@@ -9904,6 +9904,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         isReady = true
         startupStatusTitle = "Ready"
         startupFailure = nil
+        clearSpeechModelStartupProgress()
         stopPermissionReadinessMonitor()
         setMenuBarState(.idle)
         refreshActivationPolicy()
@@ -10253,14 +10254,15 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
                 fallbackSpeechModelProfileAfterStartupFailure = nil
                 isSpeechModelReady = true
-                clearSpeechModelStartupProgress()
 
+                if !PendingDictationRecovery.pendingURLs().isEmpty {
+                    setStartupPhase("recovering", title: "Recovering interrupted dictation…")
+                }
                 await recoverPendingDictationsAfterStartup()
                 guard !Task.isCancelled, !isTerminating else { return }
 
                 stage = .audioInput
-                startupStatusTitle = "Starting audio input…"
-                rebuildMenu()
+                setStartupPhase("audio", title: "Starting audio input…")
 
                 try await startAudioInputWithRetries(reason: reason,
                                                      initialStatusTitle: "Starting audio input…")
@@ -10268,7 +10270,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
                 isCoreRuntimeReady = true
                 startupFailure = nil
-                startupStatusTitle = "Finishing setup…"
+                setStartupPhase("finishing", title: "Finishing setup…")
                 completeReadinessIfPossible(reason: reason)
             } catch {
                 guard !Task.isCancelled, !isTerminating else { return }
@@ -10346,8 +10348,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         shouldResumeRuntimeAfterWake = false
         didLogDeferredWakeRecovery = false
         startupFailure = nil
-        startupStatusTitle = "Loading speech model…"
         clearSpeechModelStartupProgress()
+        startupStatusTitle = "Checking local speech model…"
+        speechModelDownloadPhase = "checking"
+        speechModelDownloadProgressUpdatedAt = Date().timeIntervalSince1970
 
         hotkey.onPress = nil
         hotkey.onRelease = nil
@@ -10372,6 +10376,15 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         speechModelDownloadPhase = nil
         speechModelDownloadMetrics = nil
         speechModelDownloadProgressUpdatedAt = nil
+    }
+
+    private func setStartupPhase(_ phase: String, title: String) {
+        startupStatusTitle = title
+        speechModelStartupProgressFraction = nil
+        speechModelDownloadPhase = phase
+        speechModelDownloadMetrics = nil
+        speechModelDownloadProgressUpdatedAt = Date().timeIntervalSince1970
+        rebuildMenu()
     }
 
     private func updateSpeechModelStartupProgress(_ update: SpeechModelProgressUpdate) {
@@ -21220,7 +21233,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                let state,
                state.status == "starting",
                state.modelDownloadPhase != nil {
-                return (displayStatus(state.status),
+                return (localizedStartupStatus(state),
                         localizedServiceDetail(state),
                         colorForStatus(state.status))
             }
@@ -21231,6 +21244,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 return (t("Работает", "Running"),
                         t("Фоновая служба включена.", "The background service is running."),
                         .systemGreen)
+            }
+            if state.status == "starting" {
+                return (localizedStartupStatus(state),
+                        localizedServiceDetail(state),
+                        colorForStatus(state.status))
             }
             return (displayStatus(state.status), localizedServiceDetail(state), colorForStatus(state.status))
         }
@@ -21851,6 +21869,28 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
+    private func localizedStartupStatus(_ state: AgentRuntimeState) -> String {
+        switch state.modelDownloadPhase {
+        case "checking", "listing":
+            return t("Проверяю модель", "Checking model")
+        case "downloading":
+            if (state.modelDownloadTotalBytes ?? 0) > 0 {
+                return t("Скачиваю модель", "Downloading model")
+            }
+            return t("Загружаю локальную модель", "Loading local model")
+        case "preparing":
+            return t("Готовлю Neural Engine", "Preparing Neural Engine")
+        case "recovering":
+            return t("Восстанавливаю диктовку", "Recovering dictation")
+        case "audio":
+            return t("Подключаю микрофон", "Starting microphone")
+        case "finishing":
+            return t("Почти готово", "Almost ready")
+        default:
+            return t("Запускаю службу", "Starting service")
+        }
+    }
+
     private func localizedServiceDetail(_ state: AgentRuntimeState) -> String {
         switch state.status {
         case "ready", "recording", "transcribing":
@@ -21863,9 +21903,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 progressUpdatedAt: state.modelDownloadProgressUpdatedAt,
                 now: now
             )
-            if state.modelDownloadPhase == "listing" {
-                let title = t("Проверяю доступ к Hugging Face и список файлов…",
-                              "Checking Hugging Face access and model files…")
+            if state.modelDownloadPhase == "checking" {
+                return t(
+                    "Сначала ищу модель на этом Mac. Если локальные файлы целы, ничего скачиваться не будет.",
+                    "Looking for the model on this Mac first. Nothing will download when the local files are intact."
+                )
+            } else if state.modelDownloadPhase == "listing" {
+                let title = t(
+                    "Проверяю наличие и целостность файлов модели…",
+                    "Checking model file availability and integrity…"
+                )
                 if stalled {
                     return "\(title)\n\(localizedModelDownloadNetworkHint(stalled: true))"
                 }
@@ -21905,11 +21952,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     t(" \($0) с", " \($0)s")
                 } ?? ""
                 return t(
-                    "Подготавливаю модель для Neural Engine…\(elapsedText)\nОбычно 20–45 секунд. Не перезапускайте службу — ожидание начнётся заново.",
-                    "Preparing the model for Neural Engine…\(elapsedText)\nUsually 20–45 seconds. Do not restart the service or the wait starts over."
+                    "Файлы уже на Mac — это не скачивание. Подготавливаю модель для Neural Engine…\(elapsedText)\nОбычно 20–45 секунд. Не перезапускайте службу: ожидание начнётся заново.",
+                    "The files are already on this Mac; this is not a download. Preparing the model for Neural Engine…\(elapsedText)\nUsually 20–45 seconds. Do not restart the service or the wait starts over."
                 )
+            } else if state.modelDownloadPhase == "recovering" {
+                return t("Модель готова. Сохраняю незавершённую диктовку в историю…",
+                         "The model is ready. Recovering an interrupted dictation into history…")
+            } else if state.modelDownloadPhase == "audio" {
+                return t("Модель готова. Подключаю микрофон и глобальные сочетания…",
+                         "The model is ready. Starting the microphone and global shortcuts…")
+            } else if state.modelDownloadPhase == "finishing" {
+                return t("Все компоненты готовы. Завершаю запуск…",
+                         "All components are ready. Finishing startup…")
             } else if state.detail.hasPrefix("Loading cached speech model") {
-                return t("Загружаю модель из кэша…", "Loading cached speech model…")
+                return t("Модель уже на Mac. Загружаю её с диска — ничего не скачивается.",
+                         "The model is already on this Mac. Loading it from disk; nothing is downloading.")
             } else if state.detail.hasPrefix("Loading speech model") {
                 return t("Загружаю языковую модель…", "Loading speech model…")
             }
