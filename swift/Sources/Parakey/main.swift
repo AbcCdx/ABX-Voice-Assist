@@ -97,6 +97,7 @@ let RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED: CGFloat = 10.08
 let RECORDING_HUD_TRANSCRIBING_PHASE_SPEED: CGFloat = 10.2
 let HOTKEY_CAPTURE_BEGIN_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-begin")
 let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-end")
+let SETTINGS_CHANGED_NOTIFICATION = Notification.Name("com.local.superdictate.settings-changed")
 let HOTKEY_CAPTURE_FAILSAFE_SECONDS: TimeInterval = 45
 let DICTATION_ERROR_FLASH_SECONDS: TimeInterval = 1.5  // how long the menu-bar icon flags a dropped dictation before returning to idle
 let AUDIO_START_RETRY_DELAYS_SECONDS: [UInt64] = [1, 3, 8]
@@ -4434,33 +4435,38 @@ final class HotkeyListener {
     /// Replace the current hotkey choice. Safe to call at runtime —
     /// the tap stays bound, only the per-event filter changes.
     func setHotkey(_ choice: HotkeyChoice) {
+        guard choice != hotkey else { return }
         self.hotkey = choice
         self.transitionState.resetAll()
         log("HotkeyListener: hotkey changed → \(choice.name)")
     }
 
     func setEnterHotkey(_ choice: HotkeyChoice) {
+        guard choice != enterHotkey else { return }
         enterHotkey = choice
         transitionState.resetAll()
         log("HotkeyListener: alternate completion hotkey changed → \(choice.name)")
     }
 
     func setAlternateCompletionEnabled(_ enabled: Bool) {
+        guard enabled != alternateCompletionEnabled else { return }
         alternateCompletionEnabled = enabled
         transitionState.resetAll()
         log("HotkeyListener: alternate completion → \(enabled ? "enabled" : "disabled")")
     }
 
     func setHistoryHotkey(_ choice: HotkeyChoice) {
+        guard choice != historyHotkey else { return }
         historyHotkey = choice
         transitionState.resetAll()
         log("HotkeyListener: history hotkey changed → \(choice.name)")
     }
 
     func setTriggerMode(_ mode: TriggerMode) {
+        guard mode != triggerMode else { return }
         // Reset toggle state when switching modes so we don't get
         // stuck in mid-toggle from a previous session.
-        if mode != triggerMode { transitionState.resetToggleState() }
+        transitionState.resetToggleState()
         triggerMode = mode
         log("HotkeyListener: trigger mode → \(mode.rawValue)")
     }
@@ -7919,6 +7925,7 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
                                            backupAppPath: String,
                                            appPath: String,
                                            language: InterfaceLanguage,
+                                           agentLabel: String = AGENT_LABEL,
                                            relaunch: Bool = true) -> String {
     let preparing = localizedText("Подготавливаю замену приложения…",
                                   "Preparing to replace the application…",
@@ -7955,7 +7962,8 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
     SHOULD_RELAUNCH=\#(relaunch ? "1" : "0")
     APP_PARENT="$(/usr/bin/dirname "$APP_PATH")"
     INFO_PLIST="$APP_PATH/Contents/Info.plist"
-    SERVICE="gui/$(/usr/bin/id -u)/\#(AGENT_LABEL)"
+    SERVICE_LABEL=\#(shellSingleQuoted(agentLabel))
+    SERVICE="gui/$(/usr/bin/id -u)/$SERVICE_LABEL"
 
     timestamp() {
         /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -9686,6 +9694,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var startupTask: Task<Void, Never>?
     private var updateCheckLoopTask: Task<Void, Never>?
     private var manualUpdateCheckTask: Task<Void, Never>?
+    private var settingsReloadRetryWorkItem: DispatchWorkItem?
     private var startupStatusTitle = "Loading speech model…"
     private var speechModelStartupProgressFraction: Double?
     private var speechModelDownloadPhase: String?
@@ -9991,6 +10000,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updateCheckLoopTask = nil
         manualUpdateCheckTask?.cancel()
         manualUpdateCheckTask = nil
+        settingsReloadRetryWorkItem?.cancel()
+        settingsReloadRetryWorkItem = nil
         stopPermissionReadinessMonitor()
         stopSetupChecklistRefreshTimer()
         removeWorkspacePowerObservers()
@@ -10021,6 +10032,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                            selector: #selector(externalHotkeyCaptureDidEnd(_:)),
                            name: HOTKEY_CAPTURE_END_NOTIFICATION,
                            object: nil)
+        center.addObserver(self,
+                           selector: #selector(externalSettingsDidChange(_:)),
+                           name: SETTINGS_CHANGED_NOTIFICATION,
+                           object: nil)
     }
 
     private func removeHotkeyCaptureObservers() {
@@ -10029,6 +10044,36 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let center = DistributedNotificationCenter.default()
         center.removeObserver(self, name: HOTKEY_CAPTURE_BEGIN_NOTIFICATION, object: nil)
         center.removeObserver(self, name: HOTKEY_CAPTURE_END_NOTIFICATION, object: nil)
+        center.removeObserver(self, name: SETTINGS_CHANGED_NOTIFICATION, object: nil)
+    }
+
+    @objc private func externalSettingsDidChange(_ notification: Notification) {
+        guard !isTerminating else { return }
+        reloadSettingsWhenIdle(logDeferral: true)
+    }
+
+    private func reloadSettingsWhenIdle(logDeferral: Bool = false) {
+        settingsReloadRetryWorkItem?.cancel()
+        settingsReloadRetryWorkItem = nil
+        guard !isRecording, !isBusy else {
+            let retry = DispatchWorkItem { [weak self] in
+                self?.reloadSettingsWhenIdle()
+            }
+            settingsReloadRetryWorkItem = retry
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: retry)
+            if logDeferral {
+                log("settings reload deferred until the current dictation finishes")
+            }
+            return
+        }
+        _ = settings.refreshFromDisk()
+        hotkey.setHotkey(settings.configuredHotkey)
+        hotkey.setEnterHotkey(settings.configuredEnterHotkey)
+        hotkey.setAlternateCompletionEnabled(settings.alternateCompletionEnabled)
+        hotkey.setHistoryHotkey(settings.configuredHistoryHotkey)
+        hotkey.setTriggerMode(settings.triggerMode)
+        rebuildMenu()
+        log("settings reloaded without restarting the speech model")
     }
 
     @objc private func externalHotkeyCaptureDidBegin(_ notification: Notification) {
@@ -19049,6 +19094,7 @@ private enum ParakeySelfTest {
             backupAppPath: backupApp.path,
             appPath: currentApp.path,
             language: .english,
+            agentLabel: "com.local.superdictate.self-test.\(UUID().uuidString)",
             relaunch: false
         )
         try script.write(to: helperPath, atomically: true, encoding: .utf8)
@@ -20395,7 +20441,6 @@ private enum ControlPanelServiceOperation: String, Sendable {
     case starting
     case restarting
     case stopping
-    case applyingSettings
 }
 
 private enum ControlPanelShortcutKind: Int {
@@ -20576,7 +20621,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func resizeCompactPanel(_ window: NSWindow) {
         let missingCount = Permission.allCases.filter { !Permissions.isGranted($0) }.count
         let state = AgentRuntimeStateStore.read()
-        let showsModelProgress = state?.status == "starting"
+        let showsModelProgress = SuperDictateAgentService.isAgentRunning()
+            && state?.status == "starting"
             && state?.modelDownloadPhase != nil
         let modelProgressHeight = showsModelProgress ? 26 : 0
         let height = CGFloat(310 + max(0, missingCount - 1) * 28 + modelProgressHeight)
@@ -20600,8 +20646,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             let rawStatus = state?.status ?? "none"
             let isHealthyRuntimeState = ["ready", "recording", "transcribing"].contains(rawStatus)
             let phase = state?.modelDownloadPhase ?? ""
-            let networkProgressClock = rawStatus == "starting"
-                && (phase == "listing" || phase == "downloading")
+            let startupProgressClock = rawStatus == "starting"
+                && (phase == "listing" || phase == "downloading" || phase == "preparing")
                 ? String(Int(Date().timeIntervalSince1970 / 3))
                 : ""
             let detailToken = isHealthyRuntimeState ? "" : (state?.detail ?? "")
@@ -20621,7 +20667,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                           totalToken,
                           speedToken,
                           etaToken,
-                          networkProgressClock,
+                          startupProgressClock,
                           String(state?.pid ?? 0),
                           state?.speechModelReady == true ? "1" : "0"].joined(separator: "|")
         }
@@ -20844,8 +20890,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.spacing = 2
         text.addArrangedSubview(panelLabel(t("Настройки", "Settings"), size: 20, weight: .semibold))
         text.addArrangedSubview(panelLabel(
-            t("Изменения применятся вместе после сохранения и перезапуска службы.",
-              "Changes are applied together after saving and restarting the service."),
+            t("Изменения применяются после сохранения — перезапуск модели не нужен.",
+              "Changes apply after saving; the speech model does not need to restart."),
             size: 11.5,
             color: .secondaryLabelColor
         ))
@@ -20929,14 +20975,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         actions.alignment = .centerY
         actions.spacing = 5
         let enabled = serviceOperation == nil
+        let restartEnabled = enabled && state?.status != "starting"
         if running {
             actions.addArrangedSubview(compactIconButton(
                 symbol: "arrow.clockwise",
                 accessibilityTitle: t("Перезапустить службу", "Restart Service"),
-                toolTip: t("Перезапустить фоновую службу, не закрывая панель",
-                           "Restart the background service without closing the panel"),
+                toolTip: restartEnabled
+                    ? t("Перезапустить фоновую службу, не закрывая панель",
+                        "Restart the background service without closing the panel")
+                    : t("Дождитесь завершения подготовки модели.",
+                        "Wait for model preparation to finish."),
                 action: #selector(restartAgentClicked(_:)),
-                enabled: enabled
+                enabled: restartEnabled
             ))
             actions.addArrangedSubview(compactIconButton(
                 symbol: "stop.fill",
@@ -21145,8 +21195,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .starting: return t("Запускаю службу диктовки", "Starting dictation service")
         case .restarting: return t("Перезапускаю фоновую службу", "Restarting background service")
         case .stopping: return t("Останавливаю фоновую службу", "Stopping background service")
-        case .applyingSettings: return t("Применяю настройки и перезапускаю службу",
-                                         "Applying settings and restarting service")
         }
     }
 
@@ -21155,7 +21203,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .starting:
             return t("Подключаю глобальный хоткей и локальную модель.\nОбычно 1–3 секунды; при первой загрузке дольше.",
                      "Enabling the global shortcut and local model.\nUsually 1–3 seconds; the first download takes longer.")
-        case .restarting, .applyingSettings:
+        case .restarting:
             return t("Диктовка временно недоступна. Панель не зависла — новый воркер уже запускается.",
                      "Dictation is temporarily unavailable. The panel is responsive while the new worker starts.")
         case .stopping:
@@ -21167,6 +21215,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func servicePresentation(running: Bool,
                                      state: AgentRuntimeState?) -> (status: String, detail: String, color: NSColor) {
         if let operation = serviceOperation {
+            if operation != .stopping,
+               running,
+               let state,
+               state.status == "starting",
+               state.modelDownloadPhase != nil {
+                return (displayStatus(state.status),
+                        localizedServiceDetail(state),
+                        colorForStatus(state.status))
+            }
             return (operationTitle(operation), operationDetail(operation), .systemBlue)
         }
         if running, let state {
@@ -21585,14 +21642,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let persisted = ControlPanelSettingsDraft(settings: settings)
         let hasChanges = draft != persisted
         let validation = settingsValidationMessage(draft)
+        let agentState = AgentRuntimeStateStore.read()
+        let dictationInProgress = agentState?.isRecording == true
+            || agentState?.isTranscribing == true
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
 
+        let unsavedMessage = dictationInProgress
+            ? t("Завершите текущую диктовку, чтобы сохранить",
+                "Finish the current dictation before saving")
+            : t("Есть несохранённые изменения", "You have unsaved changes")
         let message = panelLabel(
             validation ?? (hasChanges
-                ? t("Есть несохранённые изменения", "You have unsaved changes")
+                ? unsavedMessage
                 : t("Все изменения сохранены", "All changes are saved")),
             size: 11.5,
             weight: .medium,
@@ -21609,11 +21673,17 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Отменить несохранённые изменения.", "Discard unsaved changes.")
         ))
         let save = panelButton(
-            t("Сохранить и перезапустить", "Save & Restart"),
+            t("Сохранить", "Save"),
             action: #selector(saveSettingsClicked(_:)),
-            enabled: hasChanges && validation == nil && serviceOperation == nil,
-            toolTip: t("Сохранить настройки и перезапустить фоновую службу.",
-                       "Save settings and restart the background service.")
+            enabled: hasChanges
+                && validation == nil
+                && serviceOperation == nil
+                && !dictationInProgress,
+            toolTip: dictationInProgress
+                ? t("Сначала завершите текущую диктовку.",
+                    "Finish the current dictation first.")
+                : t("Сохранить и применить настройки без перезапуска модели.",
+                    "Save and apply settings without restarting the speech model.")
         )
         save.keyEquivalent = "\r"
         row.addArrangedSubview(save)
@@ -21829,7 +21899,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 return summary
             } else if state.modelDownloadPhase == "preparing"
                         || state.detail.hasPrefix("Preparing speech model") {
-                return t("Подготавливаю модель…", "Preparing speech model…")
+                let elapsed = state.modelDownloadProgressUpdatedAt
+                    .map { max(0, Int((now - $0).rounded(.down))) }
+                let elapsedText = elapsed.map {
+                    t(" \($0) с", " \($0)s")
+                } ?? ""
+                return t(
+                    "Подготавливаю модель для Neural Engine…\(elapsedText)\nОбычно 20–45 секунд. Не перезапускайте службу — ожидание начнётся заново.",
+                    "Preparing the model for Neural Engine…\(elapsedText)\nUsually 20–45 seconds. Do not restart the service or the wait starts over."
+                )
             } else if state.detail.hasPrefix("Loading cached speech model") {
                 return t("Загружаю модель из кэша…", "Loading cached speech model…")
             } else if state.detail.hasPrefix("Loading speech model") {
@@ -21977,7 +22055,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     switch operation {
                     case .starting:
                         try SuperDictateAgentService.installAndStart()
-                    case .restarting, .applyingSettings:
+                    case .restarting:
                         try SuperDictateAgentService.restart()
                     case .stopping:
                         SuperDictateAgentService.stop()
@@ -22037,6 +22115,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func restartAgentClicked(_ sender: NSButton) {
+        guard AgentRuntimeStateStore.read()?.status != "starting" else {
+            refresh(force: true)
+            return
+        }
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         beginServiceOperation(.restarting)
@@ -22167,6 +22249,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     @objc private func selectInterfaceLanguage(_ sender: NSSegmentedControl) {
         settings.interfaceLanguage = sender.selectedSegment == 1 ? .english : .russian
         _ = settings.refreshFromDisk()
+        DistributedNotificationCenter.default().postNotificationName(
+            SETTINGS_CHANGED_NOTIFICATION,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
         lastRenderFingerprint = ""
         refresh(force: true)
     }
@@ -22238,6 +22326,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     @objc private func saveSettingsClicked(_ sender: NSButton) {
         guard let draft = settingsDraft,
               settingsValidationMessage(draft) == nil else { return }
+        let agentState = AgentRuntimeStateStore.read()
+        guard agentState?.isRecording != true,
+              agentState?.isTranscribing != true else {
+            showError(
+                title: t("Диктовка ещё не завершена", "Dictation Is Still Active"),
+                detail: t("Завершите запись или распознавание, затем сохраните настройки.",
+                          "Finish recording or transcription, then save the settings.")
+            )
+            return
+        }
         settings.setConfiguredHotkey(draft.dictationHotkey)
         settings.setConfiguredEnterHotkey(draft.alternateCompletionHotkey)
         settings.setConfiguredHistoryHotkey(draft.historyHotkey)
@@ -22251,7 +22349,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
-        beginServiceOperation(.applyingSettings)
+        DistributedNotificationCenter.default().postNotificationName(
+            SETTINGS_CHANGED_NOTIFICATION,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+        lastRenderFingerprint = ""
+        refresh(force: true)
     }
 
     private func refreshSettingsWindow() {
