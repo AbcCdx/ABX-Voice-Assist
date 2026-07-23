@@ -512,6 +512,15 @@ enum SpeechModelProfile: String, CaseIterable {
         700 * 1024 * 1024
     }
 
+    /// Byte total of the files in the pinned production model revision.
+    /// FluidAudio reports byte-weighted progress but not the total itself.
+    var expectedTransferBytes: Int64 {
+        switch self {
+        case .multilingualV3, .englishUnified:
+            return 483_256_769
+        }
+    }
+
     var downloadSizeText: String {
         "about 500-700 MB"
     }
@@ -2174,6 +2183,12 @@ struct AgentRuntimeState: Codable {
     var hotkeyName: String
     var triggerMode: String
     var downloadProgressFraction: Double?
+    var modelDownloadPhase: String?
+    var modelDownloadedBytes: Int64?
+    var modelDownloadTotalBytes: Int64?
+    var modelDownloadBytesPerSecond: Double?
+    var modelDownloadEstimatedSecondsRemaining: Double?
+    var modelDownloadProgressUpdatedAt: TimeInterval?
 }
 
 enum AgentRuntimeStateStore {
@@ -5696,22 +5711,152 @@ func speechModelStartupProgressValue(_ progress: DownloadUtils.DownloadProgress)
     }
 }
 
-/// Thread-safe throttle that drops duplicate percent values
-/// before they hit @MainActor, preventing main-thread flooding.
-final class ProgressThrottler: @unchecked Sendable {
+func speechModelStartupPhaseName(_ progress: DownloadUtils.DownloadProgress) -> String {
+    switch progress.phase {
+    case .listing:
+        return "listing"
+    case .downloading:
+        return "downloading"
+    case .compiling:
+        return "preparing"
+    }
+}
+
+struct SpeechModelDownloadMetrics: Equatable, Sendable {
+    let downloadedBytes: Int64
+    let totalBytes: Int64
+    let bytesPerSecond: Double?
+    let estimatedSecondsRemaining: Double?
+}
+
+struct SpeechModelProgressUpdate: Sendable {
+    let title: String
+    let fraction: Double?
+    let phase: String
+    let metrics: SpeechModelDownloadMetrics?
+    let didAdvance: Bool
+    let shouldDispatch: Bool
+}
+
+/// Thread-safe progress sampler. FluidAudio calls its handler on an
+/// unspecified queue and may report many chunks per rendered frame.
+final class SpeechModelProgressTracker: @unchecked Sendable {
     private var lastTitle: String = ""
     private var lastFraction: Double? = nil
+    private var lastPhase: String?
+    private var lastDownloadedBytes: Int64?
+    private var sampleBytes: Int64?
+    private var sampleTime: TimeInterval?
+    private var smoothedBytesPerSecond: Double?
+    private var lastDispatchTime: TimeInterval?
     private let lock = NSLock()
 
-    /// Returns true when the progress actually changed and should be dispatched.
-    func shouldDispatch(_ title: String, _ fraction: Double?) -> Bool {
+    func consume(_ progress: DownloadUtils.DownloadProgress,
+                 totalBytes: Int64,
+                 now suppliedNow: TimeInterval? = nil) -> SpeechModelProgressUpdate {
         lock.lock()
         defer { lock.unlock() }
-        guard title != lastTitle || fraction != lastFraction else { return false }
+
+        let now = suppliedNow ?? ProcessInfo.processInfo.systemUptime
+        let title = speechModelStartupStatusTitle(progress)
+        let fraction = speechModelStartupProgressValue(progress)
+        let phase = speechModelStartupPhaseName(progress)
+        let phaseChanged = phase != lastPhase
+
+        if phaseChanged {
+            lastDownloadedBytes = nil
+            sampleBytes = nil
+            sampleTime = nil
+            smoothedBytesPerSecond = nil
+        }
+
+        var metrics: SpeechModelDownloadMetrics?
+        var didAdvance = phaseChanged
+        if case .downloading(_, let totalFiles) = progress.phase,
+           totalFiles > 0,
+           totalBytes > 0 {
+            let rawFraction = min(max(progress.fractionCompleted / 0.5, 0), 1)
+            let downloadedBytes = min(
+                totalBytes,
+                max(0, Int64((Double(totalBytes) * rawFraction).rounded(.down)))
+            )
+
+            if let previous = lastDownloadedBytes {
+                didAdvance = downloadedBytes > previous
+            }
+            lastDownloadedBytes = downloadedBytes
+
+            if let previousBytes = sampleBytes,
+               let previousTime = sampleTime {
+                let elapsed = now - previousTime
+                let byteDelta = downloadedBytes - previousBytes
+                if byteDelta < 0 {
+                    sampleBytes = downloadedBytes
+                    sampleTime = now
+                    smoothedBytesPerSecond = nil
+                } else if elapsed >= 0.2, byteDelta > 0 {
+                    let instantaneous = Double(byteDelta) / elapsed
+                    if instantaneous.isFinite, instantaneous > 0 {
+                        if let smoothed = smoothedBytesPerSecond {
+                            smoothedBytesPerSecond = (smoothed * 0.72) + (instantaneous * 0.28)
+                        } else {
+                            smoothedBytesPerSecond = instantaneous
+                        }
+                    }
+                    sampleBytes = downloadedBytes
+                    sampleTime = now
+                }
+            } else {
+                sampleBytes = downloadedBytes
+                sampleTime = now
+            }
+
+            let speed = smoothedBytesPerSecond.flatMap {
+                $0.isFinite && $0 > 0 ? $0 : nil
+            }
+            let remaining = speed.flatMap { measuredSpeed -> Double? in
+                let seconds = Double(max(0, totalBytes - downloadedBytes)) / measuredSpeed
+                return seconds.isFinite ? seconds : nil
+            }
+            metrics = SpeechModelDownloadMetrics(
+                downloadedBytes: downloadedBytes,
+                totalBytes: totalBytes,
+                bytesPerSecond: speed,
+                estimatedSecondsRemaining: remaining
+            )
+        }
+
+        let timedRefresh = lastDispatchTime.map { now - $0 >= 0.5 } ?? true
+        let downloadFinished = phase == "downloading" && fraction == 1
+        let shouldDispatch: Bool
+        if phase == "downloading" {
+            shouldDispatch = phaseChanged || timedRefresh || downloadFinished
+        } else {
+            shouldDispatch = phaseChanged || title != lastTitle || fraction != lastFraction
+        }
+
+        if shouldDispatch {
+            lastDispatchTime = now
+        }
         lastTitle = title
         lastFraction = fraction
-        return true
+        lastPhase = phase
+        return SpeechModelProgressUpdate(title: title,
+                                         fraction: fraction,
+                                         phase: phase,
+                                         metrics: metrics,
+                                         didAdvance: didAdvance,
+                                         shouldDispatch: shouldDispatch)
     }
+}
+
+func speechModelNetworkProgressIsStalled(phase: String?,
+                                         progressUpdatedAt: TimeInterval?,
+                                         now: TimeInterval,
+                                         threshold: TimeInterval = 12) -> Bool {
+    guard phase == "listing" || phase == "downloading",
+          let progressUpdatedAt else { return false }
+    return now - progressUpdatedAt >= threshold
 }
 
 enum TextInsertionStrategy: String {
@@ -9543,6 +9688,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var manualUpdateCheckTask: Task<Void, Never>?
     private var startupStatusTitle = "Loading speech model…"
     private var speechModelStartupProgressFraction: Double?
+    private var speechModelDownloadPhase: String?
+    private var speechModelDownloadMetrics: SpeechModelDownloadMetrics?
+    private var speechModelDownloadProgressUpdatedAt: TimeInterval?
     private var startupFailure: StartupFailure?
     private var didTouchAudioEngine = false
     private var permissionReadinessTimer: Timer?
@@ -10035,13 +10183,15 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
 
             do {
-                let throttler = ProgressThrottler()
+                let progressTracker = SpeechModelProgressTracker()
                 try await asr.load(profile: speechModelProfile) { [weak self] progress in
-                    let title = speechModelStartupStatusTitle(progress)
-                    let fraction = speechModelStartupProgressValue(progress)
-                    guard throttler.shouldDispatch(title, fraction) else { return }
+                    let update = progressTracker.consume(
+                        progress,
+                        totalBytes: speechModelProfile.expectedTransferBytes
+                    )
+                    guard update.shouldDispatch else { return }
                     Task { @MainActor in
-                        self?.updateSpeechModelStartupProgress(progress)
+                        self?.updateSpeechModelStartupProgress(update)
                     }
                 }
                 guard !Task.isCancelled, !isTerminating else { return }
@@ -10058,7 +10208,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
                 fallbackSpeechModelProfileAfterStartupFailure = nil
                 isSpeechModelReady = true
-                speechModelStartupProgressFraction = nil
+                clearSpeechModelStartupProgress()
 
                 await recoverPendingDictationsAfterStartup()
                 guard !Task.isCancelled, !isTerminating else { return }
@@ -10152,7 +10302,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         didLogDeferredWakeRecovery = false
         startupFailure = nil
         startupStatusTitle = "Loading speech model…"
-        speechModelStartupProgressFraction = nil
+        clearSpeechModelStartupProgress()
 
         hotkey.onPress = nil
         hotkey.onRelease = nil
@@ -10172,14 +10322,27 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rebuildMenu()
     }
 
-    private func updateSpeechModelStartupProgress(_ progress: DownloadUtils.DownloadProgress) {
+    private func clearSpeechModelStartupProgress() {
+        speechModelStartupProgressFraction = nil
+        speechModelDownloadPhase = nil
+        speechModelDownloadMetrics = nil
+        speechModelDownloadProgressUpdatedAt = nil
+    }
+
+    private func updateSpeechModelStartupProgress(_ update: SpeechModelProgressUpdate) {
         guard startupTask != nil, !isTerminating else { return }
-        let next = speechModelStartupStatusTitle(progress)
-        let nextProgressFraction = speechModelStartupProgressValue(progress)
-        guard next != startupStatusTitle
-            || nextProgressFraction != speechModelStartupProgressFraction else { return }
-        startupStatusTitle = next
-        speechModelStartupProgressFraction = nextProgressFraction
+        guard update.title != startupStatusTitle
+            || update.fraction != speechModelStartupProgressFraction
+            || update.phase != speechModelDownloadPhase
+            || update.metrics != speechModelDownloadMetrics
+            || update.didAdvance else { return }
+        startupStatusTitle = update.title
+        speechModelStartupProgressFraction = update.fraction
+        speechModelDownloadPhase = update.phase
+        speechModelDownloadMetrics = update.metrics
+        if update.didAdvance {
+            speechModelDownloadProgressUpdatedAt = Date().timeIntervalSince1970
+        }
         rebuildMenu()
     }
 
@@ -10199,7 +10362,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             isBusy = false
             startupFailure = nil
             startupStatusTitle = "Falling back to \(fallback.shortName)…"
-            speechModelStartupProgressFraction = nil
+            clearSpeechModelStartupProgress()
             setMenuBarState(.loading)
             log("ASR: \(failedProfile.shortName) failed to load during switch; falling back to \(fallback.shortName): \(startupFailureLogDetail(stage: stage, error: error))")
             rebuildMenu()
@@ -10222,7 +10385,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         isReady = false
         isRecording = false
         isBusy = false
-        speechModelStartupProgressFraction = nil
+        clearSpeechModelStartupProgress()
         stopRecordingLevelMeter()
 
         hotkey.onPress = nil
@@ -12757,7 +12920,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                               missingPermissions: missing,
                               hotkeyName: hotkey.hotkey.name,
                               triggerMode: settings.triggerMode.rawValue,
-                              downloadProgressFraction: speechModelStartupProgressFraction)
+                              downloadProgressFraction: speechModelStartupProgressFraction,
+                              modelDownloadPhase: speechModelDownloadPhase,
+                              modelDownloadedBytes: speechModelDownloadMetrics?.downloadedBytes,
+                              modelDownloadTotalBytes: speechModelDownloadMetrics?.totalBytes,
+                              modelDownloadBytesPerSecond: speechModelDownloadMetrics?.bytesPerSecond,
+                              modelDownloadEstimatedSecondsRemaining: speechModelDownloadMetrics?.estimatedSecondsRemaining,
+                              modelDownloadProgressUpdatedAt: speechModelDownloadProgressUpdatedAt)
         )
     }
 
@@ -17919,6 +18088,94 @@ private enum ParakeySelfTest {
             equals: nil,
             "unknown disk-space readings should not block model startup"
         )
+
+        let tracker = SpeechModelProgressTracker()
+        let listing = tracker.consume(
+            .init(fractionCompleted: 0, phase: .listing),
+            totalBytes: 1_000,
+            now: 10
+        )
+        try expect(listing.phase, equals: "listing",
+                   "progress telemetry should expose the listing phase")
+        try expect(listing.shouldDispatch, equals: true,
+                   "the first listing update should be dispatched")
+
+        let firstDownload = tracker.consume(
+            .init(fractionCompleted: 0.05,
+                  phase: .downloading(completedFiles: 0, totalFiles: 4)),
+            totalBytes: 1_000,
+            now: 11
+        )
+        try expect(firstDownload.metrics?.downloadedBytes, equals: 100,
+                   "byte telemetry should follow FluidAudio's normalized download fraction")
+        try expect(firstDownload.metrics?.bytesPerSecond, equals: nil,
+                   "the first byte sample should establish a baseline without inventing a speed")
+
+        let measuredDownload = tracker.consume(
+            .init(fractionCompleted: 0.10,
+                  phase: .downloading(completedFiles: 0, totalFiles: 4)),
+            totalBytes: 1_000,
+            now: 12
+        )
+        try expect(measuredDownload.metrics?.downloadedBytes, equals: 200,
+                   "downloaded byte telemetry should advance with the model")
+        try expect(measuredDownload.metrics?.bytesPerSecond, equals: 100,
+                   "download speed should be calculated from byte and time deltas")
+        try expect(measuredDownload.metrics?.estimatedSecondsRemaining, equals: 8,
+                   "download ETA should use remaining bytes and measured speed")
+
+        let duplicate = tracker.consume(
+            .init(fractionCompleted: 0.10,
+                  phase: .downloading(completedFiles: 0, totalFiles: 4)),
+            totalBytes: 1_000,
+            now: 12.1
+        )
+        try expect(duplicate.shouldDispatch, equals: false,
+                   "duplicate chunk callbacks should not flood the main actor")
+
+        let cached = SpeechModelProgressTracker().consume(
+            .init(fractionCompleted: 0.5,
+                  phase: .downloading(completedFiles: 0, totalFiles: 0)),
+            totalBytes: 1_000,
+            now: 20
+        )
+        try expect(cached.metrics, equals: nil,
+                   "cached model loading should not display fake transfer telemetry")
+        try expect(
+            speechModelNetworkProgressIsStalled(phase: "listing",
+                                                progressUpdatedAt: 10,
+                                                now: 22),
+            equals: true,
+            "a listing request without progress should surface network recovery guidance"
+        )
+        try expect(
+            speechModelNetworkProgressIsStalled(phase: "preparing",
+                                                progressUpdatedAt: 10,
+                                                now: 100),
+            equals: false,
+            "CoreML preparation should never be mislabeled as a stalled download"
+        )
+
+        let legacyState = try JSONDecoder().decode(
+            AgentRuntimeState.self,
+            from: Data("""
+            {
+              "status": "starting",
+              "detail": "Checking speech model files…",
+              "updatedAt": 10,
+              "pid": 42,
+              "isReady": false,
+              "isRecording": false,
+              "isTranscribing": false,
+              "speechModelReady": false,
+              "missingPermissions": [],
+              "hotkeyName": "Right Command",
+              "triggerMode": "toggle"
+            }
+            """.utf8)
+        )
+        try expect(legacyState.modelDownloadPhase, equals: nil,
+                   "runtime state from older app versions should decode without telemetry fields")
     }
 
     private static func testModelIntegrity() throws {
@@ -20318,7 +20575,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func resizeCompactPanel(_ window: NSWindow) {
         let missingCount = Permission.allCases.filter { !Permissions.isGranted($0) }.count
-        let height = CGFloat(310 + max(0, missingCount - 1) * 28)
+        let state = AgentRuntimeStateStore.read()
+        let showsModelProgress = state?.status == "starting"
+            && state?.modelDownloadPhase != nil
+        let modelProgressHeight = showsModelProgress ? 26 : 0
+        let height = CGFloat(310 + max(0, missingCount - 1) * 28 + modelProgressHeight)
         let oldTop = window.frame.maxY
         let size = NSSize(width: 520, height: height)
         window.contentMinSize = size
@@ -20338,9 +20599,29 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         } else {
             let rawStatus = state?.status ?? "none"
             let isHealthyRuntimeState = ["ready", "recording", "transcribing"].contains(rawStatus)
+            let phase = state?.modelDownloadPhase ?? ""
+            let networkProgressClock = rawStatus == "starting"
+                && (phase == "listing" || phase == "downloading")
+                ? String(Int(Date().timeIntervalSince1970 / 3))
+                : ""
+            let detailToken = isHealthyRuntimeState ? "" : (state?.detail ?? "")
+            let progressToken = state?.downloadProgressFraction
+                .map { String(format: "%.2f", $0) } ?? ""
+            let downloadedToken = state?.modelDownloadedBytes.map { String($0) } ?? ""
+            let totalToken = state?.modelDownloadTotalBytes.map { String($0) } ?? ""
+            let speedToken = state?.modelDownloadBytesPerSecond
+                .map { String(format: "%.0f", $0) } ?? ""
+            let etaToken = state?.modelDownloadEstimatedSecondsRemaining
+                .map { String(format: "%.0f", $0) } ?? ""
             stateToken = [isHealthyRuntimeState ? "ready" : rawStatus,
-                          isHealthyRuntimeState ? "" : state?.detail ?? "",
-                          state?.downloadProgressFraction.map { String(format: "%.2f", $0) } ?? "",
+                          detailToken,
+                          progressToken,
+                          phase,
+                          downloadedToken,
+                          totalToken,
+                          speedToken,
+                          etaToken,
+                          networkProgressClock,
                           String(state?.pid ?? 0),
                           state?.speechModelReady == true ? "1" : "0"].joined(separator: "|")
         }
@@ -20602,13 +20883,19 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let alternateShortcut = settings.alternateCompletionEnabled
             ? "\(t("Альтернативно", "Alternative")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language)) — \(alternateAction)"
             : t("Альтернативное завершение выключено", "Alternative finish is disabled")
+        let showsModelProgress = running
+            && state?.status == "starting"
+            && state?.modelDownloadPhase != nil
+        let detailText = showsModelProgress
+            ? presentation.detail
+            : "\(presentation.detail)\n\(primaryShortcut) · \(historyShortcut)"
         let detail = panelLabel(
-            "\(presentation.detail)\n\(primaryShortcut) · \(historyShortcut)",
+            detailText,
             size: 11.5,
             color: .secondaryLabelColor
         )
-        detail.maximumNumberOfLines = 2
-        detail.lineBreakMode = .byTruncatingTail
+        detail.maximumNumberOfLines = showsModelProgress ? 3 : 2
+        detail.lineBreakMode = showsModelProgress ? .byWordWrapping : .byTruncatingTail
         detail.toolTip = "\(presentation.detail)\n\(primaryShortcut)\n\(primaryAction)\n\(alternateShortcut)\n\(historyShortcut)"
         text.addArrangedSubview(detail)
 
@@ -21500,15 +21787,48 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return t("Фоновая служба готова к диктовке.",
                      "The background service is ready for dictation.")
         case "starting":
-            if state.detail.hasPrefix("Downloading speech model") {
-                if let percentRange = state.detail.range(of: "\\d+%", options: .regularExpression) {
-                    let percent = state.detail[percentRange]
-                    return t("Скачиваю языковую модель… \(percent)", "Downloading speech model… \(percent)")
+            let now = Date().timeIntervalSince1970
+            let stalled = speechModelNetworkProgressIsStalled(
+                phase: state.modelDownloadPhase,
+                progressUpdatedAt: state.modelDownloadProgressUpdatedAt,
+                now: now
+            )
+            if state.modelDownloadPhase == "listing" {
+                let title = t("Проверяю доступ к Hugging Face и список файлов…",
+                              "Checking Hugging Face access and model files…")
+                if stalled {
+                    return "\(title)\n\(localizedModelDownloadNetworkHint(stalled: true))"
                 }
-                return t("Скачиваю языковую модель…", "Downloading speech model…")
-            } else if state.detail.hasPrefix("Checking speech model") {
-                return t("Проверяю список файлов модели…", "Checking speech model files…")
-            } else if state.detail.hasPrefix("Preparing speech model") {
+                return title
+            } else if state.modelDownloadPhase == "downloading",
+                      let downloaded = state.modelDownloadedBytes,
+                      let total = state.modelDownloadTotalBytes {
+                var parts = [
+                    t("Скачано \(localizedModelByteCount(downloaded)) из \(localizedModelByteCount(total))",
+                      "Downloaded \(localizedModelByteCount(downloaded)) of \(localizedModelByteCount(total))")
+                ]
+                if stalled {
+                    parts.append(t("0 КБ/с", "0 KB/s"))
+                } else if let speed = state.modelDownloadBytesPerSecond, speed > 0 {
+                    parts.append(localizedModelDownloadSpeed(speed))
+                } else {
+                    parts.append(t("измеряю скорость…", "measuring speed…"))
+                }
+                if !stalled,
+                   let remaining = state.modelDownloadEstimatedSecondsRemaining,
+                   remaining.isFinite,
+                   remaining >= 0 {
+                    parts.append(t("осталось ≈ \(localizedModelDuration(remaining))",
+                                   "≈ \(localizedModelDuration(remaining)) left"))
+                }
+                let summary = parts.joined(separator: " · ")
+                let slow = (state.modelDownloadBytesPerSecond ?? .infinity) < 1_000_000
+                if stalled || slow {
+                    return "\(summary)\n\(localizedModelDownloadNetworkHint(stalled: stalled))"
+                }
+                return summary
+            } else if state.modelDownloadPhase == "preparing"
+                        || state.detail.hasPrefix("Preparing speech model") {
                 return t("Подготавливаю модель…", "Preparing speech model…")
             } else if state.detail.hasPrefix("Loading cached speech model") {
                 return t("Загружаю модель из кэша…", "Loading cached speech model…")
@@ -21521,6 +21841,64 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case "error": return t("Служба сообщила об ошибке: \(state.detail)", "Service error: \(state.detail)")
         default: return state.detail
         }
+    }
+
+    private func localizedModelByteCount(_ bytes: Int64) -> String {
+        let value: Double
+        let unit: String
+        if bytes >= 1_000_000_000 {
+            value = Double(bytes) / 1_000_000_000
+            unit = t("ГБ", "GB")
+        } else if bytes >= 1_000_000 {
+            value = Double(bytes) / 1_000_000
+            unit = t("МБ", "MB")
+        } else {
+            value = Double(bytes) / 1_000
+            unit = t("КБ", "KB")
+        }
+        let digits = value < 10 ? 1 : 0
+        return "\(localizedModelDecimal(value, digits: digits)) \(unit)"
+    }
+
+    private func localizedModelDownloadSpeed(_ bytesPerSecond: Double) -> String {
+        let value: Double
+        let unit: String
+        if bytesPerSecond >= 1_000_000 {
+            value = bytesPerSecond / 1_000_000
+            unit = t("МБ/с", "MB/s")
+        } else {
+            value = bytesPerSecond / 1_000
+            unit = t("КБ/с", "KB/s")
+        }
+        let digits = value < 10 ? 1 : 0
+        return "\(localizedModelDecimal(value, digits: digits)) \(unit)"
+    }
+
+    private func localizedModelDuration(_ seconds: Double) -> String {
+        let rounded = max(1, Int(seconds.rounded()))
+        if rounded < 60 {
+            return t("\(rounded) с", "\(rounded)s")
+        }
+        let minutes = rounded / 60
+        let remainder = rounded % 60
+        if remainder == 0 {
+            return t("\(minutes) мин", "\(minutes)m")
+        }
+        return t("\(minutes) мин \(remainder) с", "\(minutes)m \(remainder)s")
+    }
+
+    private func localizedModelDecimal(_ value: Double, digits: Int) -> String {
+        let result = String(format: "%.\(digits)f", value)
+        return language == .russian ? result.replacingOccurrences(of: ".", with: ",") : result
+    }
+
+    private func localizedModelDownloadNetworkHint(stalled: Bool) -> String {
+        if stalled {
+            return t("Прогресс остановился. Включите или выключите VPN, попробуйте другой VPN либо сеть.",
+                     "Progress has stopped. Toggle VPN, try another VPN, or switch networks.")
+        }
+        return t("Медленно? Включите или выключите VPN, попробуйте другой VPN либо сеть.",
+                 "Slow? Toggle VPN, try another VPN, or switch networks.")
     }
 
     private func colorForStatus(_ raw: String) -> NSColor {
