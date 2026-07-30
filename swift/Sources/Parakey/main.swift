@@ -6827,7 +6827,9 @@ enum TextInserter {
 private enum ClipboardPasteInserter {
     private static let virtualKeyCommand: CGKeyCode = 0x37  // left Command
     private static let virtualKeyV: CGKeyCode = 0x09  // ANSI 'v'
-    private static let restoreDelay: TimeInterval = 0.35
+    private static let restoreDelayAfterRead: TimeInterval = 0.12
+    private static let restoreTimeout: TimeInterval = 10
+    private static var pendingTransaction: ClipboardPasteTransaction?
 
     static func write(_ text: String, to pb: NSPasteboard) -> Bool {
         pb.clearContents()
@@ -6836,38 +6838,34 @@ private enum ClipboardPasteInserter {
 
     static func insert(_ text: String) -> Bool {
         let pasteboard = NSPasteboard.general
+        pendingTransaction?.restoreNowIfCurrent(reason: "superseded by another dictation")
         let previous = PasteboardSnapshot.capture(from: pasteboard)
-        guard write(text, to: pasteboard) else {
+        let transaction = ClipboardPasteTransaction(
+            text: text,
+            pasteboard: pasteboard,
+            previousSnapshot: previous,
+            restoreDelay: restoreDelayAfterRead,
+            restoreTimeout: restoreTimeout
+        )
+        transaction.onFinished = { [weak transaction] in
+            guard let transaction, pendingTransaction === transaction else { return }
+            pendingTransaction = nil
+        }
+        pendingTransaction = transaction
+        guard transaction.install() else {
+            pendingTransaction = nil
             log("pasteboard write failed")
             return false
         }
-        let transientChangeCount = pasteboard.changeCount
 
         let steps = clipboardPasteKeyboardEventSteps(commandKey: virtualKeyCommand,
                                                      pasteKey: virtualKeyV)
         guard post(steps) else {
             log("paste event creation failed")
-            previous.restore(to: pasteboard)
+            transaction.restoreNowIfCurrent(reason: "paste event creation failed")
             return false
         }
-        restorePasteboard(previous,
-                          ifStillTemporaryText: text,
-                          changeCount: transientChangeCount,
-                          pasteboard: pasteboard)
         return true
-    }
-
-    private static func restorePasteboard(_ snapshot: PasteboardSnapshot,
-                                          ifStillTemporaryText text: String,
-                                          changeCount: Int,
-                                          pasteboard: NSPasteboard) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
-            guard pasteboard.changeCount == changeCount,
-                  pasteboard.string(forType: .string) == text else {
-                return
-            }
-            snapshot.restore(to: pasteboard)
-        }
     }
 
     private static func post(_ steps: [KeyboardEventStep]) -> Bool {
@@ -6908,6 +6906,108 @@ private struct PasteboardSnapshot {
         if !restoredItems.isEmpty {
             pasteboard.writeObjects(restoredItems)
         }
+    }
+}
+
+@MainActor
+private final class ClipboardPasteTransaction: NSObject, NSPasteboardItemDataProvider {
+    nonisolated let text: String
+    let pasteboard: NSPasteboard
+    let previousSnapshot: PasteboardSnapshot
+    let restoreDelay: TimeInterval
+    let restoreTimeout: TimeInterval
+    var onFinished: (() -> Void)?
+
+    private let startedAt = ProcessInfo.processInfo.systemUptime
+    private var transientChangeCount: Int?
+    private var restoreWorkItem: DispatchWorkItem?
+    private var didProvideText = false
+    private var isFinished = false
+
+    init(text: String,
+         pasteboard: NSPasteboard,
+         previousSnapshot: PasteboardSnapshot,
+         restoreDelay: TimeInterval,
+         restoreTimeout: TimeInterval,
+         onFinished: (() -> Void)? = nil) {
+        self.text = text
+        self.pasteboard = pasteboard
+        self.previousSnapshot = previousSnapshot
+        self.restoreDelay = restoreDelay
+        self.restoreTimeout = restoreTimeout
+        self.onFinished = onFinished
+    }
+
+    func install() -> Bool {
+        let item = NSPasteboardItem()
+        guard item.setDataProvider(self, forTypes: [.string]) else {
+            finish()
+            return false
+        }
+        pasteboard.clearContents()
+        guard pasteboard.writeObjects([item]) else {
+            previousSnapshot.restore(to: pasteboard)
+            finish()
+            return false
+        }
+        transientChangeCount = pasteboard.changeCount
+        scheduleRestore(after: restoreTimeout, reason: "target did not request dictation text")
+        return true
+    }
+
+    nonisolated func pasteboard(_ pasteboard: NSPasteboard?,
+                               item: NSPasteboardItem,
+                               provideDataForType type: NSPasteboard.PasteboardType) {
+        guard type == .string else { return }
+        item.setString(text, forType: type)
+        Task { @MainActor [weak self] in
+            self?.textWasProvided()
+        }
+    }
+
+    private func textWasProvided() {
+        guard !isFinished, !didProvideText else { return }
+        didProvideText = true
+        let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+        log("pasteboard target requested dictation text after \(millisecondsLabel(elapsed))")
+        scheduleRestore(after: restoreDelay, reason: "target consumed dictation text")
+    }
+
+    func restoreNowIfCurrent(reason: String) {
+        restore(reason: reason)
+    }
+
+    private func scheduleRestore(after delay: TimeInterval, reason: String) {
+        restoreWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.restore(reason: reason)
+        }
+        restoreWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, delay), execute: work)
+    }
+
+    private func restore(reason: String) {
+        guard !isFinished else { return }
+        restoreWorkItem?.cancel()
+        restoreWorkItem = nil
+        if let transientChangeCount,
+           pasteboard.changeCount == transientChangeCount {
+            previousSnapshot.restore(to: pasteboard)
+            log("pasteboard restored after \(reason)")
+        } else {
+            log("pasteboard restore skipped after \(reason): clipboard changed externally")
+        }
+        finish()
+    }
+
+    private func finish() {
+        guard !isFinished else { return }
+        isFinished = true
+        restoreWorkItem?.cancel()
+        restoreWorkItem = nil
+        let completion = onFinished
+        onFinished = nil
+        completion?()
     }
 }
 
@@ -17068,6 +17168,81 @@ private enum ParakeySelfTest {
             pasteboardProbe.stored,
             equals: "pasteboard probe",
             "clipboard paste should write the intended string before posting Cmd+V"
+        )
+
+        let lazyPasteProbe = MainActor.assumeIsolated {
+            let pasteboardName = NSPasteboard.Name("com.local.superdictate.lazy-paste-test.\(UUID().uuidString)")
+            let pasteboard = NSPasteboard(name: pasteboardName)
+            _ = ClipboardPasteInserter.write("older clipboard text", to: pasteboard)
+            let snapshot = PasteboardSnapshot.capture(from: pasteboard)
+            var transactionFinished = false
+            let transaction = ClipboardPasteTransaction(
+                text: "fresh dictation",
+                pasteboard: pasteboard,
+                previousSnapshot: snapshot,
+                restoreDelay: 0.01,
+                restoreTimeout: 1
+            ) {
+                transactionFinished = true
+            }
+            let installed = transaction.install()
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.40))
+            let freshText = pasteboard.string(forType: .string)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+            return (
+                installed: installed,
+                freshText: freshText,
+                restoredText: pasteboard.string(forType: .string),
+                transactionFinished: transactionFinished
+            )
+        }
+        try expect(
+            lazyPasteProbe.installed,
+            equals: true,
+            "clipboard transaction should install a lazy text provider"
+        )
+        try expect(
+            lazyPasteProbe.freshText,
+            equals: "fresh dictation",
+            "the paste target should receive the current dictation"
+        )
+        try expect(
+            lazyPasteProbe.restoredText,
+            equals: "older clipboard text",
+            "the previous clipboard should be restored only after the dictation was requested"
+        )
+        try expect(
+            lazyPasteProbe.transactionFinished,
+            equals: true,
+            "clipboard transaction should release itself after restoration"
+        )
+
+        let untouchedUserCopyProbe = MainActor.assumeIsolated {
+            let pasteboardName = NSPasteboard.Name("com.local.superdictate.changed-paste-test.\(UUID().uuidString)")
+            let pasteboard = NSPasteboard(name: pasteboardName)
+            _ = ClipboardPasteInserter.write("older clipboard text", to: pasteboard)
+            let snapshot = PasteboardSnapshot.capture(from: pasteboard)
+            let transaction = ClipboardPasteTransaction(
+                text: "fresh dictation",
+                pasteboard: pasteboard,
+                previousSnapshot: snapshot,
+                restoreDelay: 0.01,
+                restoreTimeout: 0.01
+            )
+            let installed = transaction.install()
+            _ = ClipboardPasteInserter.write("new user copy", to: pasteboard)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+            return (installed: installed, stored: pasteboard.string(forType: .string))
+        }
+        try expect(
+            untouchedUserCopyProbe.installed,
+            equals: true,
+            "clipboard transaction should install before an external clipboard change"
+        )
+        try expect(
+            untouchedUserCopyProbe.stored,
+            equals: "new user copy",
+            "clipboard restoration must not overwrite a newer user copy"
         )
     }
 
