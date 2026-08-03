@@ -5867,7 +5867,7 @@ enum FillerWordRemover {
 
 struct AICleanupSettings: Equatable, Sendable {
     static let defaultBaseURL = "https://opencode.ai/zen/v1"
-    static let defaultModel = "north-mini-code-free"
+    static let defaultModel = "laguna-s-2.1-free"
     /// Dictation is latency-sensitive; the added wait must stay small.
     static let timeoutSeconds = 3.0
     static let maxResponseBytes = 256 * 1024
@@ -5918,6 +5918,19 @@ enum AICleanupService {
         corrected text — no explanations, no quotes, no markdown.
         """
 
+    /// Shared session so consecutive dictations reuse the warm TCP/TLS
+    /// connection to the endpoint instead of paying for a fresh handshake
+    /// (~0.4s) every time. Still ephemeral: no disk cache, no cookies —
+    /// only the connection pool is kept alive. Never invalidated.
+    private static let sharedSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = AICleanupSettings.timeoutSeconds
+        config.timeoutIntervalForResource = AICleanupSettings.timeoutSeconds
+        return URLSession(configuration: config)
+    }()
+
     /// One dictation round-trip: build the request, send it, and return the
     /// sanitized corrected text. Throws on any failure — the caller must
     /// fall back to the pre-AI transcript.
@@ -5942,18 +5955,10 @@ enum AICleanupService {
                                             model: settings.aiCleanupModel)
         )
 
-        let config = URLSessionConfiguration.ephemeral
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.urlCache = nil
-        config.timeoutIntervalForRequest = AICleanupSettings.timeoutSeconds
-        config.timeoutIntervalForResource = AICleanupSettings.timeoutSeconds
-        let session = URLSession(configuration: config)
-        defer { session.finishTasksAndInvalidate() }
-
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await sharedSession.data(for: req)
         } catch {
             throw AICleanupError.network(error)
         }
