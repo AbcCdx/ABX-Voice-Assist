@@ -5892,8 +5892,8 @@ enum FillerWordRemover {
 //     the repo, or logs. Log lines must never contain transcript text.
 
 struct AICleanupSettings: Equatable, Sendable {
-    static let defaultBaseURL = "https://opencode.ai/zen/v1"
-    static let defaultModel = "laguna-s-2.1-free"
+    static let defaultBaseURL = "https://api.groq.com/openai/v1"
+    static let defaultModel = "llama-3.1-8b-instant"
     /// Dictation is latency-sensitive; the added wait must stay small.
     static let timeoutSeconds = 3.0
     static let maxResponseBytes = 256 * 1024
@@ -22698,21 +22698,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         section.addArrangedSubview(keyRow)
 
         let privacyNote = panelLabel(
-            t("Внимание: бесплатные модели OpenCode Zen могут сохранять отправленный текст для улучшения модели. Для диктовки личных текстов выберите платную модель без хранения данных или другого провайдера.",
-              "Note: free OpenCode Zen models may retain submitted text for model improvement. For personal dictation, pick a zero-retention paid model or another provider."),
+            t("Внимание: продиктованный текст отправляется выбранному провайдеру. Бесплатные тарифы (например, OpenCode Zen) могут сохранять отправленный текст для улучшения модели — перед диктовкой личных текстов проверьте политику данных провайдера.",
+              "Note: dictated text is sent to the configured provider. Free tiers (e.g. OpenCode Zen) may retain submitted text for model improvement — check your provider's data policy before dictating personal content."),
             size: 11.5,
             color: .secondaryLabelColor
         )
         privacyNote.preferredMaxLayoutWidth = 620
         section.addArrangedSubview(privacyNote)
 
-        let docsLink = NSButton(title: "opencode.ai/docs/zen",
+        let docsLink = NSButton(title: "console.groq.com",
                                 target: self,
-                                action: #selector(openZenDocsClicked(_:)))
+                                action: #selector(openAIProviderDocsClicked(_:)))
         docsLink.isBordered = false
         docsLink.font = .systemFont(ofSize: 11.5)
         docsLink.contentTintColor = .systemBlue
-        docsLink.toolTip = "https://opencode.ai/docs/zen/"
+        docsLink.toolTip = "https://console.groq.com/keys"
         docsLink.setContentHuggingPriority(.required, for: .horizontal)
         section.addArrangedSubview(docsLink)
 
@@ -23662,8 +23662,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
-    @objc private func openZenDocsClicked(_ sender: NSButton) {
-        if let url = URL(string: "https://opencode.ai/docs/zen/") {
+    @objc private func openAIProviderDocsClicked(_ sender: NSButton) {
+        if let url = URL(string: "https://console.groq.com/keys") {
             NSWorkspace.shared.open(url)
         }
     }

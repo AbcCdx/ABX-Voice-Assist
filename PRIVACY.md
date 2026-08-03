@@ -24,7 +24,7 @@ account system, advertising, analytics, or telemetry.
 
 If you explicitly enable **AI cleanup** and provide your own API key, the
 finished transcript text — never microphone audio — is sent over HTTPS to the
-OpenAI-compatible endpoint you configure (default: `https://opencode.ai/zen/v1`)
+OpenAI-compatible endpoint you configure (default: `https://api.groq.com/openai/v1`)
 for grammar and punctuation correction. The API key is stored only in the
 macOS Keychain (service `com.local.superdictate.ai`), never in preferences
 files, logs, or this repository. Endpoint and model are user-editable, so the
