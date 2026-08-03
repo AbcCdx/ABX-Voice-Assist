@@ -33,6 +33,7 @@ import ApplicationServices
 import FluidAudio
 import IOKit
 import QuartzCore
+import Security
 import ServiceManagement
 import UniformTypeIdentifiers
 
@@ -930,6 +931,7 @@ struct DictationLatencyMetrics: Equatable {
     let releaseToASRSeconds: Double
     let asrTiming: ASRTimingBreakdown
     let postprocessingSeconds: Double
+    let aiCleanupSeconds: Double?
     let historyPersistenceSeconds: Double
     let journalCleanupSeconds: Double
     let permissionRecheckSeconds: Double
@@ -941,6 +943,7 @@ struct DictationLatencyMetrics: Equatable {
     var logLine: String {
         let enter = enterDelaySeconds.map(millisecondsLabel) ?? "off"
         let hotkeyDispatch = hotkeyDispatchSeconds.map(millisecondsLabel) ?? "off"
+        let aiCleanup = aiCleanupSeconds.map(millisecondsLabel) ?? "off"
         let releaseState = max(
             0,
             releasePreparationSeconds - settingsRefreshSeconds - releasePermissionCheckSeconds
@@ -967,6 +970,7 @@ struct DictationLatencyMetrics: Equatable {
             "framework_overhead=\(millisecondsLabel(asrTiming.frameworkOverheadSeconds))",
             "asr_total=\(millisecondsLabel(asrTiming.totalSeconds))",
             "postprocess=\(millisecondsLabel(postprocessingSeconds))",
+            "ai_cleanup=\(aiCleanup)",
             "history=\(millisecondsLabel(historyPersistenceSeconds))",
             "journal_cleanup=\(millisecondsLabel(journalCleanupSeconds))",
             "permission_recheck=\(millisecondsLabel(permissionRecheckSeconds))",
@@ -2628,6 +2632,9 @@ final class Settings: @unchecked Sendable {
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
     private static let keyRemoveFillerWords = "remove_filler_words"
+    private static let keyAICleanupEnabled = "ai_cleanup_enabled"
+    private static let keyAICleanupBaseURL = "ai_cleanup_base_url"
+    private static let keyAICleanupModel = "ai_cleanup_model"
     private static let keyEnterDelayMilliseconds = "enter_delay_milliseconds_v1"
     private static let keyActiveRunMarker = "active_run_marker"
     private static let keyAgentEnabled = "agent_enabled"
@@ -3267,6 +3274,35 @@ final class Settings: @unchecked Sendable {
     var removeFillerWords: Bool {
         get { defaults.bool(forKey: Self.keyRemoveFillerWords) }
         set { defaults.set(newValue, forKey: Self.keyRemoveFillerWords) }
+    }
+
+    var aiCleanupEnabled: Bool {
+        get { defaults.bool(forKey: Self.keyAICleanupEnabled) }
+        set { defaults.set(newValue, forKey: Self.keyAICleanupEnabled) }
+    }
+
+    var aiCleanupBaseURL: String {
+        get {
+            let stored = defaults.string(forKey: Self.keyAICleanupBaseURL)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return stored.isEmpty ? AICleanupSettings.defaultBaseURL : stored
+        }
+        set { defaults.set(newValue, forKey: Self.keyAICleanupBaseURL) }
+    }
+
+    var aiCleanupModel: String {
+        get {
+            let stored = defaults.string(forKey: Self.keyAICleanupModel)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return stored.isEmpty ? AICleanupSettings.defaultModel : stored
+        }
+        set { defaults.set(newValue, forKey: Self.keyAICleanupModel) }
+    }
+
+    var aiCleanup: AICleanupSettings {
+        AICleanupSettings(enabled: aiCleanupEnabled,
+                          baseURL: aiCleanupBaseURL,
+                          model: aiCleanupModel)
     }
 
     var hasActiveRunMarker: Bool {
@@ -5814,6 +5850,304 @@ enum FillerWordRemover {
 
     private static func isOrphanSeparator(_ character: Character) -> Bool {
         ",.;:!?".contains(character)
+    }
+}
+
+// MARK: - AI transcript cleanup
+//
+// Optional final post-processing stage: the locally cleaned transcript is
+// sent to an OpenAI-compatible chat-completions endpoint (BYOK) to fix
+// grammar, punctuation, and obvious recognition mistakes. Off by default.
+// Invariants:
+//   - Never lose a transcript: any failure (no key, network, timeout, bad
+//     JSON, empty/oversized output) throws and the caller pastes the
+//     pre-AI text instead.
+//   - The API key lives only in the macOS Keychain, never in UserDefaults,
+//     the repo, or logs. Log lines must never contain transcript text.
+
+struct AICleanupSettings: Equatable, Sendable {
+    static let defaultBaseURL = "https://opencode.ai/zen/v1"
+    static let defaultModel = "north-mini-code-free"
+    /// Dictation is latency-sensitive; the added wait must stay small.
+    static let timeoutSeconds = 3.0
+    static let maxResponseBytes = 256 * 1024
+
+    var enabled: Bool
+    var baseURL: String
+    var model: String
+}
+
+enum AICleanupError: LocalizedError {
+    /// No API key is stored in the Keychain.
+    case noAPIKey
+    /// The HTTPS request itself failed (offline, DNS, timeout).
+    case network(Error)
+    /// The endpoint answered with a non-2xx status.
+    case httpStatus(Int)
+    /// A response arrived but was oversized, malformed, or unusable.
+    case unexpectedResponse
+    /// The model returned no text.
+    case emptyResult
+
+    var errorDescription: String? {
+        switch self {
+        case .noAPIKey:
+            return "no API key stored"
+        case .network(let error):
+            return "network error: \(error.localizedDescription)"
+        case .httpStatus(let code):
+            return "HTTP \(code)"
+        case .unexpectedResponse:
+            return "unexpected response"
+        case .emptyResult:
+            return "empty result"
+        }
+    }
+}
+
+enum AICleanupService {
+    /// System prompt is English regardless of UI language; the model is
+    /// instructed to preserve the input language.
+    static let systemPrompt = """
+        You are a dictation post-processor. The user spoke the text below; it was \
+        transcribed by a speech-to-text model and may contain recognition errors, \
+        missing punctuation, wrong homophones, and grammar mistakes. Rewrite it as \
+        the speaker intended: fix punctuation, capitalization, grammar, and obvious \
+        transcription errors using context. Remove leftover filler words and false \
+        starts. Keep the original meaning, tone, and language. Output ONLY the \
+        corrected text — no explanations, no quotes, no markdown.
+        """
+
+    /// One dictation round-trip: build the request, send it, and return the
+    /// sanitized corrected text. Throws on any failure — the caller must
+    /// fall back to the pre-AI transcript.
+    static func clean(text: String, language: DictationLanguage) async throws -> String {
+        let settings = Settings.shared
+        guard let apiKey = AIKeyStore.read(), !apiKey.isEmpty else {
+            throw AICleanupError.noAPIKey
+        }
+        guard let base = normalizedBaseURL(settings.aiCleanupBaseURL),
+              let url = URL(string: base + "/chat/completions") else {
+            throw AICleanupError.unexpectedResponse
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = AICleanupSettings.timeoutSeconds
+        req.httpBody = try JSONSerialization.data(
+            withJSONObject: makeRequestBody(text: text,
+                                            language: language,
+                                            model: settings.aiCleanupModel)
+        )
+
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = AICleanupSettings.timeoutSeconds
+        config.timeoutIntervalForResource = AICleanupSettings.timeoutSeconds
+        let session = URLSession(configuration: config)
+        defer { session.finishTasksAndInvalidate() }
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: req)
+        } catch {
+            throw AICleanupError.network(error)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw AICleanupError.unexpectedResponse
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw AICleanupError.httpStatus(http.statusCode)
+        }
+        let raw = try parseResponse(data)
+        return try sanitizeOutput(raw, original: text)
+    }
+
+    /// Connectivity probe behind the settings "Test connection" button:
+    /// `GET {base}/models` with the stored key. Not latency-critical, so
+    /// it uses a more generous timeout than the dictation path.
+    static func probeModels(baseURL: String, apiKey: String) async -> Result<Void, AICleanupError> {
+        guard let base = normalizedBaseURL(baseURL),
+              let url = URL(string: base + "/models") else {
+            return .failure(.unexpectedResponse)
+        }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 10
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 10
+        let session = URLSession(configuration: config)
+        defer { session.finishTasksAndInvalidate() }
+
+        do {
+            let (_, response) = try await session.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                return .failure(.unexpectedResponse)
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                return .failure(.httpStatus(http.statusCode))
+            }
+            return .success(())
+        } catch {
+            return .failure(.network(error))
+        }
+    }
+
+    static func normalizedBaseURL(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
+    }
+
+    static func makeRequestBody(text: String,
+                                language: DictationLanguage,
+                                model: String) -> [String: Any] {
+        var system = systemPrompt
+        if language != .auto {
+            system += "\nThe text is in the language with ISO code \"\(language.rawValue)\"; keep the output in that language."
+        }
+        let estimatedInputTokens = max(1, text.count / 4)
+        return [
+            "model": model,
+            "messages": [
+                ["role": "system", "content": system],
+                ["role": "user", "content": text],
+            ],
+            "temperature": 0.2,
+            "max_tokens": max(256, estimatedInputTokens * 2),
+        ]
+    }
+
+    /// Parse an OpenAI-shaped chat-completions response. Enforces the
+    /// response size cap here so the rule is unit-testable offline.
+    static func parseResponse(_ data: Data) throws -> String {
+        guard data.count <= AICleanupSettings.maxResponseBytes,
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dict = object as? [String: Any],
+              let choices = dict["choices"] as? [[String: Any]],
+              let first = choices.first,
+              let message = first["message"] as? [String: Any],
+              let content = message["content"] as? String else {
+            throw AICleanupError.unexpectedResponse
+        }
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw AICleanupError.emptyResult
+        }
+        return trimmed
+    }
+
+    /// Strip the formatting models add despite instructions (code fences,
+    /// wrapping quotes, blank-line runs). An empty or wildly oversized
+    /// result is rejected so the caller falls back to the raw transcript.
+    static func sanitizeOutput(_ raw: String, original: String) throws -> String {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if text.hasPrefix("```") {
+            if let newline = text.firstIndex(of: "\n") {
+                text = String(text[text.index(after: newline)...])
+            }
+            if text.hasSuffix("```") {
+                text = String(text.dropLast(3))
+            }
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let quotePairs: [(Character, Character)] = [
+            ("\"", "\""), ("'", "'"), ("“", "”"), ("«", "»"),
+        ]
+        for (opening, closing) in quotePairs {
+            guard text.count >= 2,
+                  text.first == opening,
+                  text.last == closing else { continue }
+            text = String(text.dropFirst().dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            break
+        }
+
+        while text.contains("\n\n\n") {
+            text = text.replacingOccurrences(of: "\n\n\n", with: "\n\n")
+        }
+
+        guard !text.isEmpty,
+              text.count <= max(256, original.count * 3) else {
+            throw AICleanupError.unexpectedResponse
+        }
+        return text
+    }
+}
+
+enum AIKeyStore {
+    enum KeyStoreError: LocalizedError {
+        case readFailed(OSStatus)
+        case writeFailed(OSStatus)
+        case deleteFailed(OSStatus)
+
+        var errorDescription: String? {
+            switch self {
+            case .readFailed(let status):
+                return "Keychain read failed (\(status))"
+            case .writeFailed(let status):
+                return "Keychain write failed (\(status))"
+            case .deleteFailed(let status):
+                return "Keychain delete failed (\(status))"
+            }
+        }
+    }
+
+    private static let service = "com.local.superdictate.ai"
+    private static let account = "api-key"
+
+    private static var baseQuery: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    static func read() -> String? {
+        var query = baseQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let key = String(data: data, encoding: .utf8),
+              !key.isEmpty else {
+            return nil
+        }
+        return key
+    }
+
+    static func write(_ key: String) throws {
+        let data = Data(key.utf8)
+        var query = baseQuery
+        let status: OSStatus
+        if read() != nil {
+            status = SecItemUpdate(query as CFDictionary,
+                                   [kSecValueData as String: data] as CFDictionary)
+        } else {
+            query[kSecValueData as String] = data
+            status = SecItemAdd(query as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else {
+            throw KeyStoreError.writeFailed(status)
+        }
+    }
+
+    static func delete() throws {
+        let status = SecItemDelete(baseQuery as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeyStoreError.deleteFailed(status)
+        }
     }
 }
 
@@ -11993,15 +12327,34 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     let cleaned = processed.text
                     log("\(String(format: "%.2f", dur)) s audio → \(String(format: "%.2f", asrTiming.totalSeconds)) s → \(cleaned.count) chars")
+
+                    // Optional AI cleanup runs last, after local repair,
+                    // corrections, and filler stripping. Any failure keeps
+                    // the pre-AI transcript — a transcript is never lost.
+                    var finalText = cleaned
+                    var aiCleanupSeconds: Double?
+                    if settings.aiCleanupEnabled, !cleaned.isEmpty {
+                        let aiCleanupStartedAt = ProcessInfo.processInfo.systemUptime
+                        do {
+                            finalText = try await AICleanupService.clean(
+                                text: cleaned,
+                                language: settings.dictationLanguage)
+                        } catch {
+                            log("AI cleanup failed, pasting raw transcript: \(error.localizedDescription)")
+                            flashErrorFeedback()
+                        }
+                        aiCleanupSeconds = ProcessInfo.processInfo.systemUptime - aiCleanupStartedAt
+                    }
+
                     if !cleaned.isEmpty {
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
                         addToHistory(
-                            cleaned,
+                            finalText,
                             transcriptionDurationSeconds: asrTiming.totalSeconds,
                             asrTiming: asrTiming,
                             rebuildMenuAfterPersisting: false
                         )
-                        recordDictationUsage(text: cleaned,
+                        recordDictationUsage(text: finalText,
                                              audioSeconds: dur,
                                              asrSeconds: asrTiming.totalSeconds)
                         let historyCompletedAt = ProcessInfo.processInfo.systemUptime
@@ -12022,7 +12375,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
                         let insertionStartedAt = ProcessInfo.processInfo.systemUptime
                         let inserted = TextInserter.insert(
-                            pastedText(from: cleaned, suffix: settings.pasteSuffix)
+                            pastedText(from: finalText, suffix: settings.pasteSuffix)
                         )
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
                         var enterDelaySeconds: Double?
@@ -12063,6 +12416,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             releaseToASRSeconds: asrRequestedAt - releaseReceivedAt,
                             asrTiming: asrTiming,
                             postprocessingSeconds: postprocessingCompletedAt - postprocessingStartedAt,
+                            aiCleanupSeconds: aiCleanupSeconds,
                             historyPersistenceSeconds: historyCompletedAt - historyStartedAt,
                             journalCleanupSeconds: journalCleanupCompletedAt - journalCleanupStartedAt,
                             permissionRecheckSeconds: permissionRecheckCompletedAt - permissionRecheckStartedAt,
@@ -14055,6 +14409,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         filler.state = settings.removeFillerWords ? .on : .off
         sub.addItem(filler)
 
+        let aiCleanup = NSMenuItem(title: "AI cleanup",
+                                   action: #selector(toggleAICleanup(_:)),
+                                   keyEquivalent: "")
+        aiCleanup.target = self
+        aiCleanup.state = settings.aiCleanupEnabled ? .on : .off
+        if AIKeyStore.read() == nil {
+            aiCleanup.isEnabled = false
+            aiCleanup.toolTip = "Add an API key in Settings to enable AI cleanup"
+        }
+        sub.addItem(aiCleanup)
+
         parent.submenu = sub
         return parent
     }
@@ -15523,6 +15888,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sender.state = settings.removeFillerWords ? .on : .off
     }
 
+    @objc private func toggleAICleanup(_ sender: NSMenuItem) {
+        settings.aiCleanupEnabled.toggle()
+        sender.state = settings.aiCleanupEnabled ? .on : .off
+    }
+
     @objc private func toggleFeedbackSounds(_ sender: NSMenuItem) {
         settings.playFeedbackSounds.toggle()
         sender.state = settings.playFeedbackSounds ? .on : .off
@@ -16209,6 +16579,8 @@ private enum ParakeySelfTest {
             return runSuite("corrections", testTranscriptCorrections)
         case "fillers":
             return runSuite("fillers", testFillerWordRemoval)
+        case "ai-cleanup":
+            return runSuite("ai-cleanup", testAICleanup)
         case "audio-level":
             return runSuite("audio-level", testAudioLevelMetering)
         case "audio-conversion":
@@ -16270,6 +16642,7 @@ private enum ParakeySelfTest {
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
         try testFillerWordRemoval()
+        try testAICleanup()
         try testAudioLevelMetering()
         try testAudioConversion()
         try testAudioInputDeviceFiltering()
@@ -16283,6 +16656,126 @@ private enum ParakeySelfTest {
         try testPrivateLogAppend()
         try testDiagnostics()
         try testInsertionTargetTracking()
+    }
+
+    private static func testAICleanup() throws {
+        // Request body: roles, prompt, temperature, and token budget.
+        let body = AICleanupService.makeRequestBody(text: "hello world",
+                                                    language: .russian,
+                                                    model: "test-model")
+        try expect(body["model"] as? String,
+                   equals: "test-model",
+                   "AI cleanup body should carry the configured model")
+        let messages = body["messages"] as? [[String: String]]
+        try expect(messages?.count,
+                   equals: 2,
+                   "AI cleanup body should contain system and user messages")
+        try expect(messages?.first?["role"],
+                   equals: "system",
+                   "AI cleanup first message should be the system prompt")
+        try expect(messages?.first?["content"]?.contains("\"ru\""),
+                   equals: true,
+                   "AI cleanup system prompt should pin the dictation language")
+        try expect(messages?.last?["role"],
+                   equals: "user",
+                   "AI cleanup second message should be the user message")
+        try expect(messages?.last?["content"],
+                   equals: "hello world",
+                   "AI cleanup user message should carry the raw transcript")
+        try expect(body["temperature"] as? Double,
+                   equals: 0.2,
+                   "AI cleanup should request low-temperature output")
+        try expect(body["max_tokens"] as? Int,
+                   equals: 256,
+                   "AI cleanup should budget at least 256 output tokens")
+
+        let longText = String(repeating: "a", count: 2000)
+        let longBody = AICleanupService.makeRequestBody(text: longText,
+                                                        language: .auto,
+                                                        model: "m")
+        try expect(longBody["max_tokens"] as? Int,
+                   equals: 1000,
+                   "AI cleanup token budget should scale with input length")
+        let autoMessages = longBody["messages"] as? [[String: String]]
+        try expect(autoMessages?.first?["content"]?.contains("ISO code"),
+                   equals: false,
+                   "AI cleanup prompt should not pin a language in auto mode")
+
+        // parseResponse: canonical OpenAI shape.
+        let okData = Data(#"{"choices":[{"message":{"role":"assistant","content":" Fixed text. "}}]}"#.utf8)
+        try expect(try AICleanupService.parseResponse(okData),
+                   equals: "Fixed text.",
+                   "AI cleanup parsing should decode and trim the first choice")
+
+        // parseResponse: error body / missing choices.
+        let errorBody = Data(#"{"error":{"message":"bad key","type":"auth"}}"#.utf8)
+        do {
+            _ = try AICleanupService.parseResponse(errorBody)
+            throw SelfTestFailure.failed("AI cleanup parsing should reject error bodies")
+        } catch AICleanupError.unexpectedResponse {
+        }
+        let noChoices = Data(#"{"choices":[]}"#.utf8)
+        do {
+            _ = try AICleanupService.parseResponse(noChoices)
+            throw SelfTestFailure.failed("AI cleanup parsing should reject empty choices")
+        } catch AICleanupError.unexpectedResponse {
+        }
+
+        // parseResponse: empty model output.
+        let emptyContent = Data(#"{"choices":[{"message":{"content":"   "}}]}"#.utf8)
+        do {
+            _ = try AICleanupService.parseResponse(emptyContent)
+            throw SelfTestFailure.failed("AI cleanup parsing should reject empty content")
+        } catch AICleanupError.emptyResult {
+        }
+
+        // parseResponse: over the size cap.
+        let oversized = Data(repeating: 0x20, count: AICleanupSettings.maxResponseBytes + 1)
+        do {
+            _ = try AICleanupService.parseResponse(oversized)
+            throw SelfTestFailure.failed("AI cleanup parsing should reject oversized responses")
+        } catch AICleanupError.unexpectedResponse {
+        }
+
+        // sanitizeOutput: fences, quotes, blank-line runs.
+        try expect(try AICleanupService.sanitizeOutput("```\nFixed text.\n```",
+                                                       original: "fxied text"),
+                   equals: "Fixed text.",
+                   "AI cleanup sanitize should strip code fences")
+        try expect(try AICleanupService.sanitizeOutput("```text\nFixed.\n```",
+                                                       original: "fxied"),
+                   equals: "Fixed.",
+                   "AI cleanup sanitize should strip language-tagged fences")
+        try expect(try AICleanupService.sanitizeOutput("\"Fixed text.\"",
+                                                       original: "fxied text"),
+                   equals: "Fixed text.",
+                   "AI cleanup sanitize should strip wrapping quotes")
+        try expect(try AICleanupService.sanitizeOutput("One.\n\n\n\nTwo.",
+                                                       original: "One. Two."),
+                   equals: "One.\n\nTwo.",
+                   "AI cleanup sanitize should collapse blank-line runs")
+
+        // sanitizeOutput rejects garbage so the caller falls back to the
+        // pre-AI transcript (the never-lose-a-transcript rule).
+        do {
+            _ = try AICleanupService.sanitizeOutput("   ", original: "hello")
+            throw SelfTestFailure.failed("AI cleanup sanitize should reject empty output")
+        } catch AICleanupError.unexpectedResponse {
+        }
+        let bloated = String(repeating: "x", count: 400)
+        do {
+            _ = try AICleanupService.sanitizeOutput(bloated, original: "hi")
+            throw SelfTestFailure.failed("AI cleanup sanitize should reject oversized output")
+        } catch AICleanupError.unexpectedResponse {
+        }
+
+        // Base URL normalization for endpoint construction.
+        try expect(AICleanupService.normalizedBaseURL(" https://example.com/v1/ "),
+                   equals: "https://example.com/v1",
+                   "AI cleanup should trim and de-slash the base URL")
+        try expect(AICleanupService.normalizedBaseURL("  "),
+                   equals: nil,
+                   "AI cleanup should reject a blank base URL")
     }
 
     private static func testInsertionTargetTracking() throws {
@@ -17416,6 +17909,7 @@ private enum ParakeySelfTest {
             releaseToASRSeconds: 0.010,
             asrTiming: timing,
             postprocessingSeconds: 0.005,
+            aiCleanupSeconds: nil,
             historyPersistenceSeconds: 0.006,
             journalCleanupSeconds: 0.007,
             permissionRecheckSeconds: 0.008,
@@ -20897,6 +21391,9 @@ private struct ControlPanelSettingsDraft: Equatable {
     var primaryCompletionBehavior: DictationCompletionBehavior
     var alternateCompletionEnabled: Bool
     var enterDelayMilliseconds: Int
+    var aiCleanupEnabled: Bool
+    var aiCleanupBaseURL: String
+    var aiCleanupModel: String
     var inputDevicePreference: String
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
@@ -20910,6 +21407,9 @@ private struct ControlPanelSettingsDraft: Equatable {
         primaryCompletionBehavior = settings.primaryCompletionBehavior
         alternateCompletionEnabled = settings.alternateCompletionEnabled
         enterDelayMilliseconds = settings.enterDelayMilliseconds
+        aiCleanupEnabled = settings.aiCleanupEnabled
+        aiCleanupBaseURL = settings.aiCleanupBaseURL
+        aiCleanupModel = settings.aiCleanupModel
         let savedInput = settings.inputDevice
         inputDevicePreference = audioInputDevice(matching: savedInput)?.uid ?? savedInput
         recordingColor = settings.recordingHUDRecordingColor
@@ -20955,6 +21455,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var permissionClickCount: [Permission: Int] = [:]
     private var settingsDraft: ControlPanelSettingsDraft?
     private var hotkeyRecorder: HotkeyRecorderController?
+    private weak var aiKeyField: NSSecureTextField?
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -21212,6 +21713,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(primaryCompletionBehaviorRow(draft))
         root.addArrangedSubview(alternateCompletionRow(draft))
         root.addArrangedSubview(enterDelayRow(draft))
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(aiCleanupSection(draft))
+        root.addArrangedSubview(separator())
         root.addArrangedSubview(hotkeyRow(
             title: t("История", "History"),
             shortcut: draft.historyHotkey,
@@ -22060,6 +22564,121 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
     }
 
+    private func aiCleanupSection(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let section = NSStackView()
+        section.orientation = .vertical
+        section.alignment = .leading
+        section.spacing = 8
+
+        section.addArrangedSubview(panelLabel(t("AI-чистка текста", "AI Cleanup"),
+                                              size: 13,
+                                              weight: .semibold))
+        let detail = panelLabel(
+            t("Необязательно: после распознавания текст отправляется на OpenAI-совместимый сервер для исправления грамматики и пунктуации. По умолчанию выключено.",
+              "Optional: after transcription the text is sent to an OpenAI-compatible endpoint to fix grammar and punctuation. Off by default."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        detail.preferredMaxLayoutWidth = 620
+        section.addArrangedSubview(detail)
+
+        let enableRow = NSStackView()
+        enableRow.orientation = .horizontal
+        enableRow.alignment = .centerY
+        enableRow.spacing = 10
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleAICleanupDraft(_:))
+        toggle.state = draft.aiCleanupEnabled ? .on : .off
+        toggle.toolTip = t("Включить AI-чистку после распознавания.",
+                           "Enable AI cleanup after transcription.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+        enableRow.addArrangedSubview(toggle)
+        enableRow.addArrangedSubview(panelLabel(
+            t("Включить AI-чистку", "Enable AI cleanup"),
+            size: 12
+        ))
+        section.addArrangedSubview(enableRow)
+
+        let urlField = NSTextField(string: draft.aiCleanupBaseURL)
+        urlField.placeholderString = AICleanupSettings.defaultBaseURL
+        urlField.font = .systemFont(ofSize: 12)
+        urlField.target = self
+        urlField.action = #selector(aiCleanupBaseURLChanged(_:))
+        urlField.toolTip = t("Базовый URL OpenAI-совместимого API (без /chat/completions).",
+                             "Base URL of the OpenAI-compatible API (without /chat/completions).")
+        urlField.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        section.addArrangedSubview(urlField)
+
+        let modelField = NSTextField(string: draft.aiCleanupModel)
+        modelField.placeholderString = AICleanupSettings.defaultModel
+        modelField.font = .systemFont(ofSize: 12)
+        modelField.target = self
+        modelField.action = #selector(aiCleanupModelChanged(_:))
+        modelField.toolTip = t("Имя модели на выбранном сервере.",
+                               "Model name on the configured endpoint.")
+        modelField.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        section.addArrangedSubview(modelField)
+
+        let hasKey = AIKeyStore.read() != nil
+        let keyRow = NSStackView()
+        keyRow.orientation = .horizontal
+        keyRow.alignment = .centerY
+        keyRow.spacing = 8
+        let keyField = NSSecureTextField()
+        keyField.placeholderString = hasKey
+            ? t("•••• сохранён", "•••• saved")
+            : t("API-ключ", "API key")
+        keyField.font = .systemFont(ofSize: 12)
+        keyField.toolTip = t("Ключ хранится только в Связке ключей macOS.",
+                             "The key is stored only in the macOS Keychain.")
+        keyField.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        aiKeyField = keyField
+        keyRow.addArrangedSubview(keyField)
+        keyRow.addArrangedSubview(panelButton(
+            t("Сохранить ключ", "Save Key"),
+            action: #selector(saveAIKeyClicked(_:)),
+            toolTip: t("Записать ключ в Связку ключей macOS.",
+                       "Write the key to the macOS Keychain.")
+        ))
+        keyRow.addArrangedSubview(panelButton(
+            t("Удалить ключ", "Remove Key"),
+            action: #selector(removeAIKeyClicked(_:)),
+            enabled: hasKey,
+            toolTip: t("Удалить сохранённый ключ из Связки ключей.",
+                       "Delete the saved key from the Keychain.")
+        ))
+        keyRow.addArrangedSubview(panelButton(
+            t("Проверить подключение", "Test Connection"),
+            action: #selector(testAICleanupConnectionClicked(_:)),
+            enabled: hasKey,
+            toolTip: t("Отправить тестовый запрос к {базовый URL}/models.",
+                       "Send a test request to {base URL}/models.")
+        ))
+        section.addArrangedSubview(keyRow)
+
+        let privacyNote = panelLabel(
+            t("Внимание: бесплатные модели OpenCode Zen могут сохранять отправленный текст для улучшения модели. Для диктовки личных текстов выберите платную модель без хранения данных или другого провайдера.",
+              "Note: free OpenCode Zen models may retain submitted text for model improvement. For personal dictation, pick a zero-retention paid model or another provider."),
+            size: 11.5,
+            color: .secondaryLabelColor
+        )
+        privacyNote.preferredMaxLayoutWidth = 620
+        section.addArrangedSubview(privacyNote)
+
+        let docsLink = NSButton(title: "opencode.ai/docs/zen",
+                                target: self,
+                                action: #selector(openZenDocsClicked(_:)))
+        docsLink.isBordered = false
+        docsLink.font = .systemFont(ofSize: 11.5)
+        docsLink.contentTintColor = .systemBlue
+        docsLink.toolTip = "https://opencode.ai/docs/zen/"
+        docsLink.setContentHuggingPriority(.required, for: .horizontal)
+        section.addArrangedSubview(docsLink)
+
+        return section
+    }
+
     private func microphoneSettingsRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         let devices = availableAudioInputDevices()
         let preference = draft.inputDevicePreference
@@ -22260,8 +22879,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         icon.contentTintColor = .secondaryLabelColor
         row.addArrangedSubview(icon)
         let label = panelLabel(
-            t("Аудио и распознавание остаются на Mac. Интернет нужен только для первой загрузки модели и обновлений.",
-              "Audio and transcription stay on this Mac. Internet is only used for the first model download and updates."),
+            t("Аудио и распознавание остаются на Mac. Интернет нужен для первой загрузки модели, обновлений и — если включена AI-чистка — для отправки текста на выбранный вами сервер.",
+              "Audio and transcription stay on this Mac. Internet is used for the first model download, updates, and — only if AI cleanup is enabled — to send text to the endpoint you configured."),
             size: 11.5,
             color: .secondaryLabelColor
         )
@@ -22726,14 +23345,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 660),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 980),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 680, height: 660)
-        settingsWindow.contentMaxSize = NSSize(width: 680, height: 660)
+        settingsWindow.contentMinSize = NSSize(width: 680, height: 980)
+        settingsWindow.contentMaxSize = NSSize(width: 680, height: 980)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
@@ -22908,6 +23527,107 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func toggleAICleanupDraft(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.aiCleanupEnabled = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func aiCleanupBaseURLChanged(_ sender: NSTextField) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.aiCleanupBaseURL = sender.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func aiCleanupModelChanged(_ sender: NSTextField) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.aiCleanupModel = sender.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func saveAIKeyClicked(_ sender: NSButton) {
+        let key = aiKeyField?.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !key.isEmpty else { return }
+        do {
+            try AIKeyStore.write(key)
+            refreshSettingsWindow()
+        } catch {
+            showError(
+                title: t("Не удалось сохранить ключ", "Couldn’t Save Key"),
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    @objc private func removeAIKeyClicked(_ sender: NSButton) {
+        do {
+            try AIKeyStore.delete()
+            // Without a key every dictation would fail with noAPIKey — turn the feature off.
+            settings.aiCleanupEnabled = false
+            if var draft = settingsDraft {
+                draft.aiCleanupEnabled = false
+                settingsDraft = draft
+            }
+            DistributedNotificationCenter.default().postNotificationName(
+                SETTINGS_CHANGED_NOTIFICATION,
+                object: nil,
+                userInfo: nil,
+                deliverImmediately: true
+            )
+            refreshSettingsWindow()
+        } catch {
+            showError(
+                title: t("Не удалось удалить ключ", "Couldn’t Remove Key"),
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    @objc private func testAICleanupConnectionClicked(_ sender: NSButton) {
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        guard let key = AIKeyStore.read() else {
+            showError(
+                title: t("Нет API-ключа", "No API Key"),
+                detail: t("Сначала сохраните API-ключ.", "Save an API key first.")
+            )
+            return
+        }
+        sender.isEnabled = false
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await AICleanupService.probeModels(baseURL: draft.aiCleanupBaseURL,
+                                                            apiKey: key)
+            switch result {
+            case .success:
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = t("Подключение успешно", "Connection OK")
+                alert.informativeText = t("Сервер ответил на запрос списка моделей.",
+                                          "The endpoint answered the model-list request.")
+                alert.addButton(withTitle: t("ОК", "OK"))
+                alert.runModal()
+            case .failure(let error):
+                self.showError(
+                    title: t("Проверка не удалась", "Connection Failed"),
+                    detail: error.localizedDescription
+                )
+            }
+            self.refreshSettingsWindow()
+        }
+    }
+
+    @objc private func openZenDocsClicked(_ sender: NSButton) {
+        if let url = URL(string: "https://opencode.ai/docs/zen/") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     @objc private func saveSettingsClicked(_ sender: NSButton) {
         guard let draft = settingsDraft,
               settingsValidationMessage(draft) == nil else { return }
@@ -22927,6 +23647,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.primaryCompletionBehavior = draft.primaryCompletionBehavior
         settings.alternateCompletionEnabled = draft.alternateCompletionEnabled
         settings.enterDelayMilliseconds = draft.enterDelayMilliseconds
+        settings.aiCleanupEnabled = draft.aiCleanupEnabled
+        settings.aiCleanupBaseURL = draft.aiCleanupBaseURL
+        settings.aiCleanupModel = draft.aiCleanupModel
         settings.inputDevice = draft.inputDevicePreference
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
