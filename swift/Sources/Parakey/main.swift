@@ -2635,6 +2635,7 @@ final class Settings: @unchecked Sendable {
     private static let keyAICleanupEnabled = "ai_cleanup_enabled"
     private static let keyAICleanupBaseURL = "ai_cleanup_base_url"
     private static let keyAICleanupModel = "ai_cleanup_model"
+    private static let keyRemoveFinalPeriod = "remove_final_period_v1"
     private static let keyEnterDelayMilliseconds = "enter_delay_milliseconds_v1"
     private static let keyActiveRunMarker = "active_run_marker"
     private static let keyAgentEnabled = "agent_enabled"
@@ -3303,6 +3304,11 @@ final class Settings: @unchecked Sendable {
         AICleanupSettings(enabled: aiCleanupEnabled,
                           baseURL: aiCleanupBaseURL,
                           model: aiCleanupModel)
+    }
+
+    var removeFinalPeriod: Bool {
+        get { defaults.bool(forKey: Self.keyRemoveFinalPeriod) }
+        set { defaults.set(newValue, forKey: Self.keyRemoveFinalPeriod) }
     }
 
     var hasActiveRunMarker: Bool {
@@ -6263,24 +6269,39 @@ private struct DictationTextProcessingResult: Equatable {
     let removedFillerWordCount: Int
 }
 
+private func removingFinalPeriod(from text: String) -> String {
+    guard text.last == "." else { return text }
+    let textWithoutFinalPeriod = text.dropLast()
+    guard textWithoutFinalPeriod.last != "." else { return text }
+    return String(textWithoutFinalPeriod)
+}
+
 private func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool,
+                                    removeFinalPeriod: Bool = false,
                                     language: DictationLanguage = .auto) -> DictationTextProcessingResult {
     let trimmed = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
     let repaired = SpeechModelTextRepair.apply(to: trimmed, language: language)
     let corrected = TranscriptCorrector.apply(to: repaired, corrections: corrections)
 
-    guard removeFillerWords else {
-        return DictationTextProcessingResult(text: corrected.text,
-                                             appliedCorrectionCount: corrected.appliedCount,
-                                             removedFillerWordCount: 0)
+    let textAfterFillers: String
+    let removedFillerWordCount: Int
+    if removeFillerWords {
+        let stripped = FillerWordRemover.apply(to: corrected.text)
+        textAfterFillers = stripped.text
+        removedFillerWordCount = stripped.removedCount
+    } else {
+        textAfterFillers = corrected.text
+        removedFillerWordCount = 0
     }
 
-    let stripped = FillerWordRemover.apply(to: corrected.text)
-    return DictationTextProcessingResult(text: stripped.text,
+    let finalText = removeFinalPeriod
+        ? removingFinalPeriod(from: textAfterFillers)
+        : textAfterFillers
+    return DictationTextProcessingResult(text: finalText,
                                          appliedCorrectionCount: corrected.appliedCount,
-                                         removedFillerWordCount: stripped.removedCount)
+                                         removedFillerWordCount: removedFillerWordCount)
 }
 
 // MARK: - Text insertion
@@ -10986,6 +11007,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let processed = processedDictationText(rawTranscript: transcription.text,
                                                        corrections: settings.transcriptCorrections,
                                                        removeFillerWords: settings.removeFillerWords,
+                                                       removeFinalPeriod: settings.removeFinalPeriod,
                                                        language: settings.dictationLanguage)
                 if !processed.text.isEmpty {
                     addToHistory(
@@ -12407,6 +12429,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
+                                                           removeFinalPeriod: settings.removeFinalPeriod,
                                                            language: settings.dictationLanguage)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
                     if processed.appliedCorrectionCount > 0 {
@@ -12587,6 +12610,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
+                                                           removeFinalPeriod: settings.removeFinalPeriod,
                                                            language: settings.dictationLanguage)
                     if !processed.text.isEmpty {
                         addToHistory(
@@ -14058,6 +14082,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 "Language: \(languageSettingText)",
                 "Paste behavior: \(PASTE_SUFFIX_DISPLAY[settings.pasteSuffix] ?? settings.pasteSuffix.rawValue)",
                 "Remove filler words: \(settings.removeFillerWords)",
+                "Remove final period: \(settings.removeFinalPeriod)",
                 "Recent transcripts: \(RECENT_TRANSCRIPT_LIMIT_DISPLAY[settings.recentTranscriptLimit] ?? settings.recentTranscriptLimit.rawValue) (\(visibleHistory.count) visible, \(history.count) archived)",
                 "Text corrections: \(settings.transcriptCorrections.count) configured",
                 "Text correction sync: \(settings.transcriptCorrectionsSyncFile.isEmpty ? "off" : "configured")",
@@ -17705,6 +17730,75 @@ private enum ParakeySelfTest {
     }
 
     private static func testPasteSuffixFormatting() throws {
+        try expect(
+            removingFinalPeriod(from: "Привет."),
+            equals: "Привет",
+            "final period postprocessing should remove one final ASCII period"
+        )
+        try expect(
+            removingFinalPeriod(from: "Привет!"),
+            equals: "Привет!",
+            "final period postprocessing should preserve an exclamation mark"
+        )
+        try expect(
+            removingFinalPeriod(from: "Привет?"),
+            equals: "Привет?",
+            "final period postprocessing should preserve a question mark"
+        )
+        try expect(
+            removingFinalPeriod(from: "Ну вот..."),
+            equals: "Ну вот...",
+            "final period postprocessing should preserve an ASCII ellipsis"
+        )
+        try expect(
+            removingFinalPeriod(from: "Ну вот…"),
+            equals: "Ну вот…",
+            "final period postprocessing should preserve a Unicode ellipsis"
+        )
+        try expect(
+            removingFinalPeriod(from: "Версия 1.2 готова."),
+            equals: "Версия 1.2 готова",
+            "final period postprocessing should preserve internal periods"
+        )
+        try expect(
+            removingFinalPeriod(from: ""),
+            equals: "",
+            "final period postprocessing should preserve empty text"
+        )
+
+        let disabledPostprocessing = processedDictationText(
+            rawTranscript: "Привет.",
+            corrections: [],
+            removeFillerWords: false,
+            removeFinalPeriod: false
+        )
+        try expect(
+            disabledPostprocessing.text,
+            equals: "Привет.",
+            "disabled final period postprocessing should preserve existing behavior"
+        )
+
+        let settingsSuiteName = "com.local.superdictate.self-test.postprocessing.\(UUID().uuidString)"
+        guard let settingsDefaults = UserDefaults(suiteName: settingsSuiteName) else {
+            throw SelfTestFailure.failed("could not create isolated postprocessing defaults")
+        }
+        settingsDefaults.removePersistentDomain(forName: settingsSuiteName)
+        defer { settingsDefaults.removePersistentDomain(forName: settingsSuiteName) }
+        let initialSettings = Settings(defaults: settingsDefaults)
+        try expect(
+            initialSettings.removeFinalPeriod,
+            equals: false,
+            "final period removal should default to disabled"
+        )
+        initialSettings.removeFinalPeriod = true
+        settingsDefaults.synchronize()
+        let reloadedSettings = Settings(defaults: settingsDefaults)
+        try expect(
+            reloadedSettings.removeFinalPeriod,
+            equals: true,
+            "final period removal should persist across settings instances"
+        )
+
         try expect(
             pastedText(from: "hello world", suffix: .appendSpace),
             equals: "hello world ",
@@ -21520,6 +21614,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var aiCleanupBaseURL: String
     var aiCleanupModel: String
     var inputDevicePreference: String
+    var removeFinalPeriod: Bool
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
@@ -21537,6 +21632,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         aiCleanupModel = settings.aiCleanupModel
         let savedInput = settings.inputDevice
         inputDevicePreference = audioInputDevice(matching: savedInput)?.uid ?? savedInput
+        removeFinalPeriod = settings.removeFinalPeriod
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
@@ -21759,6 +21855,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 inputDevices,
                 settings.primaryCompletionBehavior.rawValue,
                 settings.alternateCompletionEnabled ? "alternate-on" : "alternate-off",
+                settings.removeFinalPeriod ? "remove-period-on" : "remove-period-off",
                 settings.triggerMode.rawValue,
                 settings.recordingHUDRecordingColor.rawValue,
                 settings.recordingHUDTranscribingColor.rawValue,
@@ -21850,6 +21947,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(microphoneSettingsRow(draft))
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(panelLabel(t("Обработка текста", "Text processing"),
+                                           size: 12,
+                                           weight: .semibold,
+                                           color: .secondaryLabelColor))
+        root.addArrangedSubview(removeFinalPeriodRow(draft))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
@@ -22893,6 +22996,45 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func removeFinalPeriodRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(t("Убирать точку в конце", "Remove final period"),
+                                           size: 13,
+                                           weight: .semibold))
+        let detail = panelLabel(
+            t("Убирает только последнюю точку. !, ?, многоточия и точки внутри текста сохраняются.",
+              "Removes only the final period. !, ?, ellipses, and periods inside the text remain."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        detail.maximumNumberOfLines = 2
+        detail.lineBreakMode = .byWordWrapping
+        detail.preferredMaxLayoutWidth = 500
+        text.addArrangedSubview(detail)
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleRemoveFinalPeriod(_:))
+        toggle.state = draft.removeFinalPeriod ? .on : .off
+        toggle.isEnabled = serviceOperation == nil
+        toggle.toolTip = t("Убрать один символ . только в самом конце распознанного текста.",
+                           "Remove one . character only at the very end of transcribed text.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     private func popupRow(title: String,
                           detail: String,
                           selectedValue: String,
@@ -23603,6 +23745,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func toggleRemoveFinalPeriod(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.removeFinalPeriod = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDRecordingColor(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let color = RecordingHUDAccentColor(rawValue: raw) else { return }
@@ -23785,6 +23934,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.aiCleanupBaseURL = draft.aiCleanupBaseURL
         settings.aiCleanupModel = draft.aiCleanupModel
         settings.inputDevice = draft.inputDevicePreference
+        settings.removeFinalPeriod = draft.removeFinalPeriod
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
