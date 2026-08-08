@@ -3300,12 +3300,6 @@ final class Settings: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Self.keyAICleanupModel) }
     }
 
-    var aiCleanup: AICleanupSettings {
-        AICleanupSettings(enabled: aiCleanupEnabled,
-                          baseURL: aiCleanupBaseURL,
-                          model: aiCleanupModel)
-    }
-
     var removeFinalPeriod: Bool {
         get { defaults.bool(forKey: Self.keyRemoveFinalPeriod) }
         set { defaults.set(newValue, forKey: Self.keyRemoveFinalPeriod) }
@@ -3782,14 +3776,15 @@ final class Permissions {
     }
 
     /// Revoke every macOS permission the app holds via `tccutil reset`.
-    /// Only ever called from an explicit user action (the Reset button in
-    /// the permissions card) — never automatically.
-    static func resetAll() {
+    /// Only ever called from an explicit, confirmed action in Settings —
+    /// never automatically.
+    nonisolated static func resetAll() -> [String] {
         let services: [Permission: String] = [
             .microphone: "Microphone",
             .accessibility: "Accessibility",
             .inputMonitoring: "ListenEvent",
         ]
+        var failures: [String] = []
         for permission in Permission.allCases {
             guard let service = services[permission] else { continue }
             let process = Process()
@@ -3800,11 +3795,14 @@ final class Permissions {
                 process.waitUntilExit()
                 if process.terminationStatus != 0 {
                     log("Permissions.resetAll: tccutil reset \(service) exited \(process.terminationStatus)")
+                    failures.append(service)
                 }
             } catch {
                 log("Permissions.resetAll: tccutil reset \(service) failed: \(error.localizedDescription)")
+                failures.append(service)
             }
         }
+        return failures
     }
 }
 
@@ -5897,16 +5895,13 @@ enum FillerWordRemover {
 //   - The API key lives only in the macOS Keychain, never in UserDefaults,
 //     the repo, or logs. Log lines must never contain transcript text.
 
-struct AICleanupSettings: Equatable, Sendable {
+enum AICleanupSettings {
     static let defaultBaseURL = "https://api.groq.com/openai/v1"
     static let defaultModel = "llama-3.1-8b-instant"
     /// Dictation is latency-sensitive; the added wait must stay small.
     static let timeoutSeconds = 3.0
     static let maxResponseBytes = 256 * 1024
 
-    var enabled: Bool
-    var baseURL: String
-    var model: String
 }
 
 enum AICleanupError: LocalizedError {
@@ -6045,8 +6040,20 @@ enum AICleanupService {
 
     static func normalizedBaseURL(_ value: String) -> String? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
+        guard !trimmed.isEmpty,
+              var components = URLComponents(string: trimmed),
+              components.scheme?.lowercased() == "https",
+              let host = components.host,
+              !host.isEmpty,
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil else { return nil }
+
+        while components.path.hasSuffix("/") {
+            components.path.removeLast()
+        }
+        return components.url?.absoluteString
     }
 
     static func makeRequestBody(text: String,
@@ -6090,6 +6097,7 @@ enum AICleanupService {
               let dict = object as? [String: Any],
               let choices = dict["choices"] as? [[String: Any]],
               let first = choices.first,
+              (first["finish_reason"] as? String).map({ $0 == "stop" }) ?? true,
               let message = first["message"] as? [String: Any],
               let content = message["content"] as? String else {
             throw AICleanupError.unexpectedResponse
@@ -6276,6 +6284,11 @@ private func removingFinalPeriod(from text: String) -> String {
     return String(textWithoutFinalPeriod)
 }
 
+private func finalizedDictationText(_ text: String,
+                                    removeFinalPeriod: Bool) -> String {
+    removeFinalPeriod ? removingFinalPeriod(from: text) : text
+}
+
 private func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool,
@@ -6296,9 +6309,8 @@ private func processedDictationText(rawTranscript: String,
         removedFillerWordCount = 0
     }
 
-    let finalText = removeFinalPeriod
-        ? removingFinalPeriod(from: textAfterFillers)
-        : textAfterFillers
+    let finalText = finalizedDictationText(textAfterFillers,
+                                           removeFinalPeriod: removeFinalPeriod)
     return DictationTextProcessingResult(text: finalText,
                                          appliedCorrectionCount: corrected.appliedCount,
                                          removedFillerWordCount: removedFillerWordCount)
@@ -12458,6 +12470,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                         aiCleanupSeconds = ProcessInfo.processInfo.systemUptime - aiCleanupStartedAt
                     }
+                    finalText = finalizedDictationText(
+                        finalText,
+                        removeFinalPeriod: settings.removeFinalPeriod
+                    )
 
                     if !cleaned.isEmpty {
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
@@ -14524,17 +14540,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         filler.state = settings.removeFillerWords ? .on : .off
         sub.addItem(filler)
 
-        let aiCleanup = NSMenuItem(title: "AI cleanup",
-                                   action: #selector(toggleAICleanup(_:)),
-                                   keyEquivalent: "")
-        aiCleanup.target = self
-        aiCleanup.state = settings.aiCleanupEnabled ? .on : .off
-        if AIKeyStore.read() == nil {
-            aiCleanup.isEnabled = false
-            aiCleanup.toolTip = "Add an API key in Settings to enable AI cleanup"
-        }
-        sub.addItem(aiCleanup)
-
         parent.submenu = sub
         return parent
     }
@@ -16003,11 +16008,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sender.state = settings.removeFillerWords ? .on : .off
     }
 
-    @objc private func toggleAICleanup(_ sender: NSMenuItem) {
-        settings.aiCleanupEnabled.toggle()
-        sender.state = settings.aiCleanupEnabled ? .on : .off
-    }
-
     @objc private func toggleFeedbackSounds(_ sender: NSMenuItem) {
         settings.playFeedbackSounds.toggle()
         sender.state = settings.playFeedbackSounds ? .on : .off
@@ -16845,6 +16845,15 @@ private enum ParakeySelfTest {
         } catch AICleanupError.unexpectedResponse {
         }
 
+        // A syntactically valid but token-limited completion is incomplete.
+        // Accepting it would replace the full local transcript with a prefix.
+        let truncated = Data(#"{"choices":[{"finish_reason":"length","message":{"content":"Only the first half"}}]}"#.utf8)
+        do {
+            _ = try AICleanupService.parseResponse(truncated)
+            throw SelfTestFailure.failed("AI cleanup parsing should reject truncated completions")
+        } catch AICleanupError.unexpectedResponse {
+        }
+
         // parseResponse: empty model output.
         let emptyContent = Data(#"{"choices":[{"message":{"content":"   "}}]}"#.utf8)
         do {
@@ -16926,6 +16935,29 @@ private enum ParakeySelfTest {
         try expect(AICleanupService.normalizedBaseURL("  "),
                    equals: nil,
                    "AI cleanup should reject a blank base URL")
+        try expect(AICleanupService.normalizedBaseURL("http://example.com/v1"),
+                   equals: nil,
+                   "AI cleanup should never send transcripts or API keys over plaintext HTTP")
+        try expect(AICleanupService.normalizedBaseURL("https://user:pass@example.com/v1"),
+                   equals: nil,
+                   "AI cleanup should reject endpoint URLs containing credentials")
+        try expect(AICleanupService.normalizedBaseURL("https://example.com/v1?route=other"),
+                   equals: nil,
+                   "AI cleanup should reject endpoint URLs containing a query")
+
+        let settingsSuiteName = "com.local.superdictate.self-test.ai-cleanup.\(UUID().uuidString)"
+        guard let settingsDefaults = UserDefaults(suiteName: settingsSuiteName) else {
+            throw SelfTestFailure.failed("could not create isolated AI cleanup defaults")
+        }
+        settingsDefaults.removePersistentDomain(forName: settingsSuiteName)
+        defer { settingsDefaults.removePersistentDomain(forName: settingsSuiteName) }
+        try expect(Settings(defaults: settingsDefaults).aiCleanupEnabled,
+                   equals: false,
+                   "AI cleanup should remain completely opt-in")
+
+        try expect(finalizedDictationText("Исправленный текст.", removeFinalPeriod: true),
+                   equals: "Исправленный текст",
+                   "deterministic text settings should be applied after AI cleanup")
     }
 
     private static func testInsertionTargetTracking() throws {
@@ -21627,7 +21659,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         primaryCompletionBehavior = settings.primaryCompletionBehavior
         alternateCompletionEnabled = settings.alternateCompletionEnabled
         enterDelayMilliseconds = settings.enterDelayMilliseconds
-        aiCleanupEnabled = settings.aiCleanupEnabled
+        aiCleanupEnabled = settings.aiCleanupEnabled && AIKeyStore.read() != nil
         aiCleanupBaseURL = settings.aiCleanupBaseURL
         aiCleanupModel = settings.aiCleanupModel
         let savedInput = settings.inputDevice
@@ -21661,6 +21693,11 @@ private enum ControlPanelUpdateState: Equatable, Sendable {
     case available(GitHubRelease)
     case preparing(version: String, phase: String)
     case failed(String)
+}
+
+@MainActor
+private final class SettingsDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 @MainActor
@@ -21993,6 +22030,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Выбрать фон плавающего индикатора диктовки.",
                        "Choose the floating dictation indicator background.")
         ))
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(permissionsRecoveryRow())
         root.addArrangedSubview(settingsActionsRow(draft: draft))
         root.addArrangedSubview(privacyInfoView())
 
@@ -22000,13 +22039,34 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         background.material = .underWindowBackground
         background.blendingMode = .behindWindow
         background.state = .active
-        background.addSubview(root)
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+
+        let document = SettingsDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(root)
+        scroll.documentView = document
+        background.addSubview(scroll)
 
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
-            root.topAnchor.constraint(equalTo: background.topAnchor),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: background.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: background.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            root.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            root.topAnchor.constraint(equalTo: document.topAnchor),
+            root.bottomAnchor.constraint(equalTo: document.bottomAnchor),
         ])
 
         let innerWidthInset = -(root.edgeInsets.left + root.edgeInsets.right)
@@ -22230,15 +22290,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             weight: .medium,
             color: color
         ))
-        let resetButton = panelButton(
-            t("Сбросить", "Reset"),
-            action: #selector(resetPermissionsClicked(_:)),
-            enabled: serviceOperation == nil,
-            toolTip: t("Отозвать все разрешения macOS у SuperDictate (микрофон, вставка текста, хоткей). После сброса их нужно выдать заново.",
-                       "Revoke all macOS permissions from SuperDictate (microphone, text insertion, hotkey). You'll need to grant them again.")
-        )
-        resetButton.controlSize = .small
-        header.addArrangedSubview(resetButton)
         content.addArrangedSubview(header)
 
         if missing.isEmpty {
@@ -22819,6 +22870,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         detail.preferredMaxLayoutWidth = 620
         section.addArrangedSubview(detail)
 
+        let hasKey = AIKeyStore.read() != nil
         let enableRow = NSStackView()
         enableRow.orientation = .horizontal
         enableRow.alignment = .centerY
@@ -22827,8 +22879,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         toggle.target = self
         toggle.action = #selector(toggleAICleanupDraft(_:))
         toggle.state = draft.aiCleanupEnabled ? .on : .off
-        toggle.toolTip = t("Включить AI-чистку после распознавания.",
-                           "Enable AI cleanup after transcription.")
+        toggle.isEnabled = hasKey
+        toggle.toolTip = hasKey
+            ? t("Включить AI-чистку после распознавания.",
+                "Enable AI cleanup after transcription.")
+            : t("Сначала сохраните API-ключ.", "Save an API key first.")
         toggle.setContentHuggingPriority(.required, for: .horizontal)
         enableRow.addArrangedSubview(toggle)
         enableRow.addArrangedSubview(panelLabel(
@@ -22857,7 +22912,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         modelField.widthAnchor.constraint(equalToConstant: 420).isActive = true
         section.addArrangedSubview(modelField)
 
-        let hasKey = AIKeyStore.read() != nil
         let keyRow = NSStackView()
         keyRow.orientation = .horizontal
         keyRow.alignment = .centerY
@@ -23032,6 +23086,51 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func permissionsRecoveryRow() -> NSView {
+        let runtime = AgentRuntimeStateStore.read()
+        let dictationInProgress = runtime?.isRecording == true
+            || runtime?.isTranscribing == true
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Восстановление разрешений", "Permission recovery"),
+            size: 13,
+            weight: .semibold
+        ))
+        let detail = panelLabel(
+            t("Только если доступы macOS сломались после переустановки. Все три разрешения придётся выдать заново.",
+              "Use only when macOS permissions became stuck after reinstalling. All three permissions must be granted again."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        detail.maximumNumberOfLines = 2
+        detail.preferredMaxLayoutWidth = 470
+        text.addArrangedSubview(detail)
+
+        let reset = panelButton(
+            t("Сбросить…", "Reset…"),
+            action: #selector(resetPermissionsClicked(_:)),
+            enabled: serviceOperation == nil && !dictationInProgress,
+            toolTip: dictationInProgress
+                ? t("Сначала завершите текущую диктовку.", "Finish the current dictation first.")
+                : t("Отозвать разрешения SuperDictate после дополнительного подтверждения.",
+                    "Revoke SuperDictate permissions after an additional confirmation.")
+        )
+        reset.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(reset)
         return row
     }
 
@@ -23621,14 +23720,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 980),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 760),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 680, height: 980)
-        settingsWindow.contentMaxSize = NSSize(width: 680, height: 980)
+        settingsWindow.contentMinSize = NSSize(width: 680, height: 760)
+        settingsWindow.contentMaxSize = NSSize(width: 680, height: 760)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
@@ -23958,9 +24057,58 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func resetPermissionsClicked(_ sender: NSButton) {
-        Permissions.resetAll()
-        permissionClickCount = [:]
-        refresh(force: true)
+        guard serviceOperation == nil else { return }
+        let runtime = AgentRuntimeStateStore.read()
+        guard runtime?.isRecording != true,
+              runtime?.isTranscribing != true else {
+            showError(
+                title: t("Сначала завершите диктовку", "Finish Dictation First"),
+                detail: t("Разрешения нельзя сбрасывать во время записи или транскрибации.",
+                          "Permissions cannot be reset while recording or transcribing.")
+            )
+            return
+        }
+
+        let confirmation = NSAlert()
+        confirmation.alertStyle = .critical
+        confirmation.messageText = t("Сбросить разрешения SuperDictate?",
+                                     "Reset SuperDictate Permissions?")
+        confirmation.informativeText = t(
+            "Микрофон, Универсальный доступ и Мониторинг ввода будут отозваны. Используйте это только для восстановления сломанных разрешений; затем их нужно выдать заново.",
+            "Microphone, Accessibility, and Input Monitoring access will be revoked. Use this only to recover stuck permissions; all three must then be granted again."
+        )
+        confirmation.addButton(withTitle: t("Отмена", "Cancel"))
+        confirmation.addButton(withTitle: t("Сбросить", "Reset"))
+        guard confirmation.runModal() == .alertSecondButtonReturn else { return }
+
+        sender.isEnabled = false
+        Task { @MainActor [weak self, weak sender] in
+            let failures = await Task.detached(priority: .userInitiated) {
+                Permissions.resetAll()
+            }.value
+            guard let self else { return }
+            sender?.isEnabled = true
+            self.permissionClickCount = [:]
+            self.refresh(force: true)
+
+            if failures.isEmpty {
+                let result = NSAlert()
+                result.alertStyle = .informational
+                result.messageText = self.t("Разрешения сброшены", "Permissions Reset")
+                result.informativeText = self.t(
+                    "Вернитесь в панель управления и выдайте три разрешения заново.",
+                    "Return to the control panel and grant all three permissions again."
+                )
+                result.addButton(withTitle: self.t("ОК", "OK"))
+                result.runModal()
+            } else {
+                self.showError(
+                    title: self.t("Сброс выполнен не полностью", "Reset Was Incomplete"),
+                    detail: self.t("Не удалось сбросить: \(failures.joined(separator: ", ")).",
+                                   "Could not reset: \(failures.joined(separator: ", ")).")
+                )
+            }
+        }
     }
 
     @objc private func grantPermissionClicked(_ sender: NSButton) {
