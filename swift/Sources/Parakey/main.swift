@@ -3295,7 +3295,10 @@ final class Settings: @unchecked Sendable {
         get {
             let stored = defaults.string(forKey: Self.keyAICleanupModel)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return stored.isEmpty ? AICleanupSettings.defaultModel : stored
+            if stored.isEmpty || AICleanupSettings.legacyDefaultModels.contains(stored) {
+                return AICleanupSettings.defaultModel
+            }
+            return stored
         }
         set { defaults.set(newValue, forKey: Self.keyAICleanupModel) }
     }
@@ -5897,10 +5900,12 @@ enum FillerWordRemover {
 
 enum AICleanupSettings {
     static let defaultBaseURL = "https://api.groq.com/openai/v1"
-    static let defaultModel = "llama-3.1-8b-instant"
+    static let defaultModel = "openai/gpt-oss-20b"
+    static let legacyDefaultModels: Set<String> = ["llama-3.1-8b-instant"]
     /// Dictation is latency-sensitive; the added wait must stay small.
     static let timeoutSeconds = 3.0
     static let maxResponseBytes = 256 * 1024
+    static let maxModelsResponseBytes = 1024 * 1024
 
 }
 
@@ -5915,6 +5920,8 @@ enum AICleanupError: LocalizedError {
     case unexpectedResponse
     /// The model returned no text.
     case emptyResult
+    /// The endpoint is reachable, but the configured model is unavailable.
+    case modelUnavailable(String)
 
     var errorDescription: String? {
         switch self {
@@ -5928,7 +5935,20 @@ enum AICleanupError: LocalizedError {
             return "unexpected response"
         case .emptyResult:
             return "empty result"
+        case .modelUnavailable(let model):
+            return "model unavailable: \(model)"
         }
+    }
+}
+
+private final class AICleanupSessionDelegate: NSObject,
+                                              URLSessionTaskDelegate,
+                                              @unchecked Sendable {
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest) async -> URLRequest? {
+        AICleanupService.redirectedRequest(request)
     }
 }
 
@@ -5953,16 +5973,30 @@ enum AICleanupService {
 
     /// Shared session so consecutive dictations reuse the warm TCP/TLS
     /// connection to the endpoint instead of paying for a fresh handshake
-    /// (~0.4s) every time. Still ephemeral: no disk cache, no cookies —
-    /// only the connection pool is kept alive. Never invalidated.
+    /// (~0.4s) every time. No cache, cookies, credentials, or redirects are
+    /// accepted; only the connection pool is kept alive. Never invalidated.
+    private static let sessionDelegate = AICleanupSessionDelegate()
     private static let sharedSession: URLSession = {
+        URLSession(configuration: makeSessionConfiguration(
+            timeout: AICleanupSettings.timeoutSeconds
+        ), delegate: sessionDelegate, delegateQueue: nil)
+    }()
+
+    static func makeSessionConfiguration(timeout: TimeInterval) -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.urlCache = nil
-        config.timeoutIntervalForRequest = AICleanupSettings.timeoutSeconds
-        config.timeoutIntervalForResource = AICleanupSettings.timeoutSeconds
-        return URLSession(configuration: config)
-    }()
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        config.urlCredentialStorage = nil
+        config.timeoutIntervalForRequest = timeout
+        config.timeoutIntervalForResource = timeout
+        return config
+    }
+
+    static func redirectedRequest(_ request: URLRequest) -> URLRequest? {
+        nil
+    }
 
     /// One dictation round-trip: build the request, send it, and return the
     /// sanitized corrected text. Throws on any failure — the caller must
@@ -5985,7 +6019,8 @@ enum AICleanupService {
         req.httpBody = try JSONSerialization.data(
             withJSONObject: makeRequestBody(text: text,
                                             language: language,
-                                            model: settings.aiCleanupModel)
+                                            model: settings.aiCleanupModel,
+                                            useGroqExtensions: isGroqAPIBaseURL(base))
         )
 
         let data: Data
@@ -6008,7 +6043,9 @@ enum AICleanupService {
     /// Connectivity probe behind the settings "Test connection" button:
     /// `GET {base}/models` with the stored key. Not latency-critical, so
     /// it uses a more generous timeout than the dictation path.
-    static func probeModels(baseURL: String, apiKey: String) async -> Result<Void, AICleanupError> {
+    static func probeModels(baseURL: String,
+                            apiKey: String,
+                            model: String) async -> Result<Void, AICleanupError> {
         guard let base = normalizedBaseURL(baseURL),
               let url = URL(string: base + "/models") else {
             return .failure(.unexpectedResponse)
@@ -6016,23 +6053,26 @@ enum AICleanupService {
         var req = URLRequest(url: url)
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.timeoutInterval = 10
-        let config = URLSessionConfiguration.ephemeral
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.urlCache = nil
-        config.timeoutIntervalForRequest = 10
-        config.timeoutIntervalForResource = 10
-        let session = URLSession(configuration: config)
+        let session = URLSession(configuration: makeSessionConfiguration(timeout: 10),
+                                 delegate: sessionDelegate,
+                                 delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
 
         do {
-            let (_, response) = try await session.data(for: req)
+            let (data, response) = try await session.data(for: req)
             guard let http = response as? HTTPURLResponse else {
                 return .failure(.unexpectedResponse)
             }
             guard (200..<300).contains(http.statusCode) else {
                 return .failure(.httpStatus(http.statusCode))
             }
+            let availableModels = try parseAvailableModelIDs(data)
+            guard availableModels.contains(model) else {
+                return .failure(.modelUnavailable(model))
+            }
             return .success(())
+        } catch let error as AICleanupError {
+            return .failure(error)
         } catch {
             return .failure(.network(error))
         }
@@ -6058,13 +6098,15 @@ enum AICleanupService {
 
     static func makeRequestBody(text: String,
                                 language: DictationLanguage,
-                                model: String) -> [String: Any] {
+                                model: String,
+                                useGroqExtensions: Bool = false) -> [String: Any] {
         var system = systemPrompt
         if language != .auto {
             system += "\nThe text is in the language with ISO code \"\(language.rawValue)\"; keep the output in that language."
         }
         let estimatedInputTokens = max(1, text.count / 4)
-        return [
+        let outputTokenLimit = max(256, estimatedInputTokens * 2)
+        var body: [String: Any] = [
             "model": model,
             "messages": [
                 ["role": "system", "content": system],
@@ -6085,8 +6127,19 @@ enum AICleanupService {
                     """],
             ],
             "temperature": 0.2,
-            "max_tokens": max(256, estimatedInputTokens * 2),
         ]
+        if useGroqExtensions && model.hasPrefix("openai/gpt-oss-") {
+            body["reasoning_effort"] = "low"
+            body["include_reasoning"] = false
+            body["max_completion_tokens"] = outputTokenLimit
+        } else {
+            body["max_tokens"] = outputTokenLimit
+        }
+        return body
+    }
+
+    static func isGroqAPIBaseURL(_ value: String) -> Bool {
+        URLComponents(string: value)?.host?.lowercased() == "api.groq.com"
     }
 
     /// Parse an OpenAI-shaped chat-completions response. Enforces the
@@ -6107,6 +6160,19 @@ enum AICleanupService {
             throw AICleanupError.emptyResult
         }
         return trimmed
+    }
+
+    static func parseAvailableModelIDs(_ data: Data) throws -> Set<String> {
+        guard data.count <= AICleanupSettings.maxModelsResponseBytes,
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dict = object as? [String: Any],
+              let models = dict["data"] as? [[String: Any]] else {
+            throw AICleanupError.unexpectedResponse
+        }
+        return Set(models.compactMap { model in
+            guard let id = model["id"] as? String, !id.isEmpty else { return nil }
+            return id
+        })
     }
 
     /// Strip the formatting models add despite instructions (code fences,
@@ -6180,8 +6246,12 @@ enum AICleanupService {
             throw AICleanupError.unexpectedResponse
         }
 
+        let originalCount = original.count
+        let outputCount = text.count
+        let isImplausiblyShort = originalCount >= 80 && outputCount * 4 < originalCount
         guard !text.isEmpty,
-              text.count <= max(256, original.count * 3) else {
+              !isImplausiblyShort,
+              outputCount <= max(256, originalCount * 3) else {
             throw AICleanupError.unexpectedResponse
         }
         return text
@@ -6253,6 +6323,28 @@ enum AIKeyStore {
             throw KeyStoreError.deleteFailed(status)
         }
     }
+}
+
+private enum AICleanupConfigurationIssue: Equatable {
+    case baseURL
+    case model
+}
+
+private func aiCleanupConfigurationIssue(enabled: Bool,
+                                         baseURL: String,
+                                         model: String) -> AICleanupConfigurationIssue? {
+    guard enabled else { return nil }
+    guard baseURL.utf8.count <= 2_048,
+          AICleanupService.normalizedBaseURL(baseURL) != nil else {
+        return .baseURL
+    }
+    let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedModel.isEmpty,
+          normalizedModel.count <= 200,
+          !normalizedModel.contains(where: { $0.isNewline }) else {
+        return .model
+    }
+    return nil
 }
 
 // MARK: - Recording lifecycle decisions
@@ -16774,6 +16866,10 @@ private enum ParakeySelfTest {
     }
 
     private static func testAICleanup() throws {
+        try expect(AICleanupSettings.defaultModel,
+                   equals: "openai/gpt-oss-20b",
+                   "AI cleanup should default to Groq's supported low-latency model")
+
         // Request body: roles, prompt, temperature, and token budget.
         let body = AICleanupService.makeRequestBody(text: "hello world",
                                                     language: .russian,
@@ -16813,6 +16909,31 @@ private enum ParakeySelfTest {
                    equals: 256,
                    "AI cleanup should budget at least 256 output tokens")
 
+        let gptOSSBody = AICleanupService.makeRequestBody(
+            text: "hello world",
+            language: .english,
+            model: AICleanupSettings.defaultModel,
+            useGroqExtensions: true
+        )
+        try expect(gptOSSBody["reasoning_effort"] as? String,
+                   equals: "low",
+                   "GPT-OSS cleanup should use low reasoning effort for latency")
+        try expect(gptOSSBody["include_reasoning"] as? Bool,
+                   equals: false,
+                   "GPT-OSS cleanup should omit reasoning from the response")
+        try expect(gptOSSBody["max_completion_tokens"] as? Int,
+                   equals: 256,
+                   "GPT-OSS cleanup should use the current completion-token field")
+        try expect(gptOSSBody["max_tokens"] == nil,
+                   equals: true,
+                   "GPT-OSS cleanup should not send the deprecated max_tokens field")
+        try expect(AICleanupService.isGroqAPIBaseURL(AICleanupSettings.defaultBaseURL),
+                   equals: true,
+                   "the default endpoint should enable Groq-specific request fields")
+        try expect(AICleanupService.isGroqAPIBaseURL("https://compatible.example/v1"),
+                   equals: false,
+                   "custom endpoints should keep the generic OpenAI request shape")
+
         let longText = String(repeating: "a", count: 2000)
         let longBody = AICleanupService.makeRequestBody(text: longText,
                                                         language: .auto,
@@ -16842,6 +16963,18 @@ private enum ParakeySelfTest {
         do {
             _ = try AICleanupService.parseResponse(noChoices)
             throw SelfTestFailure.failed("AI cleanup parsing should reject empty choices")
+        } catch AICleanupError.unexpectedResponse {
+        }
+
+        let modelsData = Data(#"{"object":"list","data":[{"id":"first/model"},{"id":"openai/gpt-oss-20b"}]}"#.utf8)
+        try expect(try AICleanupService.parseAvailableModelIDs(modelsData)
+            .contains(AICleanupSettings.defaultModel),
+                   equals: true,
+                   "AI cleanup connection probe should verify the configured model")
+        let malformedModelsData = Data(#"{"object":"list"}"#.utf8)
+        do {
+            _ = try AICleanupService.parseAvailableModelIDs(malformedModelsData)
+            throw SelfTestFailure.failed("AI cleanup should reject malformed model lists")
         } catch AICleanupError.unexpectedResponse {
         }
 
@@ -16927,6 +17060,12 @@ private enum ParakeySelfTest {
             throw SelfTestFailure.failed("AI cleanup sanitize should reject oversized output")
         } catch AICleanupError.unexpectedResponse {
         }
+        let longOriginal = String(repeating: "Полная исходная фраза. ", count: 20)
+        do {
+            _ = try AICleanupService.sanitizeOutput("Коротко.", original: longOriginal)
+            throw SelfTestFailure.failed("AI cleanup sanitize should reject implausibly short output")
+        } catch AICleanupError.unexpectedResponse {
+        }
 
         // Base URL normalization for endpoint construction.
         try expect(AICleanupService.normalizedBaseURL(" https://example.com/v1/ "),
@@ -16945,6 +17084,50 @@ private enum ParakeySelfTest {
                    equals: nil,
                    "AI cleanup should reject endpoint URLs containing a query")
 
+        let sessionConfiguration = AICleanupService.makeSessionConfiguration(timeout: 7)
+        try expect(sessionConfiguration.timeoutIntervalForRequest,
+                   equals: 7,
+                   "AI cleanup should apply the requested network timeout")
+        try expect(sessionConfiguration.httpShouldSetCookies,
+                   equals: false,
+                   "AI cleanup should never retain or resend provider cookies")
+        try expect(sessionConfiguration.httpCookieStorage == nil,
+                   equals: true,
+                   "AI cleanup should not allocate cookie storage")
+        try expect(sessionConfiguration.urlCredentialStorage == nil,
+                   equals: true,
+                   "AI cleanup should not retain provider credentials")
+        let redirected = URLRequest(url: URL(string: "https://redirected.example/v1")!)
+        try expect(AICleanupService.redirectedRequest(redirected) == nil,
+                   equals: true,
+                   "AI cleanup should refuse redirects carrying transcript data")
+        try expect(aiCleanupConfigurationIssue(enabled: false,
+                                               baseURL: "http://invalid.example",
+                                               model: ""),
+                   equals: nil,
+                   "disabled AI cleanup should not block unrelated settings")
+        try expect(aiCleanupConfigurationIssue(enabled: true,
+                                               baseURL: "http://invalid.example",
+                                               model: "model"),
+                   equals: .baseURL,
+                   "enabled AI cleanup should require a valid HTTPS endpoint")
+        try expect(aiCleanupConfigurationIssue(enabled: true,
+                                               baseURL: "https://example.com/v1",
+                                               model: "  "),
+                   equals: .model,
+                   "enabled AI cleanup should require a model name")
+        try expect(aiCleanupConfigurationIssue(enabled: true,
+                                               baseURL: "https://example.com/v1",
+                                               model: "provider/model"),
+                   equals: nil,
+                   "valid enabled AI cleanup settings should be accepted")
+        try expect(settingsWindowContentHeight(visibleScreenHeight: 900),
+                   equals: 760,
+                   "settings should use the preferred height when it fits")
+        try expect(settingsWindowContentHeight(visibleScreenHeight: 680),
+                   equals: 600,
+                   "settings should shrink on a shorter visible screen")
+
         let settingsSuiteName = "com.local.superdictate.self-test.ai-cleanup.\(UUID().uuidString)"
         guard let settingsDefaults = UserDefaults(suiteName: settingsSuiteName) else {
             throw SelfTestFailure.failed("could not create isolated AI cleanup defaults")
@@ -16954,6 +17137,14 @@ private enum ParakeySelfTest {
         try expect(Settings(defaults: settingsDefaults).aiCleanupEnabled,
                    equals: false,
                    "AI cleanup should remain completely opt-in")
+        settingsDefaults.set("llama-3.1-8b-instant", forKey: "ai_cleanup_model")
+        try expect(Settings(defaults: settingsDefaults).aiCleanupModel,
+                   equals: AICleanupSettings.defaultModel,
+                   "AI cleanup should migrate the retired former default model")
+        settingsDefaults.set("custom/provider-model", forKey: "ai_cleanup_model")
+        try expect(Settings(defaults: settingsDefaults).aiCleanupModel,
+                   equals: "custom/provider-model",
+                   "AI cleanup should preserve a user-selected custom model")
 
         try expect(finalizedDictationText("Исправленный текст.", removeFinalPeriod: true),
                    equals: "Исправленный текст",
@@ -21695,6 +21886,11 @@ private enum ControlPanelUpdateState: Equatable, Sendable {
     case failed(String)
 }
 
+private func settingsWindowContentHeight(visibleScreenHeight: CGFloat?) -> CGFloat {
+    guard let visibleScreenHeight else { return 760 }
+    return max(520, min(760, visibleScreenHeight - 80))
+}
+
 @MainActor
 private final class SettingsDocumentView: NSView {
     override var isFlipped: Bool { true }
@@ -21714,6 +21910,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var settingsDraft: ControlPanelSettingsDraft?
     private var hotkeyRecorder: HotkeyRecorderController?
     private weak var aiKeyField: NSSecureTextField?
+    private weak var aiBaseURLField: NSTextField?
+    private weak var aiModelField: NSTextField?
+    private weak var settingsScrollView: NSScrollView?
+    private var pendingAIKey = ""
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -21756,6 +21956,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             hotkeyRecorder = nil
             settingsWindow = nil
             settingsDraft = nil
+            aiKeyField = nil
+            aiBaseURLField = nil
+            aiModelField = nil
+            settingsScrollView = nil
+            pendingAIKey = ""
             return
         }
         if closingWindow === window {
@@ -21817,7 +22022,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         window.contentView = makeContentView()
         if let settingsWindow, settingsWindow.isVisible {
             settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-            settingsWindow.contentView = makeSettingsContentView()
         }
     }
 
@@ -22048,6 +22252,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers = true
         scroll.scrollerStyle = .overlay
+        settingsScrollView = scroll
 
         let document = SettingsDocumentView()
         document.translatesAutoresizingMaskIntoConstraints = false
@@ -22900,6 +23105,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         urlField.toolTip = t("Базовый URL OpenAI-совместимого API (без /chat/completions).",
                              "Base URL of the OpenAI-compatible API (without /chat/completions).")
         urlField.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        aiBaseURLField = urlField
         section.addArrangedSubview(urlField)
 
         let modelField = NSTextField(string: draft.aiCleanupModel)
@@ -22910,6 +23116,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         modelField.toolTip = t("Имя модели на выбранном сервере.",
                                "Model name on the configured endpoint.")
         modelField.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        aiModelField = modelField
         section.addArrangedSubview(modelField)
 
         let keyRow = NSStackView()
@@ -22917,6 +23124,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         keyRow.alignment = .centerY
         keyRow.spacing = 8
         let keyField = NSSecureTextField()
+        keyField.stringValue = pendingAIKey
         keyField.placeholderString = hasKey
             ? t("•••• сохранён", "•••• saved")
             : t("API-ключ", "API key")
@@ -23240,6 +23448,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                              "One active shortcut cannot be a prefix of another.")
                 }
             }
+        }
+        switch aiCleanupConfigurationIssue(enabled: draft.aiCleanupEnabled,
+                                           baseURL: draft.aiCleanupBaseURL,
+                                           model: draft.aiCleanupModel) {
+        case .baseURL:
+            return t("Для AI-чистки нужен корректный HTTPS-адрес сервера.",
+                     "AI cleanup requires a valid HTTPS endpoint.")
+        case .model:
+            return t("Укажите корректное имя модели для AI-чистки.",
+                     "Enter a valid model name for AI cleanup.")
+        case nil:
+            break
         }
         return nil
     }
@@ -23711,27 +23931,31 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     @objc private func openSettingsClicked(_ sender: NSButton) {
         if let settingsWindow {
-            settingsWindow.contentView = makeSettingsContentView()
+            refreshSettingsWindow()
             settingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
 
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
+        let visibleFrame = (window?.screen ?? NSScreen.main)?.visibleFrame
+        let contentHeight = settingsWindowContentHeight(
+            visibleScreenHeight: visibleFrame?.height
+        )
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 760),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: contentHeight),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 680, height: 760)
-        settingsWindow.contentMaxSize = NSSize(width: 680, height: 760)
+        settingsWindow.contentMinSize = NSSize(width: 680, height: contentHeight)
+        settingsWindow.contentMaxSize = NSSize(width: 680, height: contentHeight)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
-        if let mainWindow = window, let visibleFrame = mainWindow.screen?.visibleFrame {
+        if let mainWindow = window, let visibleFrame {
             let mainFrame = mainWindow.frame
             let preferredRight = mainFrame.maxX + 14
             let preferredLeft = mainFrame.minX - settingsWindow.frame.width - 14
@@ -23828,6 +24052,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
         lastRenderFingerprint = ""
         refresh(force: true)
+        refreshSettingsWindow()
     }
 
     @objc private func selectPrimaryCompletionBehavior(_ sender: NSSegmentedControl) {
@@ -23906,7 +24131,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     @objc private func discardSettingsClicked(_ sender: NSButton) {
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
-        refreshSettingsWindow()
+        pendingAIKey = ""
+        refreshSettingsWindow(captureFields: false)
     }
 
     @objc private func toggleAICleanupDraft(_ sender: NSSwitch) {
@@ -23933,12 +24159,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func saveAIKeyClicked(_ sender: NSButton) {
-        let key = aiKeyField?.stringValue
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        captureAISettingsFields()
+        let key = pendingAIKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return }
         do {
             try AIKeyStore.write(key)
-            refreshSettingsWindow()
+            pendingAIKey = ""
+            refreshSettingsWindow(captureFields: false)
         } catch {
             showError(
                 title: t("Не удалось сохранить ключ", "Couldn’t Save Key"),
@@ -23948,8 +24176,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func removeAIKeyClicked(_ sender: NSButton) {
+        captureAISettingsFields()
         do {
             try AIKeyStore.delete()
+            pendingAIKey = ""
             // Without a key every dictation would fail with noAPIKey — turn the feature off.
             settings.aiCleanupEnabled = false
             if var draft = settingsDraft {
@@ -23962,7 +24192,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 userInfo: nil,
                 deliverImmediately: true
             )
-            refreshSettingsWindow()
+            refreshSettingsWindow(captureFields: false)
         } catch {
             showError(
                 title: t("Не удалось удалить ключ", "Couldn’t Remove Key"),
@@ -23972,6 +24202,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func testAICleanupConnectionClicked(_ sender: NSButton) {
+        captureAISettingsFields()
         let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         guard let key = AIKeyStore.read() else {
             showError(
@@ -23984,23 +24215,45 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         Task { @MainActor [weak self] in
             guard let self else { return }
             let result = await AICleanupService.probeModels(baseURL: draft.aiCleanupBaseURL,
-                                                            apiKey: key)
+                                                            apiKey: key,
+                                                            model: draft.aiCleanupModel)
             switch result {
             case .success:
                 let alert = NSAlert()
                 alert.alertStyle = .informational
                 alert.messageText = t("Подключение успешно", "Connection OK")
-                alert.informativeText = t("Сервер ответил на запрос списка моделей.",
-                                          "The endpoint answered the model-list request.")
+                alert.informativeText = t("Сервер доступен, и выбранная модель найдена.",
+                                          "The endpoint is reachable and the configured model is available.")
                 alert.addButton(withTitle: t("ОК", "OK"))
                 alert.runModal()
             case .failure(let error):
                 self.showError(
                     title: t("Проверка не удалась", "Connection Failed"),
-                    detail: error.localizedDescription
+                    detail: self.aiCleanupProbeErrorMessage(error)
                 )
             }
             self.refreshSettingsWindow()
+        }
+    }
+
+    private func aiCleanupProbeErrorMessage(_ error: AICleanupError) -> String {
+        switch error {
+        case .noAPIKey:
+            return t("API-ключ не сохранён.", "No API key is stored.")
+        case .network(let underlying):
+            return t("Ошибка сети: \(underlying.localizedDescription)",
+                     "Network error: \(underlying.localizedDescription)")
+        case .httpStatus(let code):
+            return t("Сервер ответил с ошибкой HTTP \(code).",
+                     "The endpoint returned HTTP \(code).")
+        case .unexpectedResponse:
+            return t("Сервер вернул неожиданный ответ.",
+                     "The endpoint returned an unexpected response.")
+        case .emptyResult:
+            return t("Сервер вернул пустой ответ.", "The endpoint returned an empty response.")
+        case .modelUnavailable(let model):
+            return t("Модель \(model) недоступна для этого ключа.",
+                     "Model \(model) is unavailable for this API key.")
         }
     }
 
@@ -24011,6 +24264,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func saveSettingsClicked(_ sender: NSButton) {
+        captureAISettingsFields()
         guard let draft = settingsDraft,
               settingsValidationMessage(draft) == nil else { return }
         let agentState = AgentRuntimeStateStore.read()
@@ -24051,9 +24305,36 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refresh(force: true)
     }
 
-    private func refreshSettingsWindow() {
+    private func captureAISettingsFields() {
+        guard var draft = settingsDraft else { return }
+        if let aiBaseURLField {
+            draft.aiCleanupBaseURL = aiBaseURLField.stringValue
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let aiModelField {
+            draft.aiCleanupModel = aiModelField.stringValue
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let aiKeyField {
+            pendingAIKey = aiKeyField.stringValue
+        }
+        settingsDraft = draft
+    }
+
+    private func refreshSettingsWindow(captureFields: Bool = true) {
         guard let settingsWindow else { return }
+        let previousOffset = settingsScrollView?.contentView.bounds.origin.y ?? 0
+        if captureFields {
+            captureAISettingsFields()
+        }
         settingsWindow.contentView = makeSettingsContentView()
+        settingsWindow.contentView?.layoutSubtreeIfNeeded()
+        guard previousOffset > 0,
+              let scroll = settingsScrollView,
+              let document = scroll.documentView else { return }
+        let maximumOffset = max(0, document.bounds.height - scroll.contentView.bounds.height)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: min(previousOffset, maximumOffset)))
+        scroll.reflectScrolledClipView(scroll.contentView)
     }
 
     @objc private func resetPermissionsClicked(_ sender: NSButton) {
