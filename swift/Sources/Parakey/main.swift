@@ -13839,30 +13839,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func rebuildMenu() {
         publishAgentState()
         statusItem.menu = nil
-        if statusPopover?.isShown == true {
-            statusPopover?.contentViewController?.view = makeStatusPopoverContent()
-        }
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            statusItem.popUpMenu(buildMenu())
-            return
-        }
-        if statusPopover?.isShown == true {
-            statusPopover?.performClose(nil)
-            return
-        }
-        let popover = statusPopover ?? NSPopover()
-        popover.behavior = .transient
-        popover.animates = true
-        popover.appearance = NSAppearance(named: .darkAqua)
-        popover.contentSize = NSSize(width: 360, height: 420)
-        let controller = NSViewController()
-        controller.view = makeStatusPopoverContent()
-        popover.contentViewController = controller
-        popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
-        statusPopover = popover
+        statusPopover?.performClose(nil)
+        openControlPanelFromAgent()
     }
 
     private func makeStatusPopoverContent() -> NSView {
