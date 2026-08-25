@@ -454,6 +454,22 @@ let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
     .serbian: "Serbian",
 ]
 
+let SUPPORTED_DICTATION_LANGUAGES: [DictationLanguage] = [
+    .russian,
+    .english,
+    .ukrainian,
+]
+
+private func localizedDictationLanguageName(_ language: DictationLanguage,
+                                            interfaceLanguage: InterfaceLanguage) -> String {
+    switch (language, interfaceLanguage) {
+    case (.russian, .russian): return "Русский"
+    case (.english, .russian): return "Английский"
+    case (.ukrainian, .russian): return "Украинский"
+    default: return DICTATION_LANGUAGE_DISPLAY[language] ?? language.rawValue
+    }
+}
+
 enum SpeechModelProfile: String, CaseIterable {
     case multilingualV3 = "multilingual_v3"
     // Deprecated production option. Kept only so old saved preferences
@@ -3235,12 +3251,16 @@ final class Settings: @unchecked Sendable {
     var dictationLanguage: DictationLanguage {
         get {
             if let v = defaults.string(forKey: Self.keyDictationLanguage),
-               let lang = DictationLanguage(rawValue: v) {
+               let lang = DictationLanguage(rawValue: v),
+               SUPPORTED_DICTATION_LANGUAGES.contains(lang) {
                 return lang
             }
-            return .auto
+            return .russian
         }
-        set { defaults.set(newValue.rawValue, forKey: Self.keyDictationLanguage) }
+        set {
+            let supported = SUPPORTED_DICTATION_LANGUAGES.contains(newValue) ? newValue : .russian
+            defaults.set(supported.rawValue, forKey: Self.keyDictationLanguage)
+        }
     }
 
     var speechModelProfile: SpeechModelProfile {
@@ -10667,8 +10687,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// is running; guards against a second click spawning a second
     /// update helper.
     private var isPreparingUpdate = false
-    private var automaticPermissionRequest: Permission?
-    private var automaticallyRequestedPermissions: [Permission] = []
     private var reminderPausedUpdateVersion: String?
     private var reminderPausedUntil: Date?
 
@@ -10829,9 +10847,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.setHistoryHotkey(settings.configuredHistoryHotkey)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            self?.requestNextMissingPermissionAutomatically()
-        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -11602,27 +11617,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Permission.allCases.filter { !Permissions.isGranted($0) }
     }
 
-    private func requestNextMissingPermissionAutomatically() {
-        guard automaticPermissionRequest == nil else { return }
-        guard let permission = missingPermissions().first(where: {
-            !automaticallyRequestedPermissions.contains($0)
-        }) else { return }
-        automaticallyRequestedPermissions.append(permission)
-        automaticPermissionRequest = permission
-        log("automatically requesting missing permission: \(permission.rawValue)")
-        Permissions.request(permission)
-    }
-
-    private func advanceAutomaticPermissionRequestIfNeeded() {
-        guard let permission = automaticPermissionRequest,
-              Permissions.isGranted(permission) else { return }
-        log("automatic permission request granted: \(permission.rawValue)")
-        automaticPermissionRequest = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.requestNextMissingPermissionAutomatically()
-        }
-    }
-
     @discardableResult
     private func logPermissionReadinessWait(_ missing: [Permission]) -> Bool {
         let key = missing.map(\.rawValue).joined(separator: "|")
@@ -11652,7 +11646,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func permissionReadinessTimerFired(_ timer: Timer) {
-        advanceAutomaticPermissionRequestIfNeeded()
         guard isCoreRuntimeReady else {
             let missing = missingPermissions()
             guard !missing.isEmpty else {
@@ -15053,20 +15046,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let langParent = NSMenuItem(title: t("Язык диктовки", "Language Hint"), action: nil, keyEquivalent: "")
         let langSub = NSMenu()
         langSub.autoenablesItems = false
-        for lang in DictationLanguage.allCases {
-            let item = NSMenuItem(title: DICTATION_LANGUAGE_DISPLAY[lang] ?? lang.rawValue,
+        for lang in SUPPORTED_DICTATION_LANGUAGES {
+            let item = NSMenuItem(title: localizedDictationLanguageName(
+                lang,
+                interfaceLanguage: settings.interfaceLanguage
+            ),
                                   action: #selector(selectDictationLanguage(_:)),
                                   keyEquivalent: "")
             item.target = self
             item.state = (lang == settings.dictationLanguage) ? .on : .off
             item.representedObject = lang.rawValue
             langSub.addItem(item)
-            // Auto-detect is the right default for almost everyone; only
-            // pin a specific language if you see wrong-script bleed-through
-            // (e.g. Cyrillic letters in Polish output).
-            if lang == .auto {
-                langSub.addItem(.separator())
-            }
         }
         langParent.submenu = langSub
         return langParent
@@ -17757,6 +17747,7 @@ private enum ParakeySelfTest {
 
     private static func testHotkey() throws {
         try testHotkeyPreferenceNormalization()
+        try testSupportedDictationLanguages()
         try testHotkeyPreferenceUpdateResults()
         try testHotkeyRecorderCaptureFlow()
         try testHotkeyRecorderRestartActions()
@@ -17871,6 +17862,38 @@ private enum ParakeySelfTest {
                                          modifiers: [.maskAlternate, .maskCommand])),
             "hotkey recorder should accept modifier-only chords"
         )
+        try expect(
+            hotkeyChoice(forKeycode: LEFT_COMMAND_KEYCODE)
+                == hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE),
+            equals: false,
+            "left and right Command must remain distinct shortcut choices"
+        )
+    }
+
+    private static func testSupportedDictationLanguages() throws {
+        try expect(
+            SUPPORTED_DICTATION_LANGUAGES,
+            equals: [.russian, .english, .ukrainian],
+            "the dictation language picker should expose only Russian, English, and Ukrainian"
+        )
+        let suiteName = "com.abc.abxvoiceassist.self-test.language.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            throw SelfTestFailure.failed("could not create isolated language defaults")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let isolatedSettings = Settings(defaults: defaults)
+        try expect(isolatedSettings.dictationLanguage,
+                   equals: .russian,
+                   "dictation language should default to Russian")
+        isolatedSettings.dictationLanguage = .auto
+        try expect(isolatedSettings.dictationLanguage,
+                   equals: .russian,
+                   "unsupported language choices should normalize to Russian")
+        isolatedSettings.dictationLanguage = .ukrainian
+        try expect(isolatedSettings.dictationLanguage,
+                   equals: .ukrainian,
+                   "Ukrainian should remain a supported optional language")
     }
 
     private static func testHotkeyPreferenceUpdateResults() throws {
@@ -22212,6 +22235,115 @@ private final class SettingsDocumentView: NSView {
 }
 
 @MainActor
+private final class InlineHotkeyField: NSButton {
+    private let language: InterfaceLanguage
+    private let onChange: (HotkeyChoice) -> Void
+    private var shortcut: HotkeyChoice
+    private var pendingModifier: HotkeyChoice?
+    private var eventMonitor: Any?
+
+    init(shortcut: HotkeyChoice,
+         language: InterfaceLanguage,
+         onChange: @escaping (HotkeyChoice) -> Void) {
+        self.shortcut = shortcut
+        self.language = language
+        self.onChange = onChange
+        super.init(frame: .zero)
+        title = localizedHotkeyName(shortcut, language: language)
+        isBordered = true
+        bezelStyle = .rounded
+        setButtonType(.momentaryChange)
+        target = self
+        action = #selector(startCapture(_:))
+        alignment = .center
+        font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        focusRingType = .exterior
+        translatesAutoresizingMaskIntoConstraints = false
+        setAccessibilityLabel(localizedText("Поле горячей клавиши",
+                                            "Shortcut field",
+                                            language: language))
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        MainActor.assumeIsolated {
+            if let eventMonitor {
+                NSEvent.removeMonitor(eventMonitor)
+            }
+        }
+    }
+
+    @objc private func startCapture(_ sender: NSButton) {
+        stopMonitoring()
+        pendingModifier = nil
+        title = localizedText("Нажмите сочетание…",
+                              "Press shortcut…",
+                              language: language)
+        eventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .flagsChanged]
+        ) { [weak self] event in
+            self?.consume(event)
+            return nil
+        }
+    }
+
+    private func consume(_ event: NSEvent) {
+        if event.type == .keyDown {
+            if event.keyCode == ESCAPE_KEYCODE {
+                cancelCapture()
+                return
+            }
+            guard !event.isARepeat,
+                  let choice = recordableHotkeyChoice(
+                    forKeycode: CGKeyCode(event.keyCode),
+                    modifiers: hotkeyFlags(from: event.modifierFlags)
+                  ),
+                  !choice.isModifier else { return }
+            commit(choice)
+            return
+        }
+
+        let keycode = CGKeyCode(event.keyCode)
+        let flags = hotkeyFlags(from: event.modifierFlags)
+        if let base = MODIFIER_HOTKEY_CHOICES.first(where: { $0.keycode == keycode }),
+           let mask = base.modifierFlag,
+           flags.contains(mask),
+           let choice = recordableHotkeyChoice(forKeycode: keycode, modifiers: flags) {
+            pendingModifier = choice
+            title = localizedHotkeyName(choice, language: language)
+            return
+        }
+        if let pendingModifier {
+            commit(pendingModifier)
+        }
+    }
+
+    private func commit(_ choice: HotkeyChoice) {
+        shortcut = choice
+        pendingModifier = nil
+        title = localizedHotkeyName(choice, language: language)
+        stopMonitoring()
+        onChange(choice)
+    }
+
+    private func cancelCapture() {
+        pendingModifier = nil
+        title = localizedHotkeyName(shortcut, language: language)
+        stopMonitoring()
+    }
+
+    private func stopMonitoring() {
+        if let eventMonitor {
+            NSEvent.removeMonitor(eventMonitor)
+            self.eventMonitor = nil
+        }
+    }
+}
+
+@MainActor
 private final class UnifiedBackdropView: NSView {
     private lazy var backgroundImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "abx-background-texture", withExtension: "png"),
@@ -22871,7 +23003,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         section("PARAKEET TDT 0.6B V3")
         let languagePopup = compactSettingsPopup(
-            options: DictationLanguage.allCases.map { (DICTATION_LANGUAGE_DISPLAY[$0] ?? $0.rawValue, $0.rawValue) },
+            options: SUPPORTED_DICTATION_LANGUAGES.map {
+                (localizedDictationLanguageName($0, interfaceLanguage: language), $0.rawValue)
+            },
             selected: settings.dictationLanguage.rawValue,
             action: #selector(selectDictationLanguage(_:))
         )
@@ -23262,8 +23396,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let popup = NSPopUpButton()
         popup.target = self
         popup.action = #selector(selectDictationLanguage(_:))
-        for value in DictationLanguage.allCases {
-            popup.addItem(withTitle: DICTATION_LANGUAGE_DISPLAY[value] ?? value.rawValue)
+        for value in SUPPORTED_DICTATION_LANGUAGES {
+            popup.addItem(withTitle: localizedDictationLanguageName(value,
+                                                                    interfaceLanguage: language))
             popup.lastItem?.representedObject = value.rawValue
         }
         popup.select(popup.itemArray.first { ($0.representedObject as? String) == settings.dictationLanguage.rawValue })
@@ -24090,15 +24225,23 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         row.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
         row.addArrangedSubview(NSView())
-        let button = panelButton(localizedHotkeyName(shortcut, language: language),
-                                 action: #selector(recordDictationShortcutClicked(_:)),
-                                 enabled: serviceOperation == nil,
-                                 toolTip: toolTip)
-        button.tag = kind.rawValue
-        button.controlSize = .regular
-        button.setContentHuggingPriority(.required, for: .horizontal)
-        button.widthAnchor.constraint(equalToConstant: 200).isActive = true
-        row.addArrangedSubview(button)
+        let field = InlineHotkeyField(shortcut: shortcut, language: language) { [weak self] selected in
+            guard let self else { return }
+            var draft = self.settingsDraft ?? ControlPanelSettingsDraft(settings: self.settings)
+            switch kind {
+            case .dictation: draft.dictationHotkey = selected
+            case .alternateCompletion: draft.alternateCompletionHotkey = selected
+            case .history: draft.historyHotkey = selected
+            }
+            self.settingsDraft = draft
+            self.refreshSettingsWindow()
+        }
+        field.isEnabled = serviceOperation == nil
+        field.toolTip = toolTip
+        field.setContentHuggingPriority(.required, for: .horizontal)
+        field.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        field.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        row.addArrangedSubview(field)
         return row
     }
 
