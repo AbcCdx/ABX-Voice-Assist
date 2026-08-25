@@ -455,6 +455,7 @@ let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
 ]
 
 let SUPPORTED_DICTATION_LANGUAGES: [DictationLanguage] = [
+    .auto,
     .russian,
     .english,
     .ukrainian,
@@ -463,6 +464,7 @@ let SUPPORTED_DICTATION_LANGUAGES: [DictationLanguage] = [
 private func localizedDictationLanguageName(_ language: DictationLanguage,
                                             interfaceLanguage: InterfaceLanguage) -> String {
     switch (language, interfaceLanguage) {
+    case (.auto, .russian): return "Авто"
     case (.russian, .russian): return "Русский"
     case (.english, .russian): return "Английский"
     case (.ukrainian, .russian): return "Украинский"
@@ -3255,10 +3257,10 @@ final class Settings: @unchecked Sendable {
                SUPPORTED_DICTATION_LANGUAGES.contains(lang) {
                 return lang
             }
-            return .russian
+            return .auto
         }
         set {
-            let supported = SUPPORTED_DICTATION_LANGUAGES.contains(newValue) ? newValue : .russian
+            let supported = SUPPORTED_DICTATION_LANGUAGES.contains(newValue) ? newValue : .auto
             defaults.set(supported.rawValue, forKey: Self.keyDictationLanguage)
         }
     }
@@ -6431,6 +6433,42 @@ private func finalizedDictationText(_ text: String,
         .components(separatedBy: "\n\n")
         .map(removingFinalPeriod)
         .joined(separator: "\n\n")
+}
+
+private struct SuccessfulDictationInsertionContext: Equatable {
+    let text: String
+    let applicationPID: pid_t
+    let insertedAt: TimeInterval
+}
+
+private let DICTATION_PARAGRAPH_CONTINUATION_SECONDS: TimeInterval = 120
+
+private func hasTerminalSentencePunctuation(_ text: String) -> Bool {
+    var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let closingMarks = CharacterSet(charactersIn: "\"'»”’)]}")
+    while let scalar = trimmed.unicodeScalars.last,
+          closingMarks.contains(scalar) {
+        trimmed.removeLast()
+    }
+    guard let last = trimmed.last else { return false }
+    return ".!?…".contains(last)
+}
+
+private func dictationTextForInsertion(_ text: String,
+                                       previous: SuccessfulDictationInsertionContext?,
+                                       applicationPID: pid_t?,
+                                       now: TimeInterval) -> String {
+    guard !text.isEmpty,
+          !text.hasPrefix("\n"),
+          let previous,
+          let applicationPID,
+          previous.applicationPID == applicationPID,
+          now >= previous.insertedAt,
+          now - previous.insertedAt <= DICTATION_PARAGRAPH_CONTINUATION_SECONDS,
+          !hasTerminalSentencePunctuation(previous.text) else {
+        return text
+    }
+    return "\n\n" + text
 }
 
 private let LONG_DICTATION_PAUSE_SECONDS = 1.4
@@ -10670,6 +10708,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// Local transcript archive, newest first. UI applies the user's visible limit.
     private var history: [TranscriptHistoryEntry] = []
+    private var lastSuccessfulDictationInsertion: SuccessfulDictationInsertionContext?
 
     private var visibleHistory: [TranscriptHistoryEntry] {
         limitedRecentTranscriptEntries(history, limit: settings.recentTranscriptLimit)
@@ -12636,6 +12675,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     )
 
                     if !cleaned.isEmpty {
+                        let insertionApplicationPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                        let insertionPreparedAt = Date().timeIntervalSince1970
+                        let textToInsert = dictationTextForInsertion(
+                            finalText,
+                            previous: lastSuccessfulDictationInsertion,
+                            applicationPID: insertionApplicationPID,
+                            now: insertionPreparedAt
+                        )
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
                         addToHistory(
                             finalText,
@@ -12664,11 +12711,18 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
                         let insertionStartedAt = ProcessInfo.processInfo.systemUptime
                         let inserted = TextInserter.insert(
-                            pastedText(from: finalText, suffix: settings.pasteSuffix)
+                            pastedText(from: textToInsert, suffix: settings.pasteSuffix)
                         )
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
                         var enterDelaySeconds: Double?
                         if inserted {
+                            if let insertionApplicationPID {
+                                lastSuccessfulDictationInsertion = SuccessfulDictationInsertionContext(
+                                    text: finalText,
+                                    applicationPID: insertionApplicationPID,
+                                    insertedAt: Date().timeIntervalSince1970
+                                )
+                            }
                             if shouldPressEnterAfterInsertion {
                                 let enterDelayStartedAt = ProcessInfo.processInfo.systemUptime
                                 let enterDelayNanoseconds = UInt64(settings.enterDelayMilliseconds) * 1_000_000
@@ -17873,8 +17927,8 @@ private enum ParakeySelfTest {
     private static func testSupportedDictationLanguages() throws {
         try expect(
             SUPPORTED_DICTATION_LANGUAGES,
-            equals: [.russian, .english, .ukrainian],
-            "the dictation language picker should expose only Russian, English, and Ukrainian"
+            equals: [.auto, .russian, .english, .ukrainian],
+            "the dictation language picker should expose automatic, Russian, English, and Ukrainian"
         )
         let suiteName = "com.abc.abxvoiceassist.self-test.language.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
@@ -17884,12 +17938,12 @@ private enum ParakeySelfTest {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let isolatedSettings = Settings(defaults: defaults)
         try expect(isolatedSettings.dictationLanguage,
-                   equals: .russian,
-                   "dictation language should default to Russian")
-        isolatedSettings.dictationLanguage = .auto
+                   equals: .auto,
+                   "dictation language should default to automatic detection")
+        isolatedSettings.dictationLanguage = .spanish
         try expect(isolatedSettings.dictationLanguage,
-                   equals: .russian,
-                   "unsupported language choices should normalize to Russian")
+                   equals: .auto,
+                   "unsupported language choices should normalize to automatic detection")
         isolatedSettings.dictationLanguage = .ukrainian
         try expect(isolatedSettings.dictationLanguage,
                    equals: .ukrainian,
@@ -18308,6 +18362,47 @@ private enum ParakeySelfTest {
             finalizedDictationText("Первый.\n\nВторой.", removeFinalPeriod: true),
             equals: "Первый\n\nВторой",
             "final period removal should apply to every pause-separated paragraph"
+        )
+        let previousInsertion = SuccessfulDictationInsertionContext(
+            text: "Первая мысль",
+            applicationPID: 42,
+            insertedAt: 100
+        )
+        try expect(
+            dictationTextForInsertion("Продолжение",
+                                      previous: previousInsertion,
+                                      applicationPID: 42,
+                                      now: 110),
+            equals: "\n\nПродолжение",
+            "a quick continuation after text without terminal punctuation should start a paragraph"
+        )
+        try expect(
+            dictationTextForInsertion("Продолжение",
+                                      previous: SuccessfulDictationInsertionContext(
+                                        text: "Первая мысль.",
+                                        applicationPID: 42,
+                                        insertedAt: 100
+                                      ),
+                                      applicationPID: 42,
+                                      now: 110),
+            equals: "Продолжение",
+            "terminal punctuation should keep the next dictation inline"
+        )
+        try expect(
+            dictationTextForInsertion("Другое поле",
+                                      previous: previousInsertion,
+                                      applicationPID: 77,
+                                      now: 110),
+            equals: "Другое поле",
+            "switching applications should not insert an unwanted paragraph"
+        )
+        try expect(
+            dictationTextForInsertion("Позднее продолжение",
+                                      previous: previousInsertion,
+                                      applicationPID: 42,
+                                      now: 221),
+            equals: "Позднее продолжение",
+            "old dictations should not force paragraph breaks indefinitely"
         )
 
         let speech = [Float](repeating: 0.08, count: Int(SAMPLE_RATE))
@@ -22365,12 +22460,37 @@ private final class UnifiedBackdropView: NSView {
         NSColor(calibratedRed: 0.035, green: 0.030, blue: 0.045, alpha: 1).setFill()
         bounds.fill()
 
-        if let backgroundImage {
-            backgroundImage.draw(in: bounds,
-                                 from: .zero,
+        if let backgroundImage,
+           backgroundImage.size.width > 0,
+           backgroundImage.size.height > 0 {
+            let scale = max(bounds.width / backgroundImage.size.width,
+                            bounds.height / backgroundImage.size.height)
+            let destinationSize = NSSize(width: backgroundImage.size.width * scale,
+                                         height: backgroundImage.size.height * scale)
+            let destination = NSRect(x: bounds.midX - destinationSize.width / 2,
+                                     y: bounds.midY - destinationSize.height / 2,
+                                     width: destinationSize.width,
+                                     height: destinationSize.height)
+            backgroundImage.draw(in: destination,
+                                 from: NSRect(origin: .zero, size: backgroundImage.size),
                                  operation: .sourceOver,
-                                 fraction: 1)
+                                 fraction: 1,
+                                 respectFlipped: true,
+                                 hints: [.interpolation: NSImageInterpolation.high])
         }
+    }
+}
+
+@MainActor
+private final class UnifiedSidebarView: NSView {
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(calibratedRed: 0.055,
+                green: 0.048,
+                blue: 0.065,
+                alpha: 1).setFill()
+        dirtyRect.fill()
     }
 }
 
@@ -22463,14 +22583,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
 
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1060, height: 760),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 720),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered,
                               defer: false)
         window.title = "ABX Voice Assist"
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = studioBackgroundColor
-        window.contentMinSize = NSSize(width: 900, height: 620)
+        window.contentMinSize = NSSize(width: 920, height: 640)
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -22508,7 +22628,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func configureDesktopWindow(_ window: NSWindow) {
-        window.contentMinSize = NSSize(width: 900, height: 620)
+        window.contentMinSize = NSSize(width: 920, height: 640)
     }
 
     private func renderFingerprint() -> String {
@@ -22518,6 +22638,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             ? availableAudioInputDevices()
                 .map { "\($0.uid)=\($0.name)" }
                 .joined(separator: "|")
+            : ""
+        let historyToken = desktopNavigationPage == 1
+            ? settings.recentTranscriptEntries.prefix(20).map(\.text).joined(separator: "|")
             : ""
         let stateToken: String
         if serviceOperation != nil {
@@ -22573,6 +22696,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 (settingsDraft?.muteWhileRecording ?? settings.muteWhileRecording) ? "mute-on" : "mute-off",
                 String(desktopNavigationPage),
                 String(compactPanelTab),
+                historyToken,
                 permissionClickCount.description].joined(separator: "::")
     }
 
@@ -22596,7 +22720,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func makeDesktopControlSurface() -> NSView {
-        let root = UnifiedBackdropView(frame: NSRect(x: 0, y: 0, width: 1060, height: 760))
+        let root = UnifiedBackdropView(frame: NSRect(x: 0, y: 0, width: 1040, height: 720))
 
         let layout = NSStackView()
         layout.translatesAutoresizingMaskIntoConstraints = false
@@ -22607,7 +22731,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         let sidebar = makeDesktopSidebar()
         sidebar.translatesAutoresizingMaskIntoConstraints = false
-        sidebar.widthAnchor.constraint(equalToConstant: 236).isActive = true
+        sidebar.widthAnchor.constraint(equalToConstant: 220).isActive = true
         layout.addArrangedSubview(sidebar)
 
         let divider = NSView()
@@ -22617,9 +22741,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
         layout.addArrangedSubview(divider)
 
-        let content = desktopNavigationPage == 0
-            ? makeDesktopGeneralSettingsPage()
-            : makeDesktopPendingPage()
+        let content: NSView
+        switch desktopNavigationPage {
+        case 0: content = makeDesktopGeneralSettingsPage()
+        case 1: content = makeDesktopHistoryPage()
+        default: content = makeDesktopPendingPage()
+        }
         layout.addArrangedSubview(content)
 
         NSLayoutConstraint.activate([
@@ -22635,12 +22762,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func makeDesktopSidebar() -> NSView {
-        let sidebar = NSVisualEffectView()
-        sidebar.material = .underWindowBackground
-        sidebar.blendingMode = .withinWindow
-        sidebar.state = .active
-        sidebar.wantsLayer = true
-        sidebar.layer?.backgroundColor = NSColor(calibratedWhite: 0.025, alpha: 0.42).cgColor
+        let sidebar = UnifiedSidebarView()
 
         let stack = NSStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -22665,6 +22787,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         rule.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(rule)
         rule.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        rule.heightAnchor.constraint(equalToConstant: 1).isActive = true
 
         let navigationSpacer = NSView()
         navigationSpacer.translatesAutoresizingMaskIntoConstraints = false
@@ -22684,8 +22807,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                               symbol: item.1,
                                               tag: index,
                                               selected: desktopNavigationPage == index)
-            button.isEnabled = index == 0
-            if index != 0 {
+            button.isEnabled = index <= 1
+            if index > 1 {
                 button.toolTip = t("Будет перенесено на следующем этапе.",
                                    "Will be migrated in the next stage.")
             }
@@ -22727,7 +22850,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             : NSColor.clear.cgColor
         button.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 204),
+            button.widthAnchor.constraint(equalToConstant: 188),
             button.heightAnchor.constraint(equalToConstant: 48),
         ])
         return button
@@ -22753,7 +22876,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         header.addArrangedSubview(NSView())
         let state = AgentRuntimeStateStore.read()
         let missingPermissions = Permission.allCases.filter { !Permissions.isGranted($0) }
-        let statusColor: NSColor = state?.isReady == true ? .systemGreen : .systemOrange
+        let hasAllPermissions = missingPermissions.isEmpty
+        let runtimeIsReady = state?.isReady == true
+        let statusColor: NSColor = !hasAllPermissions
+            ? .systemOrange
+            : (runtimeIsReady ? .systemGreen : .systemYellow)
         let statusDot = NSView()
         statusDot.wantsLayer = true
         statusDot.layer?.cornerRadius = 4
@@ -22762,9 +22889,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         statusDot.widthAnchor.constraint(equalToConstant: 8).isActive = true
         statusDot.heightAnchor.constraint(equalToConstant: 8).isActive = true
         header.addArrangedSubview(statusDot)
-        header.addArrangedSubview(panelLabel(state?.isReady == true
-                                             ? t("ГОТОВ", "READY")
-                                             : t("НУЖЕН ДОСТУП", "ACCESS NEEDED"),
+        let statusTitle = !hasAllPermissions
+            ? t("НУЖЕН ДОСТУП", "ACCESS NEEDED")
+            : (runtimeIsReady ? t("ГОТОВ", "READY") : t("ЗАПУСКАЕТСЯ", "STARTING"))
+        header.addArrangedSubview(panelLabel(statusTitle,
                                              size: 10.5,
                                              weight: .medium,
                                              color: unifiedMutedTextColor))
@@ -22797,6 +22925,87 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             muteSystemAudioSettingsRow(),
         ]))
         stack.addArrangedSubview(settingsActionsRow(draft: draft))
+        return desktopSettingsScroll(stack)
+    }
+
+    private func makeDesktopHistoryPage() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 30, bottom: 30, right: 30)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let entries = Array(settings.recentTranscriptEntries.prefix(20))
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.addArrangedSubview(panelLabel(t("ИСТОРИЯ", "HISTORY"),
+                                             size: 13,
+                                             weight: .medium,
+                                             color: unifiedMutedTextColor))
+        header.addArrangedSubview(NSView())
+        header.addArrangedSubview(panelLabel(t("\(entries.count) записей", "\(entries.count) entries"),
+                                             size: 11,
+                                             weight: .medium,
+                                             color: unifiedMutedTextColor))
+        stack.addArrangedSubview(header)
+
+        if entries.isEmpty {
+            let emptyCard = compactCard()
+            emptyCard.translatesAutoresizingMaskIntoConstraints = false
+            emptyCard.heightAnchor.constraint(equalToConstant: 112).isActive = true
+            let empty = panelLabel(
+                t("Здесь появятся последние диктовки. История хранится только на этом Mac.",
+                  "Recent dictations appear here. History stays on this Mac."),
+                size: 13,
+                weight: .medium,
+                color: unifiedMutedTextColor
+            )
+            empty.alignment = .center
+            pin(empty, inside: emptyCard, horizontal: 24, vertical: 20)
+            stack.addArrangedSubview(emptyCard)
+        } else {
+            for (index, entry) in entries.enumerated() {
+                let card = NSButton(title: "",
+                                    target: self,
+                                    action: #selector(desktopHistoryItemClicked(_:)))
+                card.tag = index
+                card.isBordered = false
+                card.wantsLayer = true
+                card.layer?.cornerRadius = 10
+                card.layer?.backgroundColor = unifiedSurfaceColor.withAlphaComponent(0.88).cgColor
+                card.layer?.borderColor = unifiedBorderColor.cgColor
+                card.layer?.borderWidth = 1
+                card.translatesAutoresizingMaskIntoConstraints = false
+                card.heightAnchor.constraint(equalToConstant: 76).isActive = true
+                card.toolTip = t("Скопировать диктовку", "Copy dictation")
+
+                let content = NSStackView()
+                content.translatesAutoresizingMaskIntoConstraints = false
+                content.orientation = .vertical
+                content.alignment = .leading
+                content.spacing = 5
+                let preview = panelLabel(entry.text,
+                                         size: 13,
+                                         weight: .medium,
+                                         color: .white)
+                preview.maximumNumberOfLines = 2
+                preview.lineBreakMode = .byTruncatingTail
+                content.addArrangedSubview(preview)
+                let detail = entry.transcriptionDurationSeconds.map {
+                    t("Локальная диктовка · \(String(format: "%.2f", $0)) с · нажмите, чтобы скопировать",
+                      "Local dictation · \(String(format: "%.2f", $0)) s · click to copy")
+                } ?? t("Локальная диктовка · нажмите, чтобы скопировать",
+                       "Local dictation · click to copy")
+                content.addArrangedSubview(panelLabel(detail,
+                                                      size: 10.5,
+                                                      weight: .regular,
+                                                      color: unifiedMutedTextColor))
+                pin(content, inside: card, horizontal: 18, vertical: 12)
+                stack.addArrangedSubview(card)
+            }
+        }
         return desktopSettingsScroll(stack)
     }
 
@@ -23240,6 +23449,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         desktopNavigationPage = sender.tag
         lastRenderFingerprint = ""
         refresh(force: true)
+    }
+
+    @objc private func desktopHistoryItemClicked(_ sender: NSButton) {
+        let entries = settings.recentTranscriptEntries
+        guard entries.indices.contains(sender.tag) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(entries[sender.tag].text, forType: .string)
     }
 
     @objc private func toggleMuteFromDesktopSettings(_ sender: NSSwitch) {
