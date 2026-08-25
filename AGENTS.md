@@ -20,3 +20,8 @@
 Run `scripts/install-local.sh`. It builds into a temporary directory, signs
 with the stable local identity when available, replaces the single installed
 bundle, and restarts the background agent without opening another app window.
+
+## Terminal Autonomy
+
+Perform all required Terminal actions yourself. Do not ask the user to run
+commands; report the completed result or a concrete non-Terminal blocker.
