@@ -30,7 +30,6 @@ import CoreGraphics
 import CryptoKit
 import Darwin
 import ApplicationServices
-import CoreImage
 import FluidAudio
 import IOKit
 import QuartzCore
@@ -22185,18 +22184,9 @@ private final class SettingsDocumentView: NSView {
 
 @MainActor
 private final class UnifiedBackdropView: NSView {
-    private lazy var textureImage: NSImage? = {
+    private lazy var backgroundImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "abx-background-texture", withExtension: "png"),
-              let source = CIImage(contentsOf: url),
-              let filter = CIFilter(name: "CIGaussianBlur") else {
-            return nil
-        }
-        filter.setValue(source, forKey: kCIInputImageKey)
-        filter.setValue(30, forKey: kCIInputRadiusKey)
-        guard let output = filter.outputImage?.cropped(to: source.extent) else { return nil }
-        let representation = NSCIImageRep(ciImage: output)
-        let image = NSImage(size: representation.size)
-        image.addRepresentation(representation)
+              let image = NSImage(contentsOf: url) else { return nil }
         return image
     }()
 
@@ -22211,29 +22201,15 @@ private final class UnifiedBackdropView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor(calibratedRed: 0.055, green: 0.050, blue: 0.065, alpha: 1).setFill()
+        NSColor(calibratedRed: 0.035, green: 0.030, blue: 0.045, alpha: 1).setFill()
         bounds.fill()
 
-        if let textureImage {
-            let scale = max(bounds.width / textureImage.size.width,
-                            bounds.height / textureImage.size.height) * 1.75
-            let textureSize = NSSize(width: textureImage.size.width * scale,
-                                     height: textureImage.size.height * scale)
-            let textureRect = NSRect(x: bounds.midX - textureSize.width / 2,
-                                     y: bounds.midY - textureSize.height / 2,
-                                     width: textureSize.width,
-                                     height: textureSize.height)
-            textureImage.draw(in: textureRect,
-                              from: .zero,
-                              operation: .sourceOver,
-                              fraction: 0.62)
+        if let backgroundImage {
+            backgroundImage.draw(in: bounds,
+                                 from: .zero,
+                                 operation: .sourceOver,
+                                 fraction: 1)
         }
-
-        NSGradient(colors: [
-            NSColor(calibratedRed: 0.055, green: 0.050, blue: 0.060, alpha: 0.18),
-            NSColor(calibratedRed: 0.025, green: 0.018, blue: 0.035, alpha: 0.78),
-        ])?.draw(in: bounds,
-                 relativeCenterPosition: NSPoint(x: 0, y: 0.04))
     }
 }
 
