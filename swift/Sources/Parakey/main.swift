@@ -18920,6 +18920,16 @@ private enum ParakeySelfTest {
             equals: archivedEntries,
             "an invalid history deletion index should leave the archive unchanged"
         )
+        try expect(
+            historyCardShouldCopy(clickCount: 1),
+            equals: false,
+            "a single history-card click should not copy"
+        )
+        try expect(
+            historyCardShouldCopy(clickCount: 2),
+            equals: true,
+            "a double history-card click should copy"
+        )
 
         let historyRowHitTargets = MainActor.assumeIsolated { () -> (delete: Bool, row: Bool, deleteAction: Bool, copyAction: Bool) in
             let row = HistoryTranscriptItemView(
@@ -22774,6 +22784,18 @@ private final class UnifiedSidebarView: NSView {
     }
 }
 
+func historyCardShouldCopy(clickCount: Int) -> Bool {
+    clickCount >= 2
+}
+
+@MainActor
+private final class DesktopHistoryCardButton: NSButton {
+    override func mouseDown(with event: NSEvent) {
+        guard historyCardShouldCopy(clickCount: event.clickCount) else { return }
+        super.mouseDown(with: event)
+    }
+}
+
 @MainActor
 private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
@@ -22794,6 +22816,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var pendingAIKey = ""
     private var compactPanelTab = 0
     private var desktopNavigationPage = 0
+    private var historyCopyNoticeVisible = false
+    private var historyCopyNoticeWorkItem: DispatchWorkItem?
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -22821,6 +22845,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
+        historyCopyNoticeWorkItem?.cancel()
+        historyCopyNoticeWorkItem = nil
         hotkeyRecorder?.cancel()
         hotkeyRecorder = nil
         refreshTimer?.invalidate()
@@ -23225,6 +23251,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                              weight: .medium,
                                              color: unifiedMutedTextColor))
         header.addArrangedSubview(NSView())
+        if historyCopyNoticeVisible {
+            header.addArrangedSubview(panelLabel(
+                t("✓ Скопировано в буфер обмена", "✓ Copied to clipboard"),
+                size: 11,
+                weight: .semibold,
+                color: .systemGreen
+            ))
+        }
         header.addArrangedSubview(panelLabel(t("\(entries.count) записей", "\(entries.count) entries"),
                                              size: 11,
                                              weight: .medium,
@@ -23247,9 +23281,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             stack.addArrangedSubview(emptyCard)
         } else {
             for (index, entry) in entries.enumerated() {
-                let card = NSButton(title: "",
-                                    target: self,
-                                    action: #selector(desktopHistoryItemClicked(_:)))
+                let card = DesktopHistoryCardButton(title: "",
+                                                    target: self,
+                                                    action: #selector(desktopHistoryItemClicked(_:)))
                 card.tag = index
                 card.isBordered = false
                 card.wantsLayer = true
@@ -23259,7 +23293,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 card.layer?.borderWidth = 1
                 card.translatesAutoresizingMaskIntoConstraints = false
                 card.heightAnchor.constraint(equalToConstant: 76).isActive = true
-                card.toolTip = t("Скопировать диктовку", "Copy dictation")
+                card.toolTip = t("Дважды нажмите, чтобы скопировать диктовку",
+                                 "Double-click to copy dictation")
+                card.setAccessibilityLabel(t("Диктовка. Дважды нажмите, чтобы скопировать",
+                                             "Dictation. Double-click to copy"))
 
                 let content = NSStackView()
                 content.translatesAutoresizingMaskIntoConstraints = false
@@ -23274,10 +23311,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 preview.lineBreakMode = .byTruncatingTail
                 content.addArrangedSubview(preview)
                 let detail = entry.transcriptionDurationSeconds.map {
-                    t("Локальная диктовка · \(String(format: "%.2f", $0)) с · нажмите, чтобы скопировать",
-                      "Local dictation · \(String(format: "%.2f", $0)) s · click to copy")
-                } ?? t("Локальная диктовка · нажмите, чтобы скопировать",
-                       "Local dictation · click to copy")
+                    t("Локальная диктовка · \(String(format: "%.2f", $0)) с · двойной клик для копирования",
+                      "Local dictation · \(String(format: "%.2f", $0)) s · double-click to copy")
+                } ?? t("Локальная диктовка · двойной клик для копирования",
+                       "Local dictation · double-click to copy")
                 content.addArrangedSubview(panelLabel(detail,
                                                       size: 10.5,
                                                       weight: .regular,
@@ -23736,7 +23773,23 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         guard entries.indices.contains(sender.tag) else { return }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(entries[sender.tag].text, forType: .string)
+        guard pasteboard.setString(entries[sender.tag].text, forType: .string) else { return }
+        showHistoryCopyNotice()
+    }
+
+    private func showHistoryCopyNotice() {
+        historyCopyNoticeWorkItem?.cancel()
+        historyCopyNoticeVisible = true
+        refresh(force: true)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.historyCopyNoticeVisible = false
+            self.historyCopyNoticeWorkItem = nil
+            self.refresh(force: true)
+        }
+        historyCopyNoticeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: workItem)
     }
 
     @objc private func toggleMuteFromDesktopSettings(_ sender: NSSwitch) {
