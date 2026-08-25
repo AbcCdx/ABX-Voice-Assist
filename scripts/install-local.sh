@@ -68,7 +68,10 @@ if ! mv "$INCOMING" "$APP_PATH"; then
 fi
 rm -rf "$BACKUP"
 
-launchctl bootstrap "gui/$uid" "$HOME/Library/LaunchAgents/$AGENT_LABEL.plist" >/dev/null 2>&1 || true
-launchctl kickstart -k "gui/$uid/$AGENT_LABEL"
+agent_plist="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+if [[ -f "$agent_plist" ]]; then
+    launchctl bootstrap "gui/$uid" "$agent_plist" >/dev/null 2>&1 || true
+    launchctl kickstart -k "gui/$uid/$AGENT_LABEL" >/dev/null 2>&1 || true
+fi
 
 printf 'ABX Voice Assist: installed one signed app at %s and restarted the background agent.\n' "$APP_PATH"
