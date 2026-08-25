@@ -1126,6 +1126,32 @@ struct TranscriptCorrection: Codable, Equatable, Sendable {
     let replacement: String
 }
 
+struct DictationProjectTerm: Equatable, Sendable {
+    let canonical: String
+    let aliases: [String]
+}
+
+/// Small, high-confidence vocabulary shared by deterministic correction and
+/// AI cleanup. Keep this list conservative: every alias is replaced whenever
+/// it appears as a complete word or phrase in a transcript.
+let BUILT_IN_PROJECT_TERMS: [DictationProjectTerm] = [
+    DictationProjectTerm(
+        canonical: "ABLX",
+        aliases: ["аблэкс", "аблекс", "эй би эл экс"]
+    ),
+    DictationProjectTerm(
+        canonical: "ABX Voice Assist",
+        aliases: ["абикс войс ассист", "эй би экс войс ассист", "войс ассист"]
+    ),
+]
+
+let BUILT_IN_PROJECT_TRANSCRIPT_CORRECTIONS: [TranscriptCorrection] =
+    BUILT_IN_PROJECT_TERMS.flatMap { term in
+        term.aliases.map { alias in
+            TranscriptCorrection(source: alias, replacement: term.canonical)
+        }
+    }
+
 // MARK: - Text correction transfer
 
 struct TranscriptCorrectionsDocument: Codable {
@@ -5716,7 +5742,9 @@ enum TranscriptCorrector {
     }
 
     static func apply(to text: String, corrections: [TranscriptCorrection]) -> (text: String, appliedCount: Int) {
-        let active = normalizedTranscriptCorrections(corrections)
+        // User corrections come last so an explicitly configured replacement
+        // can override a built-in project alias.
+        let active = normalizedTranscriptCorrections(BUILT_IN_PROJECT_TRANSCRIPT_CORRECTIONS + corrections)
             .sorted { lhs, rhs in
                 if lhs.source.count != rhs.source.count { return lhs.source.count > rhs.source.count }
                 return lhs.source.localizedCaseInsensitiveCompare(rhs.source) == .orderedAscending
@@ -6148,6 +6176,17 @@ enum AICleanupService {
                                 model: String,
                                 useGroqExtensions: Bool = false) -> [String: Any] {
         var system = systemPrompt
+        let canonicalProjectNames = BUILT_IN_PROJECT_TERMS
+            .map(\.canonical)
+            .joined(separator: "; ")
+        system += """
+
+        Known project names use these exact spellings: \(canonicalProjectNames). \
+        Preserve a canonical project name when it is already present. Correct a \
+        phonetic or transcription variant only when the surrounding words make \
+        that name the clear intended meaning. Never introduce a project name that \
+        was not spoken.
+        """
         if language != .auto {
             system += "\nThe text is in the language with ISO code \"\(language.rawValue)\"; keep the output in that language."
         }
@@ -17389,6 +17428,12 @@ private enum ParakeySelfTest {
         try expect(messages?.first?["content"]?.contains("Never answer questions"),
                    equals: true,
                    "AI cleanup system prompt should forbid answering the dictation")
+        try expect(messages?.first?["content"]?.contains("ABLX; ABX Voice Assist"),
+                   equals: true,
+                   "AI cleanup should receive canonical project names")
+        try expect(messages?.first?["content"]?.contains("Never introduce a project name"),
+                   equals: true,
+                   "AI cleanup should not invent a project name")
         try expect(messages?[1]["role"],
                    equals: "user",
                    "AI cleanup few-shot example should start with a user message")
@@ -19333,6 +19378,31 @@ private enum ParakeySelfTest {
             applied.appliedCount,
             equals: 2,
             "correction count should track applied non-overlapping replacements"
+        )
+
+        let builtInProjects = TranscriptCorrector.apply(
+            to: "Проект аблэкс и войс ассист",
+            corrections: []
+        )
+        try expect(
+            builtInProjects.text,
+            equals: "Проект ABLX и ABX Voice Assist",
+            "built-in project vocabulary should emit canonical English names"
+        )
+        try expect(
+            builtInProjects.appliedCount,
+            equals: 2,
+            "built-in project vocabulary should count its replacements"
+        )
+
+        let overriddenProject = TranscriptCorrector.apply(
+            to: "аблэкс",
+            corrections: [TranscriptCorrection(source: "аблэкс", replacement: "Custom Name")]
+        )
+        try expect(
+            overriddenProject.text,
+            equals: "Custom Name",
+            "an explicit user correction should override a built-in project alias"
         )
 
         let transferred = try TranscriptCorrectionsTransfer.decode(
