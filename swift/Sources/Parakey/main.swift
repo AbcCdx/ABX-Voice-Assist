@@ -23824,22 +23824,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         let layout = NSStackView()
         layout.translatesAutoresizingMaskIntoConstraints = false
-        layout.orientation = .horizontal
-        layout.alignment = .top
+        layout.orientation = .vertical
+        layout.alignment = .leading
         layout.spacing = 0
         root.addSubview(layout)
 
-        let sidebar = makeDesktopSidebar()
-        sidebar.translatesAutoresizingMaskIntoConstraints = false
-        sidebar.widthAnchor.constraint(equalToConstant: 220).isActive = true
-        layout.addArrangedSubview(sidebar)
-
-        let divider = NSView()
-        divider.wantsLayer = true
-        divider.layer?.backgroundColor = unifiedBorderColor.withAlphaComponent(0.65).cgColor
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        layout.addArrangedSubview(divider)
+        let navigation = makeDesktopTopNavigation()
+        layout.addArrangedSubview(navigation)
 
         let content: NSView
         switch desktopNavigationPage {
@@ -23857,104 +23848,88 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             layout.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             layout.topAnchor.constraint(equalTo: root.topAnchor),
             layout.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            sidebar.heightAnchor.constraint(equalTo: layout.heightAnchor),
-            divider.heightAnchor.constraint(equalTo: layout.heightAnchor),
-            content.heightAnchor.constraint(equalTo: layout.heightAnchor),
+            navigation.widthAnchor.constraint(equalTo: layout.widthAnchor),
+            navigation.heightAnchor.constraint(equalToConstant: 82),
+            content.widthAnchor.constraint(equalTo: layout.widthAnchor),
         ])
         return root
     }
 
-    private func makeDesktopSidebar() -> NSView {
-        let sidebar = NSVisualEffectView()
-        sidebar.material = .underWindowBackground
-        sidebar.blendingMode = .withinWindow
-        sidebar.state = .active
-        sidebar.wantsLayer = true
-        sidebar.layer?.backgroundColor = NSColor(calibratedWhite: 0.025, alpha: 0.42).cgColor
+    private func makeDesktopTopNavigation() -> NSView {
+        let header = NSView()
+        let items: [(String, String)] = [
+            (t("ОБЩИЕ", "GENERAL"), "hand.raised.fill"),
+            (t("ИСТОРИЯ", "HISTORY"), "clock.arrow.circlepath"),
+            (t("ПРОДВИНУТЫЕ", "ADVANCED"), "gearshape.2.fill"),
+            (t("ПОСТОБРАБОТКА", "POST-PROCESSING"), "wand.and.stars"),
+            (t("О ПРОГРАММЕ", "ABOUT"), "info.circle"),
+        ]
+
+        let bar = NSView()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.wantsLayer = true
+        bar.layer?.cornerRadius = 13
+        bar.layer?.backgroundColor = desktopNavigationSurfaceColor.cgColor
+        bar.layer?.borderWidth = 1
+        bar.layer?.borderColor = unifiedBorderColor.withAlphaComponent(0.42).cgColor
+        header.addSubview(bar)
 
         let stack = NSStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 7
-        stack.edgeInsets = NSEdgeInsets(top: 28, left: 16, bottom: 24, right: 16)
-        sidebar.addSubview(stack)
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.distribution = .fillEqually
+        stack.spacing = 4
+        stack.edgeInsets = NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4)
+        bar.addSubview(stack)
 
-        let brand = panelLabel("ABX", size: 28, weight: .heavy, color: .white)
-        brand.font = .systemFont(ofSize: 28, weight: .heavy)
-        stack.addArrangedSubview(brand)
-        let product = panelLabel("VOICE ASSIST", size: 11, weight: .bold, color: unifiedMutedTextColor)
-        product.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
-        stack.addArrangedSubview(product)
-
-        let brandSpacer = NSView()
-        brandSpacer.translatesAutoresizingMaskIntoConstraints = false
-        brandSpacer.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        stack.addArrangedSubview(brandSpacer)
-        let rule = unifiedSeparator(frame: .zero)
-        rule.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(rule)
-        rule.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        rule.heightAnchor.constraint(equalToConstant: 1).isActive = true
-
-        let navigationSpacer = NSView()
-        navigationSpacer.translatesAutoresizingMaskIntoConstraints = false
-        navigationSpacer.heightAnchor.constraint(equalToConstant: 8).isActive = true
-        stack.addArrangedSubview(navigationSpacer)
-
-        let items: [(String, String)] = [
-            (t("Общие", "General"), "hand.raised.fill"),
-            (t("История", "History"), "clock.arrow.circlepath"),
-            (t("Продвинутые", "Advanced"), "gearshape.2.fill"),
-            (t("Постобработка", "Post-processing"), "wand.and.stars"),
-            (t("О программе", "About"), "info.circle"),
-        ]
+        var buttons: [NSButton] = []
         for (index, item) in items.enumerated() {
-            let button = desktopSidebarButton(title: item.0,
-                                              symbol: item.1,
-                                              tag: index,
-                                              selected: desktopNavigationPage == index)
+            let button = desktopTopNavigationButton(title: item.0,
+                                                    symbol: item.1,
+                                                    tag: index,
+                                                    selected: desktopNavigationPage == index)
             stack.addArrangedSubview(button)
+            buttons.append(button)
         }
-        stack.addArrangedSubview(NSView())
-
-        let version = panelLabel(currentBuildDisplayVersion(), size: 10.5, color: unifiedMutedTextColor)
-        version.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
-        stack.addArrangedSubview(version)
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: sidebar.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+            bar.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 24),
+            bar.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -24),
+            bar.topAnchor.constraint(equalTo: header.topAnchor, constant: 16),
+            bar.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -14),
+            stack.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: bar.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
         ])
-        return sidebar
+        for button in buttons {
+            button.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        }
+        return header
     }
 
-    private func desktopSidebarButton(title: String,
-                                      symbol: String,
-                                      tag: Int,
-                                      selected: Bool) -> NSButton {
+    private func desktopTopNavigationButton(title: String,
+                                            symbol: String,
+                                            tag: Int,
+                                            selected: Bool) -> NSButton {
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
         let button = NSButton(title: title, image: image ?? NSImage(), target: self,
                               action: #selector(selectDesktopNavigationPage(_:)))
         button.tag = tag
         button.imagePosition = .imageLeading
         button.imageScaling = .scaleProportionallyDown
-        button.alignment = .left
+        button.alignment = .center
         button.isBordered = false
-        button.font = .systemFont(ofSize: 15, weight: selected ? .semibold : .medium)
+        button.font = .systemFont(ofSize: 11.5, weight: .bold)
         button.contentTintColor = selected ? .white : unifiedMutedTextColor
         button.wantsLayer = true
-        button.layer?.cornerRadius = 9
+        button.layer?.cornerRadius = 10
         button.layer?.backgroundColor = selected
-            ? NSColor(calibratedRed: 0.36, green: 0.24, blue: 0.47, alpha: 0.82).cgColor
+            ? desktopNavigationAccentColor.cgColor
             : NSColor.clear.cgColor
         button.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 180),
-            button.heightAnchor.constraint(equalToConstant: 42),
-        ])
+        button.toolTip = title
         return button
     }
 
@@ -24830,6 +24805,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var unifiedSurfaceColor: NSColor { NSColor(calibratedRed: 0.115, green: 0.105, blue: 0.130, alpha: 0.92) }
     private var unifiedBorderColor: NSColor { NSColor(calibratedRed: 0.30, green: 0.27, blue: 0.34, alpha: 0.82) }
     private var unifiedMutedTextColor: NSColor { NSColor(calibratedWhite: 0.60, alpha: 1) }
+    private var desktopNavigationSurfaceColor: NSColor {
+        NSColor(calibratedRed: 0.095, green: 0.078, blue: 0.110, alpha: 0.96)
+    }
+    private var desktopNavigationAccentColor: NSColor {
+        NSColor(calibratedRed: 0.39, green: 0.25, blue: 0.51, alpha: 0.96)
+    }
 
     private func compactLanguageName(_ value: DictationLanguage) -> String {
         switch value {
