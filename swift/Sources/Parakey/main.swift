@@ -10550,6 +10550,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let insertionTargetTracker = FocusedInsertionTargetTracker()
     private let settings = Settings.shared
 
+    private func t(_ russian: String, _ english: String) -> String {
+        localizedText(russian, english, language: settings.interfaceLanguage)
+    }
+
     private var isRecording = false
     private var isBusy = false
     private var isReady = false
@@ -13958,7 +13962,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(.separator())
 
         if isRecording {
-            let cancel = NSMenuItem(title: "Cancel Recording",
+            let cancel = NSMenuItem(title: t("Отменить запись", "Cancel Recording"),
                                     action: #selector(cancelRecordingClicked(_:)),
                                     keyEquivalent: "")
             cancel.target = self
@@ -13995,7 +13999,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // hide transcript preview text inside the submenu so the menu
         // stays stable even after long dictations.
         if let newest = visibleHistory.first {
-            let inline = NSMenuItem(title: "Copy Last Transcript",
+            let inline = NSMenuItem(title: t("Скопировать последнюю диктовку", "Copy Last Transcript"),
                                     action: #selector(historyClicked(_:)),
                                     keyEquivalent: "")
             inline.target = self
@@ -14020,7 +14024,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // in the menu that gets such an indicator — every other row
         // sits flush against the left edge. The wrapper produces the
         // identical behaviour with no auto-glyph.
-        let quit = NSMenuItem(title: "Quit ABX Voice Assist",
+        let quit = NSMenuItem(title: t("Закрыть ABX Voice Assist", "Quit ABX Voice Assist"),
                               action: #selector(quitClicked(_:)),
                               keyEquivalent: "q")
         quit.target = self
@@ -14029,7 +14033,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildRecentTranscriptsItem() -> NSMenuItem {
-        let parent = NSMenuItem(title: "Recent Transcripts", action: nil, keyEquivalent: "")
+        let parent = NSMenuItem(title: t("Недавние диктовки", "Recent Transcripts"), action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
 
@@ -14045,7 +14049,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(.separator())
 
-        let clear = NSMenuItem(title: "Clear Recent Transcripts",
+        let clear = NSMenuItem(title: t("Очистить недавние диктовки", "Clear Recent Transcripts"),
                                action: #selector(clearHistoryClicked(_:)),
                                keyEquivalent: "")
         clear.target = self
@@ -14056,11 +14060,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildSupportItem() -> NSMenuItem {
-        let parent = NSMenuItem(title: "Support", action: nil, keyEquivalent: "")
+        let parent = NSMenuItem(title: t("Поддержка", "Support"), action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
 
-        let setup = NSMenuItem(title: "Setup Checklist…",
+        let setup = NSMenuItem(title: t("Проверка настройки…", "Setup Checklist…"),
                                action: #selector(showSetupChecklistClicked(_:)),
                                keyEquivalent: "")
         setup.target = self
@@ -14068,7 +14072,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(.separator())
 
-        let checkUpdates = NSMenuItem(title: isCheckingForUpdates ? "Checking for Updates…" : "Check for Updates…",
+        let checkUpdates = NSMenuItem(title: isCheckingForUpdates
+            ? t("Проверяю обновления…", "Checking for Updates…")
+            : t("Проверить обновления…", "Check for Updates…"),
                                       action: #selector(checkForUpdatesClicked(_:)),
                                       keyEquivalent: "")
         checkUpdates.target = self
@@ -14077,7 +14083,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(.separator())
 
-        let about = NSMenuItem(title: "About ABX Voice Assist",
+        let about = NSMenuItem(title: t("О программе ABX Voice Assist", "About ABX Voice Assist"),
                                action: #selector(showAboutClicked(_:)),
                                keyEquivalent: "")
         about.target = self
@@ -14085,19 +14091,21 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(.separator())
 
-        let diagnostics = NSMenuItem(title: "Copy Diagnostics",
+        let diagnostics = NSMenuItem(title: t("Скопировать диагностику", "Copy Diagnostics"),
                                      action: #selector(copyDiagnosticsClicked(_:)),
                                      keyEquivalent: "")
         diagnostics.target = self
         sub.addItem(diagnostics)
 
-        let saveDiagnostics = NSMenuItem(title: "Save Diagnostics…",
+        let saveDiagnostics = NSMenuItem(title: t("Сохранить диагностику…", "Save Diagnostics…"),
                                          action: #selector(saveDiagnosticsClicked(_:)),
                                          keyEquivalent: "")
         saveDiagnostics.target = self
         sub.addItem(saveDiagnostics)
 
-        let resetModel = NSMenuItem(title: isResettingSpeechModelCache ? "Resetting Speech Model Cache…" : "Reset Speech Model Cache…",
+        let resetModel = NSMenuItem(title: isResettingSpeechModelCache
+            ? t("Сбрасываю кэш модели речи…", "Resetting Speech Model Cache…")
+            : t("Сбросить кэш модели речи…", "Reset Speech Model Cache…"),
                                     action: #selector(resetSpeechModelCacheClicked(_:)),
                                     keyEquivalent: "")
         resetModel.target = self
@@ -14147,15 +14155,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func menuStatusTitle() -> String {
         if isRecording {
-            return "Recording..."
+            return t("Идёт запись…", "Recording...")
         }
         if isBusy {
-            return "Transcribing..."
+            return t("Распознаю…", "Transcribing...")
         }
         if isReady {
             let hk = hotkey.hotkey.name
-            let verb = settings.triggerMode == .hold ? "Hold" : "Press"
-            return "\(verb) \(hk) to dictate"
+            return settings.triggerMode == .hold
+                ? t("Удерживайте \(hk) для диктовки", "Hold \(hk) to dictate")
+                : t("Нажмите \(hk) для диктовки", "Press \(hk) to dictate")
         }
         if let failure = startupFailure {
             return failure.statusTitle
@@ -14164,12 +14173,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return startupStatusTitle
         }
         if !missingPermissions().isEmpty {
-            return "Grant permissions to finish setup"
+            return t("Выдайте разрешения для завершения настройки", "Grant permissions to finish setup")
         }
         if isCoreRuntimeReady {
-            return "Starting hotkey listener…"
+            return t("Запускаю обработчик горячей клавиши…", "Starting hotkey listener…")
         }
-        return "ABX Voice Assist is not ready"
+        return t("ABX Voice Assist пока не готов", "ABX Voice Assist is not ready")
     }
 
     private func diagnosticsText() -> String {
@@ -14636,13 +14645,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - Permission row
 
+    private func permissionTitle(_ permission: Permission) -> String {
+        switch permission {
+        case .microphone: return t("микрофон", "Microphone")
+        case .accessibility: return t("универсальный доступ", "Accessibility")
+        case .inputMonitoring: return t("отслеживание ввода", "Input Monitoring")
+        }
+    }
+
     private func buildPermissionItem(_ p: Permission) -> NSMenuItem {
         let clicks = permClickCount[p] ?? 0
+        let permission = permissionTitle(p)
         let title: String
         if clicks >= 1 {
-            title = "⚠ Open \(p.rawValue) settings…"
+            title = t("⚠ Открыть настройки: \(permission)…", "⚠ Open \(permission) settings…")
         } else {
-            title = "⚠ Grant \(p.rawValue) permission…"
+            title = t("⚠ Разрешить: \(permission)…", "⚠ Grant \(permission) permission…")
         }
         let item = NSMenuItem(title: title,
                               action: #selector(grantPermissionClicked(_:)),
@@ -14683,7 +14701,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - Settings submenu
 
     private func buildSettingsItem() -> NSMenuItem {
-        let parent = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        let parent = NSMenuItem(title: t("Настройки", "Settings"), action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
 
@@ -14696,7 +14714,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildDictationSettingsItem() -> NSMenuItem {
-        let parent = NSMenuItem(title: "Dictation", action: nil, keyEquivalent: "")
+        let parent = NSMenuItem(title: t("Диктовка", "Dictation"), action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
 
@@ -14709,7 +14727,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildTextSettingsItem() -> NSMenuItem {
-        let parent = NSMenuItem(title: "Text", action: nil, keyEquivalent: "")
+        let parent = NSMenuItem(title: t("Текст", "Text"), action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
 
@@ -14717,7 +14735,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(buildRecentTranscriptLimitSettingsItem())
         sub.addItem(buildCorrectionsItem())
 
-        let filler = NSMenuItem(title: "Remove filler words (um, uh, ah, er, hmm)",
+        let filler = NSMenuItem(title: t("Удалять слова-паразиты", "Remove filler words (um, uh, ah, er, hmm)"),
                                 action: #selector(toggleRemoveFillerWords(_:)),
                                 keyEquivalent: "")
         filler.target = self
@@ -14729,25 +14747,25 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildBehaviorSettingsItem() -> NSMenuItem {
-        let parent = NSMenuItem(title: "Behavior", action: nil, keyEquivalent: "")
+        let parent = NSMenuItem(title: t("Поведение", "Behavior"), action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
 
-        let waveform = NSMenuItem(title: "Show recording waveform",
+        let waveform = NSMenuItem(title: t("Показывать волну записи", "Show recording waveform"),
                                   action: #selector(toggleRecordingWaveform(_:)),
                                   keyEquivalent: "")
         waveform.target = self
         waveform.state = settings.showRecordingWaveform ? .on : .off
         sub.addItem(waveform)
 
-        let mute = NSMenuItem(title: "Mute system audio while recording",
+        let mute = NSMenuItem(title: t("Отключать системный звук при записи", "Mute system audio while recording"),
                               action: #selector(toggleMute(_:)),
                               keyEquivalent: "")
         mute.target = self
         mute.state = settings.muteWhileRecording ? .on : .off
         sub.addItem(mute)
 
-        let automaticUpdates = NSMenuItem(title: "Automatically check for updates",
+        let automaticUpdates = NSMenuItem(title: t("Автоматически проверять обновления", "Automatically check for updates"),
                                           action: #selector(toggleCheckForUpdates(_:)),
                                           keyEquivalent: "")
         automaticUpdates.target = self
@@ -14755,7 +14773,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         automaticUpdates.toolTip = "Periodically checks GitHub for a newer release and only notifies you."
         sub.addItem(automaticUpdates)
 
-        let launchAtLogin = NSMenuItem(title: "Launch at Login",
+        let launchAtLogin = NSMenuItem(title: t("Запускать при входе", "Launch at Login"),
                                        action: #selector(toggleLaunchAtLogin(_:)),
                                        keyEquivalent: "")
         launchAtLogin.target = self
@@ -14775,7 +14793,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildHotkeySettingsItem() -> NSMenuItem {
-        let hkParent = NSMenuItem(title: "Hotkey", action: nil, keyEquivalent: "")
+        let hkParent = NSMenuItem(title: t("Горячая клавиша", "Hotkey"), action: nil, keyEquivalent: "")
         let hkSub = NSMenu()
         hkSub.autoenablesItems = false
         let current = hotkey.hotkey
@@ -14802,14 +14820,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         hkSub.addItem(.separator())
 
-        let record = NSMenuItem(title: "Record Hotkey…",
+        let record = NSMenuItem(title: t("Записать горячую клавишу…", "Record Hotkey…"),
                                 action: #selector(recordHotkeyClicked(_:)),
                                 keyEquivalent: "")
         record.target = self
         record.isEnabled = !isRecording && !isBusy && !isTerminating
         hkSub.addItem(record)
 
-        let reset = NSMenuItem(title: "Reset Hotkey to Default",
+        let reset = NSMenuItem(title: t("Вернуть горячую клавишу по умолчанию", "Reset Hotkey to Default"),
                                action: #selector(resetHotkeyClicked(_:)),
                                keyEquivalent: "")
         reset.target = self
@@ -14842,7 +14860,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildDictationLanguageSettingsItem() -> NSMenuItem {
-        let langParent = NSMenuItem(title: "Language Hint", action: nil, keyEquivalent: "")
+        let langParent = NSMenuItem(title: t("Язык диктовки", "Language Hint"), action: nil, keyEquivalent: "")
         let langSub = NSMenu()
         langSub.autoenablesItems = false
         for lang in DictationLanguage.allCases {
@@ -14865,7 +14883,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildPasteSuffixSettingsItem() -> NSMenuItem {
-        let pasteParent = NSMenuItem(title: "After Pasting", action: nil, keyEquivalent: "")
+        let pasteParent = NSMenuItem(title: t("После вставки", "After Pasting"), action: nil, keyEquivalent: "")
         let pasteSub = NSMenu()
         pasteSub.autoenablesItems = false
         for suffix in [PasteSuffix.appendSpace, .none, .appendNewline] {
@@ -14882,7 +14900,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildRecentTranscriptLimitSettingsItem() -> NSMenuItem {
-        let recentParent = NSMenuItem(title: "Recent Transcripts", action: nil, keyEquivalent: "")
+        let recentParent = NSMenuItem(title: t("Количество недавних диктовок", "Recent Transcripts"), action: nil, keyEquivalent: "")
         let recentSub = NSMenu()
         recentSub.autoenablesItems = false
         for limit in RecentTranscriptLimit.allCases {
@@ -14904,7 +14922,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let savedPreference = isDefaultAggregateAudioInputPreference(rawSavedPreference) ? "" : rawSavedPreference
         let selectedDevice = audioInputDevice(matching: savedPreference, in: devices)
         let canSwitch = !isRecording && !isBusy && !isTerminating
-        let parent = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+        let parent = NSMenuItem(title: t("Микрофон", "Microphone"), action: nil, keyEquivalent: "")
         if !savedPreference.isEmpty && selectedDevice == nil {
             parent.toolTip = savedPreference
         }
@@ -14912,7 +14930,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let sub = NSMenu()
         sub.autoenablesItems = false
 
-        let system = NSMenuItem(title: "System default",
+        let system = NSMenuItem(title: t("Системный по умолчанию", "System default"),
                                 action: #selector(selectInputDevice(_:)),
                                 keyEquivalent: "")
         system.target = self
@@ -14922,7 +14940,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(system)
 
         if !savedPreference.isEmpty && selectedDevice == nil {
-            let unavailable = NSMenuItem(title: "Unavailable: \(savedPreference)",
+            let unavailable = NSMenuItem(title: t("Недоступен: \(savedPreference)", "Unavailable: \(savedPreference)"),
                                          action: nil,
                                          keyEquivalent: "")
             unavailable.isEnabled = false
@@ -15121,18 +15139,20 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func buildCorrectionsItem() -> NSMenuItem {
         let corrections = settings.transcriptCorrections
-        let title = corrections.isEmpty ? "Text Corrections" : "Text Corrections (\(corrections.count))"
+        let title = corrections.isEmpty
+            ? t("Замены текста", "Text Corrections")
+            : t("Замены текста (\(corrections.count))", "Text Corrections (\(corrections.count))")
         let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
 
-        let add = NSMenuItem(title: "Add Correction…",
+        let add = NSMenuItem(title: t("Добавить замену…", "Add Correction…"),
                              action: #selector(addCorrectionClicked(_:)),
                              keyEquivalent: "")
         add.target = self
         sub.addItem(add)
 
-        let addFromLast = NSMenuItem(title: "Add Correction from Last Transcript…",
+        let addFromLast = NSMenuItem(title: t("Добавить замену из последней диктовки…", "Add Correction from Last Transcript…"),
                                      action: #selector(addCorrectionFromLastTranscriptClicked(_:)),
                                      keyEquivalent: "")
         addFromLast.target = self
@@ -15144,20 +15164,20 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(.separator())
 
-        let importItem = NSMenuItem(title: "Import Corrections…",
+        let importItem = NSMenuItem(title: t("Импортировать замены…", "Import Corrections…"),
                                     action: #selector(importCorrectionsClicked(_:)),
                                     keyEquivalent: "")
         importItem.target = self
         sub.addItem(importItem)
 
-        let exportItem = NSMenuItem(title: "Export Corrections…",
+        let exportItem = NSMenuItem(title: t("Экспортировать замены…", "Export Corrections…"),
                                     action: #selector(exportCorrectionsClicked(_:)),
                                     keyEquivalent: "")
         exportItem.target = self
         exportItem.isEnabled = !corrections.isEmpty
         sub.addItem(exportItem)
 
-        let shareItem = NSMenuItem(title: "Share Corrections…",
+        let shareItem = NSMenuItem(title: t("Поделиться заменами…", "Share Corrections…"),
                                    action: #selector(shareCorrectionsClicked(_:)),
                                    keyEquivalent: "")
         shareItem.target = self
@@ -15167,26 +15187,26 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(.separator())
 
         if let syncURL = correctionSyncFileURL() {
-            let syncLabel = NSMenuItem(title: "Syncing: \(syncURL.lastPathComponent)",
+            let syncLabel = NSMenuItem(title: t("Синхронизация: \(syncURL.lastPathComponent)", "Syncing: \(syncURL.lastPathComponent)"),
                                        action: nil,
                                        keyEquivalent: "")
             syncLabel.isEnabled = false
             syncLabel.toolTip = syncURL.path
             sub.addItem(syncLabel)
 
-            let syncNow = NSMenuItem(title: "Sync Now",
+            let syncNow = NSMenuItem(title: t("Синхронизировать", "Sync Now"),
                                      action: #selector(syncCorrectionsNowClicked(_:)),
                                      keyEquivalent: "")
             syncNow.target = self
             sub.addItem(syncNow)
 
-            let stopSync = NSMenuItem(title: "Stop Syncing…",
+            let stopSync = NSMenuItem(title: t("Остановить синхронизацию…", "Stop Syncing…"),
                                       action: #selector(stopSyncingCorrectionsClicked(_:)),
                                       keyEquivalent: "")
             stopSync.target = self
             sub.addItem(stopSync)
         } else {
-            let startSync = NSMenuItem(title: "Set Up Sync…",
+            let startSync = NSMenuItem(title: t("Настроить синхронизацию…", "Set Up Sync…"),
                                        action: #selector(setUpCorrectionsSyncClicked(_:)),
                                        keyEquivalent: "")
             startSync.target = self
@@ -15196,7 +15216,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(.separator())
 
         if corrections.isEmpty {
-            let empty = NSMenuItem(title: "No corrections", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: t("Нет замен", "No corrections"), action: nil, keyEquivalent: "")
             empty.isEnabled = false
             sub.addItem(empty)
             parent.submenu = sub
@@ -15210,14 +15230,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let itemSub = NSMenu()
             itemSub.autoenablesItems = false
 
-            let edit = NSMenuItem(title: "Edit…",
+            let edit = NSMenuItem(title: t("Изменить…", "Edit…"),
                                   action: #selector(editCorrectionClicked(_:)),
                                   keyEquivalent: "")
             edit.target = self
             edit.representedObject = index
             itemSub.addItem(edit)
 
-            let delete = NSMenuItem(title: "Delete",
+            let delete = NSMenuItem(title: t("Удалить", "Delete"),
                                     action: #selector(deleteCorrectionClicked(_:)),
                                     keyEquivalent: "")
             delete.target = self
@@ -15230,7 +15250,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(.separator())
 
-        let removeAll = NSMenuItem(title: "Remove All Corrections…",
+        let removeAll = NSMenuItem(title: t("Удалить все замены…", "Remove All Corrections…"),
                                    action: #selector(removeAllCorrectionsClicked(_:)),
                                    keyEquivalent: "")
         removeAll.target = self
@@ -22090,6 +22110,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                               backing: .buffered,
                               defer: false)
         window.title = "ABX Voice Assist"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.backgroundColor = studioBackgroundColor
         window.contentMinSize = NSSize(width: 520, height: 310)
         window.contentMaxSize = NSSize(width: 520, height: 310)
         window.isReleasedWhenClosed = false
@@ -22237,10 +22259,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(compactUpdateCard())
         root.addArrangedSubview(compactPrivacyFooter())
 
-        let background = NSVisualEffectView()
-        background.material = .underWindowBackground
-        background.blendingMode = .behindWindow
-        background.state = .active
+        let background = studioBackground()
         background.addSubview(root)
 
         NSLayoutConstraint.activate([
@@ -22342,10 +22361,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(settingsActionsRow(draft: draft))
         root.addArrangedSubview(privacyInfoView())
 
-        let background = NSVisualEffectView()
-        background.material = .underWindowBackground
-        background.blendingMode = .behindWindow
-        background.state = .active
+        let background = studioBackground()
 
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -22394,15 +22410,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let text = NSStackView()
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 1
-        text.addArrangedSubview(panelLabel("ABX Voice Assist", size: 20, weight: .semibold))
+        text.spacing = 2
+        let wordmark = panelLabel("ABX  VOICE ASSIST", size: 11, weight: .bold, color: studioAccentColor)
+        wordmark.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
+        text.addArrangedSubview(wordmark)
+        text.addArrangedSubview(panelLabel("ABX Voice Assist", size: 21, weight: .semibold, color: studioPrimaryTextColor))
         text.addArrangedSubview(panelLabel(
             t("Локальная диктовка · работает в фоне", "Local dictation · runs in the background"),
             size: 11.5,
-            color: .secondaryLabelColor
+            color: studioSecondaryTextColor
         ))
 
-        let version = panelLabel("v\(currentBundleVersion())", size: 11, color: .tertiaryLabelColor)
+        let version = panelLabel("v\(currentBundleVersion())", size: 11, color: studioMutedTextColor)
         version.setContentHuggingPriority(.required, for: .horizontal)
         version.toolTip = t("Установленная версия ABX Voice Assist", "Installed ABX Voice Assist version")
 
@@ -22441,16 +22460,19 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 2
-        text.addArrangedSubview(panelLabel(t("Настройки", "Settings"), size: 20, weight: .semibold))
+        let wordmark = panelLabel("ABX  VOICE ASSIST / CONTROL", size: 10.5, weight: .bold, color: studioAccentColor)
+        wordmark.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .bold)
+        text.addArrangedSubview(wordmark)
+        text.addArrangedSubview(panelLabel(t("Настройки", "Settings"), size: 20, weight: .semibold, color: studioPrimaryTextColor))
         text.addArrangedSubview(panelLabel(
             t("Изменения применяются после сохранения — перезапуск модели не нужен.",
               "Changes apply after saving; the speech model does not need to restart."),
             size: 11.5,
-            color: .secondaryLabelColor
+            color: studioSecondaryTextColor
         ))
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
-        row.addArrangedSubview(panelLabel("v\(currentBundleVersion())", size: 11, color: .tertiaryLabelColor))
+        row.addArrangedSubview(panelLabel("v\(currentBundleVersion())", size: 11, color: studioMutedTextColor))
         return row
     }
 
@@ -22689,7 +22711,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                    buttonToolTip: String?) {
         switch updateState {
         case .checking:
-            return ("arrow.triangle.2.circlepath", .systemBlue,
+            return ("arrow.triangle.2.circlepath", studioAccentColor,
                     t("Проверяю обновления", "Checking for updates"),
                     t("Установлена v\(currentBundleVersion())", "Installed v\(currentBundleVersion())"),
                     nil, nil, false, nil)
@@ -22701,7 +22723,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     t("Проверить", "Check"), #selector(updateButtonClicked(_:)), true,
                     t("Проверить GitHub Releases ещё раз", "Check GitHub Releases again"))
         case .available(let release):
-            return ("arrow.down.circle.fill", .systemBlue,
+            return ("arrow.down.circle.fill", studioAccentColor,
                     t("Доступна версия v\(release.version)", "Version v\(release.version) is available"),
                     t("Скачается, проверится и установится автоматически",
                       "Downloads, verifies, and installs automatically"),
@@ -22709,7 +22731,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     t("Обновить ABX Voice Assist до v\(release.version) одной кнопкой",
                       "Update ABX Voice Assist to v\(release.version) with one click"))
         case .preparing(let version, let phase):
-            return ("arrow.down.circle", .systemBlue,
+            return ("arrow.down.circle", studioAccentColor,
                     t("Обновляю до v\(version)", "Updating to v\(version)"),
                     phase, nil, nil, false, nil)
         case .failed(let message):
@@ -22777,7 +22799,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                         localizedServiceDetail(state),
                         colorForStatus(state.status))
             }
-            return (operationTitle(operation), operationDetail(operation), .systemBlue)
+            return (operationTitle(operation), operationDetail(operation), studioAccentColor)
         }
         if running, let state {
             if ["ready", "recording", "transcribing"].contains(state.status) {
@@ -23599,6 +23621,40 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return label
     }
 
+    private var studioBackgroundColor: NSColor {
+        NSColor(calibratedRed: 0.075, green: 0.071, blue: 0.078, alpha: 1)
+    }
+
+    private var studioCardColor: NSColor {
+        NSColor(calibratedRed: 0.105, green: 0.101, blue: 0.110, alpha: 1)
+    }
+
+    private var studioBorderColor: NSColor {
+        NSColor(calibratedRed: 0.34, green: 0.33, blue: 0.35, alpha: 0.82)
+    }
+
+    private var studioAccentColor: NSColor {
+        NSColor(calibratedRed: 0.63, green: 0.67, blue: 0.28, alpha: 1)
+    }
+
+    private var studioPrimaryTextColor: NSColor { .white }
+    private var studioSecondaryTextColor: NSColor {
+        NSColor(calibratedWhite: 0.68, alpha: 1)
+    }
+    private var studioMutedTextColor: NSColor {
+        NSColor(calibratedWhite: 0.46, alpha: 1)
+    }
+
+    private func studioBackground() -> NSVisualEffectView {
+        let background = NSVisualEffectView()
+        background.material = .hudWindow
+        background.blendingMode = .withinWindow
+        background.state = .active
+        background.wantsLayer = true
+        background.layer?.backgroundColor = studioBackgroundColor.cgColor
+        return background
+    }
+
     private func panelButton(_ title: String,
                              action: Selector,
                              enabled: Bool = true,
@@ -23606,6 +23662,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
         button.controlSize = .regular
+        button.contentTintColor = studioAccentColor
         button.isEnabled = enabled
         button.toolTip = toolTip
         button.setContentHuggingPriority(.required, for: .horizontal)
@@ -23623,6 +23680,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                               action: action)
         button.bezelStyle = .texturedRounded
         button.controlSize = .small
+        button.contentTintColor = studioAccentColor
         button.isEnabled = enabled
         button.toolTip = toolTip
         button.setAccessibilityLabel(accessibilityTitle)
@@ -23637,9 +23695,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func compactCard() -> NSView {
         let card = NSView()
         card.wantsLayer = true
-        card.layer?.cornerRadius = 8
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.70).cgColor
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.42).cgColor
+        card.layer?.cornerRadius = 10
+        card.layer?.backgroundColor = studioCardColor.cgColor
+        card.layer?.borderColor = studioBorderColor.cgColor
         card.layer?.borderWidth = 1
         card.setContentHuggingPriority(.required, for: .vertical)
         card.setContentCompressionResistancePriority(.required, for: .vertical)
@@ -24053,6 +24111,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             defer: false
         )
         settingsWindow.title = t("Настройки ABX Voice Assist", "ABX Voice Assist Settings")
+        settingsWindow.appearance = NSAppearance(named: .darkAqua)
+        settingsWindow.backgroundColor = studioBackgroundColor
         settingsWindow.contentMinSize = NSSize(width: 680, height: contentHeight)
         settingsWindow.contentMaxSize = NSSize(width: 680, height: contentHeight)
         settingsWindow.isReleasedWhenClosed = false
