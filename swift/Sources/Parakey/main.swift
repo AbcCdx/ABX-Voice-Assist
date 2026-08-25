@@ -2805,12 +2805,11 @@ final class Settings: @unchecked Sendable {
 
     var triggerMode: TriggerMode {
         get {
-            if let v = defaults.string(forKey: Self.keyTriggerMode), let m = TriggerMode(rawValue: v) {
-                return m
-            }
-            return .toggle
+            // ABX Voice Assist is push-to-talk only: holding the configured
+            // key records, and releasing it ends the dictation.
+            return .hold
         }
-        set { defaults.set(newValue.rawValue, forKey: Self.keyTriggerMode) }
+        set { defaults.set(TriggerMode.hold.rawValue, forKey: Self.keyTriggerMode) }
     }
 
     var agentEnabled: Bool {
@@ -3010,18 +3009,15 @@ final class Settings: @unchecked Sendable {
     }
 
     var playFeedbackSounds: Bool {
-        get {
-            if defaults.object(forKey: Self.keyPlayFeedbackSounds) == nil { return true }
-            return defaults.bool(forKey: Self.keyPlayFeedbackSounds)
-        }
+        // ABX Voice Assist is intentionally silent. The visual HUD and
+        // microphone icon communicate state without interrupting a call or
+        // recording. Keep the storage key for backward compatibility.
+        get { false }
         set { defaults.set(newValue, forKey: Self.keyPlayFeedbackSounds) }
     }
 
     var showInDock: Bool {
-        get {
-            if defaults.object(forKey: Self.keyShowInDock) == nil { return false }
-            return defaults.bool(forKey: Self.keyShowInDock)
-        }
+        get { false }
         set { defaults.set(newValue, forKey: Self.keyShowInDock) }
     }
 
@@ -5578,6 +5574,35 @@ actor TranscriptionWorker {
         }
     }
 
+    /// Transcribe pause-separated portions serially. The ANE model must never
+    /// receive concurrent requests, and the blank line is intentionally added
+    /// only for a long silence detected in the original recording.
+    fileprivate func transcribe(segments: [[Float]],
+                                language: Language? = nil,
+                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
+        guard segments.count > 1 else {
+            return try await transcribe(samples: segments.first ?? [],
+                                        language: language,
+                                        requestedAt: requestedAt)
+        }
+
+        var results: [TranscriptionWorkerResult] = []
+        results.reserveCapacity(segments.count)
+        for (index, segment) in segments.enumerated() {
+            let result = try await transcribe(samples: segment,
+                                               language: language,
+                                               requestedAt: index == 0 ? requestedAt : ProcessInfo.processInfo.systemUptime)
+            results.append(result)
+        }
+        return TranscriptionWorkerResult(
+            text: results.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n\n"),
+            workerQueueSeconds: results.first?.workerQueueSeconds ?? 0,
+            decoderPreparationSeconds: results.reduce(0) { $0 + $1.decoderPreparationSeconds },
+            fluidCallSeconds: results.reduce(0) { $0 + $1.fluidCallSeconds },
+            fluidProcessingSeconds: results.reduce(0) { $0 + $1.fluidProcessingSeconds }
+        )
+    }
+
     func warmUp() async throws -> ASRTimingBreakdown {
         let samples = [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4))
         let requestedAt = ProcessInfo.processInfo.systemUptime
@@ -6370,15 +6395,85 @@ private struct DictationTextProcessingResult: Equatable {
 }
 
 private func removingFinalPeriod(from text: String) -> String {
-    guard text.last == "." else { return text }
-    let textWithoutFinalPeriod = text.dropLast()
-    guard textWithoutFinalPeriod.last != "." else { return text }
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.last == "." else { return trimmed }
+    let textWithoutFinalPeriod = trimmed.dropLast()
+    guard textWithoutFinalPeriod.last != "." else { return trimmed }
     return String(textWithoutFinalPeriod)
 }
 
 private func finalizedDictationText(_ text: String,
                                     removeFinalPeriod: Bool) -> String {
-    removeFinalPeriod ? removingFinalPeriod(from: text) : text
+    guard removeFinalPeriod else { return text }
+    // A long pause can become a paragraph. Remove the generated closing
+    // period from each paragraph, not only from the final one.
+    return text
+        .components(separatedBy: "\n\n")
+        .map(removingFinalPeriod)
+        .joined(separator: "\n\n")
+}
+
+private let LONG_DICTATION_PAUSE_SECONDS = 1.4
+private let LONG_DICTATION_PAUSE_RMS_THRESHOLD: Float = 0.008
+private let LONG_DICTATION_PAUSE_BLOCK_SAMPLES = 320 // 20 ms at 16 kHz
+private let MIN_DICTATION_SEGMENT_SECONDS = 0.5
+private let MAX_DICTATION_SEGMENTS = 3
+
+/// Finds deliberate long silent pauses in a single held recording. The
+/// threshold and segment cap deliberately favour one coherent paragraph over
+/// splitting on natural hesitations.
+private func dictationSegmentsSeparatedByLongPause(samples: [Float],
+                                                    sampleRate: Double = SAMPLE_RATE) -> [[Float]] {
+    guard sampleRate > 0,
+          samples.count >= Int(sampleRate * (MIN_DICTATION_SEGMENT_SECONDS * 2 + LONG_DICTATION_PAUSE_SECONDS)) else {
+        return [samples]
+    }
+
+    let blockSize = LONG_DICTATION_PAUSE_BLOCK_SAMPLES
+    let requiredSilentBlocks = max(1, Int(ceil(LONG_DICTATION_PAUSE_SECONDS * sampleRate / Double(blockSize))))
+    let minimumSegmentSamples = Int(MIN_DICTATION_SEGMENT_SECONDS * sampleRate)
+    var speechBlocks: [Bool] = []
+    speechBlocks.reserveCapacity((samples.count + blockSize - 1) / blockSize)
+    for start in stride(from: 0, to: samples.count, by: blockSize) {
+        let end = min(samples.count, start + blockSize)
+        var sumSquares: Float = 0
+        for sample in samples[start..<end] {
+            let clamped = max(-1, min(1, sample.isFinite ? sample : 0))
+            sumSquares += clamped * clamped
+        }
+        let rms = sqrt(sumSquares / Float(max(1, end - start)))
+        speechBlocks.append(rms >= LONG_DICTATION_PAUSE_RMS_THRESHOLD)
+    }
+
+    var splitOffsets: [Int] = []
+    var index = 0
+    while index < speechBlocks.count {
+        guard !speechBlocks[index] else {
+            index += 1
+            continue
+        }
+        let silenceStart = index
+        while index < speechBlocks.count, !speechBlocks[index] { index += 1 }
+        let silenceEnd = index
+        guard silenceStart > 0,
+              silenceEnd < speechBlocks.count,
+              silenceEnd - silenceStart >= requiredSilentBlocks else { continue }
+        let split = min(samples.count, ((silenceStart + silenceEnd) * blockSize) / 2)
+        guard split >= minimumSegmentSamples,
+              samples.count - split >= minimumSegmentSamples else { continue }
+        splitOffsets.append(split)
+        if splitOffsets.count == MAX_DICTATION_SEGMENTS - 1 { break }
+    }
+
+    guard !splitOffsets.isEmpty else { return [samples] }
+    var result: [[Float]] = []
+    var start = 0
+    for split in splitOffsets {
+        result.append(Array(samples[start..<split]))
+        start = split
+    }
+    result.append(Array(samples[start..<samples.count]))
+    return result
 }
 
 private func processedDictationText(rawTranscript: String,
@@ -11586,7 +11681,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // finds it under that path automatically; Bundle.module is
         // deliberately not used here so codesign --deep doesn't have
         // to grapple with a SwiftPM resource bundle.
-        let image = NSImage(named: "parakey-menubar")
+        let image = NSImage(systemSymbolName: "mic.fill",
+                            accessibilityDescription: "ABX Voice Assist")
         image?.isTemplate = true
         image?.size = NSSize(width: 18, height: 18)
         templateImage = image
@@ -11595,10 +11691,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         button.image = image
         button.imagePosition = .imageOnly
         if image == nil {
-            button.title = "Parakey"
-            log("statusItem: parakey-menubar.png not in Bundle.main — text fallback")
+            button.title = "ABX"
+            log("statusItem: microphone symbol unavailable — text fallback")
         }
-        button.toolTip = "Parakey"
+        button.toolTip = "ABX Voice Assist"
     }
 
     private func concealMenuBarIcon() {
@@ -12498,10 +12594,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // immediately, but its disk/menu updates now overlap inference.
         let asrRequestedAt = ProcessInfo.processInfo.systemUptime
         let transcriptionWorker = asr
+        let pauseSeparatedSegments = dictationSegmentsSeparatedByLongPause(samples: samples)
+        if pauseSeparatedSegments.count > 1 {
+            log("release: detected \(pauseSeparatedSegments.count - 1) long pause(s); transcribing as paragraphs")
+        }
         let language = settings.dictationLanguage.fluidLanguage
         let transcriptionTask = Task.detached(priority: .userInitiated) {
             let transcription = try await transcriptionWorker.transcribe(
-                samples: samples,
+                segments: pauseSeparatedSegments,
                 language: language,
                 requestedAt: asrRequestedAt
             )
@@ -14608,7 +14708,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.autoenablesItems = false
 
         sub.addItem(buildHotkeySettingsItem())
-        sub.addItem(buildTriggerSettingsItem())
         sub.addItem(buildDictationLanguageSettingsItem())
         sub.addItem(buildInputDeviceItem())
 
@@ -14655,13 +14754,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mute.state = settings.muteWhileRecording ? .on : .off
         sub.addItem(mute)
 
-        let sounds = NSMenuItem(title: "Play feedback sounds",
-                                action: #selector(toggleFeedbackSounds(_:)),
-                                keyEquivalent: "")
-        sounds.target = self
-        sounds.state = settings.playFeedbackSounds ? .on : .off
-        sub.addItem(sounds)
-
         let automaticUpdates = NSMenuItem(title: "Automatically check for updates",
                                           action: #selector(toggleCheckForUpdates(_:)),
                                           keyEquivalent: "")
@@ -14684,13 +14776,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             launchAtLogin.state = .off
         }
         sub.addItem(launchAtLogin)
-
-        let dock = NSMenuItem(title: "Show ABX Voice Assist in Dock",
-                              action: #selector(toggleDock(_:)),
-                              keyEquivalent: "")
-        dock.target = self
-        dock.state = settings.showInDock ? .on : .off
-        sub.addItem(dock)
 
         parent.submenu = sub
         return parent
@@ -17959,6 +18044,11 @@ private enum ParakeySelfTest {
             "final period postprocessing should remove one final ASCII period"
         )
         try expect(
+            removingFinalPeriod(from: "Привет.  \n"),
+            equals: "Привет",
+            "final period postprocessing should remove a period after trailing whitespace"
+        )
+        try expect(
             removingFinalPeriod(from: "Привет!"),
             equals: "Привет!",
             "final period postprocessing should preserve an exclamation mark"
@@ -17987,6 +18077,26 @@ private enum ParakeySelfTest {
             removingFinalPeriod(from: ""),
             equals: "",
             "final period postprocessing should preserve empty text"
+        )
+        try expect(
+            finalizedDictationText("Первый.\n\nВторой.", removeFinalPeriod: true),
+            equals: "Первый\n\nВторой",
+            "final period removal should apply to every pause-separated paragraph"
+        )
+
+        let speech = [Float](repeating: 0.08, count: Int(SAMPLE_RATE))
+        let longSilence = [Float](repeating: 0, count: Int(SAMPLE_RATE * 1.5))
+        let pauseSegments = dictationSegmentsSeparatedByLongPause(samples: speech + longSilence + speech)
+        try expect(
+            pauseSegments.count,
+            equals: 2,
+            "a long silence between speech regions should create one paragraph break"
+        )
+        let shortSilence = [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.8))
+        try expect(
+            dictationSegmentsSeparatedByLongPause(samples: speech + shortSilence + speech).count,
+            equals: 1,
+            "a natural hesitation should remain in one paragraph"
         )
 
         let disabledPostprocessing = processedDictationText(
