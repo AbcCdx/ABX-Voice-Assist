@@ -16,13 +16,17 @@ cleanup() {
 trap cleanup EXIT
 
 identity="${ABX_VOICE_ASSIST_SIGN_IDENTITY:-}"
+valid_identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
 if [[ -z "$identity" && -d "$APP_PATH" ]]; then
-    identity="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1 \
+    installed_identity="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1 \
         | sed -n 's/^Authority=\(Apple Development:.*\)$/\1/p' \
         | head -n 1)"
+    if [[ -n "$installed_identity" && "$valid_identities" == *\"$installed_identity\"* ]]; then
+        identity="$installed_identity"
+    fi
 fi
 if [[ -z "$identity" ]]; then
-    identity="$(security find-identity -v -p codesigning 2>/dev/null \
+    identity="$(printf '%s\n' "$valid_identities" \
         | sed -n 's/.*"\(Apple Development:.*\)"/\1/p' \
         | head -n 1)"
 fi
@@ -77,5 +81,9 @@ if [[ -f "$agent_plist" ]]; then
     fi
     launchctl kickstart -k "gui/$uid/$AGENT_LABEL" >/dev/null 2>&1 || true
 fi
+
+# Catch expired or otherwise unusable identities after the final replacement,
+# not only while the staged bundle still exists.
+codesign --verify --deep --strict "$APP_PATH"
 
 printf 'ABX Voice Assist: installed one signed app at %s and restarted the background agent.\n' "$APP_PATH"
