@@ -6778,12 +6778,9 @@ private func processedDictationText(rawTranscript: String,
 
 // MARK: - Text insertion
 //
-// Default path: write to general pasteboard, post Cmd+V. If that setup
-// fails, fall back to direct Unicode events so a pasteboard problem
-// does not automatically lose the transcript. After a successful paste
-// event, restore the previous clipboard if it is still at our temporary
-// write, so dictation doesn't replace what the user had copied before
-// speaking.
+// Default path: post the transcript as direct Unicode keyboard events.
+// This deliberately leaves the shared macOS pasteboard untouched, so an
+// image, file URL, or other non-text item cannot race into the target app.
 
 func pastedText(from correctedTranscript: String, suffix: PasteSuffix) -> String {
     switch suffix {
@@ -7833,7 +7830,7 @@ private enum KeyboardShortcutPoster {
 
 @MainActor
 enum TextInserter {
-    nonisolated static let defaultStrategy = TextInsertionStrategy.clipboardPaste
+    nonisolated static let defaultStrategy = TextInsertionStrategy.directUnicode
 
     nonisolated static var defaultStrategyDescription: String {
         textInsertionStrategyDescription(primary: defaultStrategy)
@@ -19425,8 +19422,8 @@ private enum ParakeySelfTest {
         )
         try expect(
             TextInserter.defaultStrategy,
-            equals: .clipboardPaste,
-            "clipboard paste should remain the default insertion strategy"
+            equals: .directUnicode,
+            "dictation should bypass the shared clipboard by default"
         )
         try expect(
             textInsertionStrategyChain(primary: .clipboardPaste),
@@ -19440,8 +19437,8 @@ private enum ParakeySelfTest {
         )
         try expect(
             TextInserter.defaultStrategyDescription,
-            equals: "Clipboard paste with Direct Unicode typing fallback",
-            "diagnostics should describe the insertion fallback chain"
+            equals: "Direct Unicode typing",
+            "diagnostics should describe clipboard-free insertion"
         )
         let unicodeChunks = unicodeInsertionChunks(for: "ab👩‍💻cd", maxUTF16UnitsPerEvent: 4)
             .map { String(decoding: $0, as: UTF16.self) }
