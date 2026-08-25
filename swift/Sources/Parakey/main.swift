@@ -30,6 +30,7 @@ import CoreGraphics
 import CryptoKit
 import Darwin
 import ApplicationServices
+import CoreImage
 import FluidAudio
 import IOKit
 import QuartzCore
@@ -22184,6 +22185,21 @@ private final class SettingsDocumentView: NSView {
 
 @MainActor
 private final class UnifiedBackdropView: NSView {
+    private lazy var textureImage: NSImage? = {
+        guard let url = Bundle.main.url(forResource: "abx-background-texture", withExtension: "png"),
+              let source = CIImage(contentsOf: url),
+              let filter = CIFilter(name: "CIGaussianBlur") else {
+            return nil
+        }
+        filter.setValue(source, forKey: kCIInputImageKey)
+        filter.setValue(30, forKey: kCIInputRadiusKey)
+        guard let output = filter.outputImage?.cropped(to: source.extent) else { return nil }
+        let representation = NSCIImageRep(ciImage: output)
+        let image = NSImage(size: representation.size)
+        image.addRepresentation(representation)
+        return image
+    }()
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -22195,20 +22211,29 @@ private final class UnifiedBackdropView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor(calibratedRed: 0.035, green: 0.027, blue: 0.052, alpha: 1).setFill()
+        NSColor(calibratedRed: 0.055, green: 0.050, blue: 0.065, alpha: 1).setFill()
         bounds.fill()
+
+        if let textureImage {
+            let scale = max(bounds.width / textureImage.size.width,
+                            bounds.height / textureImage.size.height) * 1.75
+            let textureSize = NSSize(width: textureImage.size.width * scale,
+                                     height: textureImage.size.height * scale)
+            let textureRect = NSRect(x: bounds.midX - textureSize.width / 2,
+                                     y: bounds.midY - textureSize.height / 2,
+                                     width: textureSize.width,
+                                     height: textureSize.height)
+            textureImage.draw(in: textureRect,
+                              from: .zero,
+                              operation: .sourceOver,
+                              fraction: 0.62)
+        }
+
         NSGradient(colors: [
-            NSColor(calibratedRed: 0.48, green: 0.08, blue: 0.48, alpha: 0.48),
-            NSColor(calibratedRed: 0.08, green: 0.03, blue: 0.16, alpha: 0),
-        ])?.draw(in: bounds.insetBy(dx: -70, dy: -70),
-                 relativeCenterPosition: NSPoint(x: -0.55, y: 0.58))
-        NSGradient(colors: [
-            NSColor(calibratedRed: 0.02, green: 0.40, blue: 0.46, alpha: 0.24),
-            NSColor(calibratedRed: 0.02, green: 0.08, blue: 0.12, alpha: 0),
-        ])?.draw(in: bounds.insetBy(dx: -105, dy: -85),
-                 relativeCenterPosition: NSPoint(x: 0.72, y: -0.52))
-        NSColor(calibratedWhite: 0.015, alpha: 0.34).setFill()
-        bounds.fill(using: .sourceOver)
+            NSColor(calibratedRed: 0.055, green: 0.050, blue: 0.060, alpha: 0.18),
+            NSColor(calibratedRed: 0.025, green: 0.018, blue: 0.035, alpha: 0.78),
+        ])?.draw(in: bounds,
+                 relativeCenterPosition: NSPoint(x: 0, y: 0.04))
     }
 }
 
@@ -22493,10 +22518,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
 
         root.addSubview(unifiedSeparator(frame: NSRect(x: 17, y: 48, width: 326, height: 1)))
-        let model = unifiedLabel("•  PAR AKEET TDT 0.6  ·  ЛОКАЛЬНО", size: 9.5, color: unifiedMutedTextColor)
-        model.font = .monospacedSystemFont(ofSize: 9.5, weight: .regular)
-        model.frame = NSRect(x: 17, y: 18, width: 188, height: 18)
-        root.addSubview(model)
         root.addSubview(unifiedFooterButton(compactPanelTab == 2 ? t("Готово", "Done") : t("Настройки", "Settings"),
                                             action: #selector(openSettingsClicked(_:)),
                                             x: 213))
