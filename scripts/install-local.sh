@@ -54,8 +54,6 @@ if [[ -d "$APP_PATH" ]]; then
 fi
 
 uid="$(id -u)"
-launchctl bootout "gui/$uid/$AGENT_LABEL" >/dev/null 2>&1 || true
-pkill -f '/Applications/ABX Voice Assist.app/Contents/MacOS/ABXVoiceAssist' >/dev/null 2>&1 || true
 
 ditto "$STAGED_APP" "$INCOMING"
 codesign --verify --deep --strict "$INCOMING"
@@ -73,7 +71,10 @@ rm -rf "$BACKUP"
 
 agent_plist="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 if [[ -f "$agent_plist" ]]; then
-    launchctl bootstrap "gui/$uid" "$agent_plist" >/dev/null 2>&1 || true
+    pkill -f '/Applications/ABX Voice Assist.app/Contents/MacOS/ABXVoiceAssist' >/dev/null 2>&1 || true
+    if ! launchctl print "gui/$uid/$AGENT_LABEL" >/dev/null 2>&1; then
+        launchctl bootstrap "gui/$uid" "$agent_plist" >/dev/null 2>&1 || true
+    fi
     launchctl kickstart -k "gui/$uid/$AGENT_LABEL" >/dev/null 2>&1 || true
 fi
 
