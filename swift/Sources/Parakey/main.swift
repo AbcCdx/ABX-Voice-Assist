@@ -5648,6 +5648,7 @@ private enum LoadedSpeechEngine {
 
 private struct TranscriptionWorkerResult: Sendable {
     let text: String
+    let confidence: Float
     let workerQueueSeconds: Double
     let decoderPreparationSeconds: Double
     let fluidCallSeconds: Double
@@ -5670,6 +5671,10 @@ private struct CompletedTranscriptionWorkerResult: Sendable {
 }
 
 actor TranscriptionWorker {
+    private static let autoVerificationConfidenceThreshold: Float = 0.72
+    private static let autoVerificationLanguages: [Language] = [
+        .russian, .english, .ukrainian,
+    ]
     private var engine: LoadedSpeechEngine?
     private var loadedProfile: SpeechModelProfile?
     private(set) var ready = false
@@ -5678,7 +5683,7 @@ actor TranscriptionWorker {
     private var inFlight = false
 
     func load(profile requestedProfile: SpeechModelProfile,
-              progressHandler: DownloadUtils.ProgressHandler? = nil) async throws {
+              progressHandler: ProgressHandler? = nil) async throws {
         let profile = requestedProfile.productionProfile
         if requestedProfile != profile {
             log("ASR: ignoring unsupported speech model \(requestedProfile.shortName); using \(profile.shortName)")
@@ -5704,7 +5709,7 @@ actor TranscriptionWorker {
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
     }
 
-    private func loadParakeetV3(progressHandler: DownloadUtils.ProgressHandler?) async throws -> AsrManager {
+    private func loadParakeetV3(progressHandler: ProgressHandler?) async throws -> AsrManager {
         if !speechModelCacheExists(for: .multilingualV3) {
             try assertSufficientDiskSpaceForSpeechModelDownload(profile: .multilingualV3)
         }
@@ -5723,14 +5728,16 @@ actor TranscriptionWorker {
         let models = try await AsrModels.load(from: modelDirectory,
                                               version: .v3,
                                               progressHandler: progressHandler)
-        return AsrManager(config: .default, models: models)
+        let config = ASRConfig(melChunkContext: false,
+                               dualDecodeArbitration: true)
+        return AsrManager(config: config, models: models)
     }
 
     fileprivate func transcribe(samples: [Float],
                                language: Language? = nil,
                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
-        guard let engine else { throw NSError(domain: "Parakey", code: -2) }
+        guard engine != nil else { throw NSError(domain: "Parakey", code: -2) }
         guard !inFlight else {
             log("ASR: transcribe re-entered while another transcription is in flight — refusing (ParakeyApp.isBusy should make this impossible)")
             assertionFailure("TranscriptionWorker.transcribe re-entered across a suspension point")
@@ -5738,6 +5745,45 @@ actor TranscriptionWorker {
         }
         inFlight = true
         defer { inFlight = false }
+
+        let primary = try await transcribeOnce(samples: samples, language: language)
+        guard language == nil,
+              primary.confidence < Self.autoVerificationConfidenceThreshold else {
+            return TranscriptionWorkerResult(
+                text: primary.text,
+                confidence: primary.confidence,
+                workerQueueSeconds: workerEnteredAt - requestedAt,
+                decoderPreparationSeconds: primary.decoderPreparationSeconds,
+                fluidCallSeconds: primary.fluidCallSeconds,
+                fluidProcessingSeconds: primary.fluidProcessingSeconds
+            )
+        }
+
+        var attempts = [primary]
+        for languageHint in Self.autoVerificationLanguages {
+            attempts.append(try await transcribeOnce(samples: samples, language: languageHint))
+        }
+        let best = attempts.max { lhs, rhs in lhs.confidence < rhs.confidence } ?? primary
+        let selected = primary.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || best.confidence >= primary.confidence + 0.02
+            ? best
+            : primary
+        let primaryConfidence = String(format: "%.3f", primary.confidence)
+        let selectedConfidence = String(format: "%.3f", selected.confidence)
+        log("ASR: auto verification confidence \(primaryConfidence) → \(selectedConfidence)")
+        return TranscriptionWorkerResult(
+            text: selected.text,
+            confidence: selected.confidence,
+            workerQueueSeconds: workerEnteredAt - requestedAt,
+            decoderPreparationSeconds: attempts.reduce(0) { $0 + $1.decoderPreparationSeconds },
+            fluidCallSeconds: attempts.reduce(0) { $0 + $1.fluidCallSeconds },
+            fluidProcessingSeconds: attempts.reduce(0) { $0 + $1.fluidProcessingSeconds }
+        )
+    }
+
+    private func transcribeOnce(samples: [Float],
+                                language: Language?) async throws -> TranscriptionWorkerResult {
+        guard let engine else { throw NSError(domain: "Parakey", code: -2) }
         switch engine {
         case .parakeetV3(let asr):
             let decoderPreparationStartedAt = ProcessInfo.processInfo.systemUptime
@@ -5747,7 +5793,8 @@ actor TranscriptionWorker {
             let fluidCallCompletedAt = ProcessInfo.processInfo.systemUptime
             return TranscriptionWorkerResult(
                 text: result.text,
-                workerQueueSeconds: workerEnteredAt - requestedAt,
+                confidence: result.confidence,
+                workerQueueSeconds: 0,
                 decoderPreparationSeconds: fluidCallStartedAt - decoderPreparationStartedAt,
                 fluidCallSeconds: fluidCallCompletedAt - fluidCallStartedAt,
                 fluidProcessingSeconds: result.processingTime
@@ -5756,8 +5803,8 @@ actor TranscriptionWorker {
     }
 
     /// Transcribe pause-separated portions serially. The ANE model must never
-    /// receive concurrent requests, and the blank line is intentionally added
-    /// only for a long silence detected in the original recording.
+    /// receive concurrent requests, and one line break is added only for a
+    /// long silence detected in the original recording.
     fileprivate func transcribe(segments: [[Float]],
                                 language: Language? = nil,
                                 requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
@@ -5776,7 +5823,8 @@ actor TranscriptionWorker {
             results.append(result)
         }
         return TranscriptionWorkerResult(
-            text: results.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n\n"),
+            text: results.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n"),
+            confidence: results.map(\.confidence).min() ?? 0,
             workerQueueSeconds: results.first?.workerQueueSeconds ?? 0,
             decoderPreparationSeconds: results.reduce(0) { $0 + $1.decoderPreparationSeconds },
             fluidCallSeconds: results.reduce(0) { $0 + $1.fluidCallSeconds },
@@ -5789,7 +5837,7 @@ actor TranscriptionWorker {
         let requestedAt = ProcessInfo.processInfo.systemUptime
         let transcription = try await transcribe(
             samples: samples,
-            language: nil,
+            language: .english,
             requestedAt: requestedAt
         )
         let completedAt = ProcessInfo.processInfo.systemUptime
@@ -6599,12 +6647,12 @@ private func removingFinalPeriod(from text: String) -> String {
 private func finalizedDictationText(_ text: String,
                                     removeFinalPeriod: Bool) -> String {
     guard removeFinalPeriod else { return text }
-    // A long pause can become a paragraph. Remove the generated closing
-    // period from each paragraph, not only from the final one.
+    // A long pause becomes exactly one line break. Remove the generated
+    // closing period from each part, not only from the final one.
     return text
-        .components(separatedBy: "\n\n")
+        .components(separatedBy: "\n")
         .map(removingFinalPeriod)
-        .joined(separator: "\n\n")
+        .joined(separator: "\n")
 }
 
 private struct SuccessfulDictationInsertionContext: Equatable {
@@ -6793,7 +6841,7 @@ func pastedText(from correctedTranscript: String, suffix: PasteSuffix) -> String
     }
 }
 
-func speechModelStartupStatusTitle(_ progress: DownloadUtils.DownloadProgress) -> String {
+func speechModelStartupStatusTitle(_ progress: DownloadProgress) -> String {
     switch progress.phase {
     case .listing:
         return "Checking speech model files…"
@@ -6807,7 +6855,7 @@ func speechModelStartupStatusTitle(_ progress: DownloadUtils.DownloadProgress) -
     }
 }
 
-func speechModelStartupProgressValue(_ progress: DownloadUtils.DownloadProgress) -> Double? {
+func speechModelStartupProgressValue(_ progress: DownloadProgress) -> Double? {
     switch progress.phase {
     case .downloading(_, let totalFiles):
         guard totalFiles > 0 else { return nil }
@@ -6818,7 +6866,7 @@ func speechModelStartupProgressValue(_ progress: DownloadUtils.DownloadProgress)
     }
 }
 
-func speechModelStartupPhaseName(_ progress: DownloadUtils.DownloadProgress) -> String {
+func speechModelStartupPhaseName(_ progress: DownloadProgress) -> String {
     switch progress.phase {
     case .listing:
         return "listing"
@@ -6858,7 +6906,7 @@ final class SpeechModelProgressTracker: @unchecked Sendable {
     private var lastDispatchTime: TimeInterval?
     private let lock = NSLock()
 
-    func consume(_ progress: DownloadUtils.DownloadProgress,
+    func consume(_ progress: DownloadProgress,
                  totalBytes: Int64,
                  now suppliedNow: TimeInterval? = nil) -> SpeechModelProgressUpdate {
         lock.lock()
@@ -12260,7 +12308,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 suppressAudioConfigurationChangesFromAppEngineUpdate()
                 try audio.startEngine(inputDevicePreference: settings.inputDevice)
                 audioInputPreferenceAtLastEngineStart = settings.inputDevice
-                stopAudioEngineImmediately()
+                // Keep the input graph warm after readiness. The tap discards
+                // every frame while `_isRunning` is false, so audio is still
+                // captured only while the push-to-talk key is held. Avoiding a
+                // cold AVAudioEngine start prevents the first spoken word from
+                // being clipped on every dictation after an idle period.
                 return
             } catch {
                 lastError = error
@@ -16127,6 +16179,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func scheduleAudioIdleStop(reason: String) {
         cancelAudioIdleStop()
+        // A ready push-to-talk service keeps only the hardware graph warm.
+        // handleTap rejects idle frames before conversion or persistence.
+        guard !isCoreRuntimeReady else { return }
         guard audio.isEngineStarted, !isRecording, !isBusy, !isTerminating else { return }
 
         let work = DispatchWorkItem { [weak self] in
@@ -19263,9 +19318,9 @@ private enum ParakeySelfTest {
             "final period postprocessing should preserve empty text"
         )
         try expect(
-            finalizedDictationText("Первый.\n\nВторой.", removeFinalPeriod: true),
-            equals: "Первый\n\nВторой",
-            "final period removal should apply to every pause-separated paragraph"
+            finalizedDictationText("Первый.\nВторой.", removeFinalPeriod: true),
+            equals: "Первый\nВторой",
+            "final period removal should apply to every pause-separated line"
         )
         let previousInsertion = SuccessfulDictationInsertionContext(
             text: "Первая мысль",
