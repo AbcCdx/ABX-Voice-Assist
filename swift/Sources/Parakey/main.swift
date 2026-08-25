@@ -22368,7 +22368,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         guard force || fingerprint != lastRenderFingerprint else { return }
         lastRenderFingerprint = fingerprint
         configureDesktopWindow(window)
-        window.title = t("ABX Voice Assist — панель управления", "ABX Voice Assist — Control Panel")
+        window.title = "ABX Voice Assist"
         window.contentView = makeContentView()
         if let settingsWindow, settingsWindow.isVisible {
             settingsWindow.title = t("Настройки ABX Voice Assist", "ABX Voice Assist Settings")
