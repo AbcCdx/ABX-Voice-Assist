@@ -22223,6 +22223,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private weak var aiModelField: NSTextField?
     private weak var settingsScrollView: NSScrollView?
     private var pendingAIKey = ""
+    private var compactPanelTab = 0
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -22291,15 +22292,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
 
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 310),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 420),
                               styleMask: [.titled, .closable, .miniaturizable],
                               backing: .buffered,
                               defer: false)
         window.title = "ABX Voice Assist"
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = studioBackgroundColor
-        window.contentMinSize = NSSize(width: 520, height: 310)
-        window.contentMaxSize = NSSize(width: 520, height: 310)
+        window.contentMinSize = NSSize(width: 360, height: 420)
+        window.contentMaxSize = NSSize(width: 360, height: 420)
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -22337,15 +22338,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func resizeCompactPanel(_ window: NSWindow) {
-        let missingCount = Permission.allCases.filter { !Permissions.isGranted($0) }.count
-        let state = AgentRuntimeStateStore.read()
-        let showsModelProgress = SuperDictateAgentService.isAgentRunning()
-            && state?.status == "starting"
-            && state?.modelDownloadPhase != nil
-        let modelProgressHeight = showsModelProgress ? 26 : 0
-        let height = CGFloat(310 + max(0, missingCount - 1) * 28 + modelProgressHeight)
+        let height = CGFloat(420)
         let oldTop = window.frame.maxY
-        let size = NSSize(width: 520, height: height)
+        let size = NSSize(width: 360, height: height)
         window.contentMinSize = size
         window.contentMaxSize = size
         window.setContentSize(size)
@@ -22413,6 +22408,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.recordingHUDTranscribingColor.rawValue,
                 settings.recordingHUDBackgroundStyle.rawValue,
                 settings.recordingHUDSize.rawValue,
+                String(compactPanelTab),
                 permissionClickCount.description].joined(separator: "::")
     }
 
@@ -22432,35 +22428,207 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func makeContentView() -> NSView {
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .leading
-        root.spacing = 10
-        root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
-        root.translatesAutoresizingMaskIntoConstraints = false
+        makeUnifiedControlSurface()
+    }
 
-        root.addArrangedSubview(compactHeaderView())
-        root.addArrangedSubview(compactServiceCard())
-        root.addArrangedSubview(compactPermissionsCard())
-        root.addArrangedSubview(compactUpdateCard())
-        root.addArrangedSubview(compactPrivacyFooter())
+    // This is deliberately the same compact visual language as the menu-bar
+    // popover. Both surfaces read the same Settings and AgentRuntimeState.
+    private func makeUnifiedControlSurface() -> NSView {
+        let root = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 360, height: 420))
+        root.material = .hudWindow
+        root.blendingMode = .withinWindow
+        root.state = .active
+        root.wantsLayer = true
+        root.layer?.backgroundColor = unifiedBackgroundColor.cgColor
 
-        let background = studioBackground()
-        background.addSubview(root)
+        let brand = unifiedLabel("ABX  Voice Assist", size: 16, weight: .semibold, color: .white)
+        brand.frame = NSRect(x: 17, y: 382, width: 190, height: 20)
+        root.addSubview(brand)
 
-        NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
-            root.topAnchor.constraint(equalTo: background.topAnchor),
-            root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
-        ])
+        let presentation = servicePresentation(running: SuperDictateAgentService.isAgentRunning(),
+                                               state: AgentRuntimeStateStore.read())
+        let status = NSStackView(frame: NSRect(x: 244, y: 384, width: 99, height: 16))
+        status.orientation = .horizontal
+        status.alignment = .centerY
+        status.spacing = 6
+        let dot = NSView(frame: NSRect(x: 0, y: 0, width: 6, height: 6))
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3
+        dot.layer?.backgroundColor = Permission.allCases.allSatisfy(Permissions.isGranted)
+            ? presentation.color.cgColor : NSColor.systemOrange.cgColor
+        status.addArrangedSubview(dot)
+        let statusText = unifiedLabel(Permission.allCases.allSatisfy(Permissions.isGranted)
+                                      ? presentation.status.lowercased()
+                                      : t("нет доступа", "access needed"),
+                                      size: 10,
+                                      color: unifiedMutedTextColor)
+        statusText.maximumNumberOfLines = 1
+        status.addArrangedSubview(statusText)
+        root.addSubview(status)
+        root.addSubview(unifiedSeparator(frame: NSRect(x: 17, y: 365, width: 326, height: 1)))
 
-        let innerWidthInset = -(root.edgeInsets.left + root.edgeInsets.right)
-        for view in root.arrangedSubviews {
-            view.widthAnchor.constraint(equalTo: root.widthAnchor,
-                                        constant: innerWidthInset).isActive = true
+        let general = unifiedTabButton(t("ОБЩИЕ", "GENERAL"), tag: 0, x: 17)
+        let history = unifiedTabButton(t("ИСТОРИЯ", "HISTORY"), tag: 1, x: 90)
+        root.addSubview(general)
+        root.addSubview(history)
+        let activeX: CGFloat = compactPanelTab == 0 ? 17 : 90
+        let activeWidth: CGFloat = compactPanelTab == 0 ? 48 : 58
+        let underline = NSView(frame: NSRect(x: activeX, y: 321, width: activeWidth, height: 2))
+        underline.wantsLayer = true
+        underline.layer?.backgroundColor = NSColor.white.cgColor
+        root.addSubview(underline)
+        root.addSubview(unifiedSeparator(frame: NSRect(x: 17, y: 320, width: 326, height: 1)))
+
+        if compactPanelTab == 0 {
+            addUnifiedGeneralContent(to: root)
+        } else {
+            addUnifiedHistoryContent(to: root)
         }
-        return background
+
+        root.addSubview(unifiedSeparator(frame: NSRect(x: 17, y: 48, width: 326, height: 1)))
+        let model = unifiedLabel("•  PAR AKEET TDT 0.6  ·  ЛОКАЛЬНО", size: 9.5, color: unifiedMutedTextColor)
+        model.font = .monospacedSystemFont(ofSize: 9.5, weight: .regular)
+        model.frame = NSRect(x: 17, y: 18, width: 188, height: 18)
+        root.addSubview(model)
+        root.addSubview(unifiedFooterButton(t("Настройки", "Settings"), action: #selector(openSettingsClicked(_:)), x: 213))
+        root.addSubview(unifiedFooterButton(t("Закрыть", "Close"), action: #selector(closeControlPanelClicked(_:)), x: 292))
+        return root
+    }
+
+    private func addUnifiedGeneralContent(to root: NSView) {
+        let dictation = unifiedLabel(t("ДИКТОВКА", "DICTATION"), size: 9.5, weight: .medium, color: unifiedMutedTextColor)
+        dictation.font = .monospacedSystemFont(ofSize: 9.5, weight: .medium)
+        dictation.frame = NSRect(x: 19, y: 294, width: 120, height: 14)
+        root.addSubview(dictation)
+        addUnifiedRow(to: root, title: t("Горячая клавиша", "Hotkey"), value: localizedHotkeyName(settings.configuredHotkey, language: language), y: 251)
+        addUnifiedRow(to: root, title: t("Нажми и говори", "Hold to talk"), value: settings.triggerMode == .hold ? t("ВКЛ", "ON") : t("ВЫКЛ", "OFF"), y: 211)
+        addUnifiedRow(to: root, title: t("Язык", "Language"), value: compactLanguageName(settings.dictationLanguage), y: 171)
+        let audio = unifiedLabel(t("ЗВУК", "AUDIO"), size: 9.5, weight: .medium, color: unifiedMutedTextColor)
+        audio.font = .monospacedSystemFont(ofSize: 9.5, weight: .medium)
+        audio.frame = NSRect(x: 19, y: 143, width: 120, height: 14)
+        root.addSubview(audio)
+        addUnifiedRow(to: root, title: t("Микрофон", "Microphone"), value: settings.inputDevice.isEmpty ? t("ПО УМОЛЧАНИЮ", "DEFAULT") : t("ВЫБРАН", "SELECTED"), y: 100)
+        addUnifiedRow(to: root, title: t("Финальная точка", "Final period"), value: settings.removeFinalPeriod ? t("УБИРАТЬ", "REMOVE") : t("СОХРАНЯТЬ", "KEEP"), y: 60)
+    }
+
+    private func addUnifiedHistoryContent(to root: NSView) {
+        let title = unifiedLabel(t("ПОСЛЕДНИЕ ДИКТОВКИ", "RECENT DICTATIONS"), size: 9.5, weight: .medium, color: unifiedMutedTextColor)
+        title.font = .monospacedSystemFont(ofSize: 9.5, weight: .medium)
+        title.frame = NSRect(x: 19, y: 294, width: 220, height: 14)
+        root.addSubview(title)
+        let entries = Array(settings.recentTranscriptEntries.prefix(3))
+        guard !entries.isEmpty else {
+            let empty = unifiedLabel(t("История появится после первой диктовки.", "History appears after the first dictation."), size: 12, color: unifiedMutedTextColor)
+            empty.frame = NSRect(x: 19, y: 236, width: 320, height: 18)
+            root.addSubview(empty)
+            return
+        }
+        for (index, entry) in entries.enumerated() {
+            let y = 250 - CGFloat(index) * 64
+            let card = NSView(frame: NSRect(x: 17, y: y, width: 326, height: 56))
+            card.wantsLayer = true
+            card.layer?.cornerRadius = 10
+            card.layer?.backgroundColor = unifiedSurfaceColor.cgColor
+            card.layer?.borderColor = unifiedBorderColor.cgColor
+            card.layer?.borderWidth = 1
+            let preview = entry.text
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = unifiedLabel(preview, size: 12, weight: .medium, color: .white)
+            text.frame = NSRect(x: 12, y: 27, width: 300, height: 17)
+            let meta = unifiedLabel(t("ЛОКАЛЬНАЯ ДИКТОВКА", "LOCAL DICTATION"), size: 9.5, color: unifiedMutedTextColor)
+            meta.font = .monospacedSystemFont(ofSize: 9.5, weight: .regular)
+            meta.frame = NSRect(x: 12, y: 10, width: 240, height: 14)
+            card.addSubview(text)
+            card.addSubview(meta)
+            root.addSubview(card)
+        }
+    }
+
+    private func addUnifiedRow(to root: NSView, title: String, value: String, y: CGFloat) {
+        let card = NSButton(frame: NSRect(x: 17, y: y, width: 326, height: 40))
+        card.title = ""
+        card.target = self
+        card.action = #selector(openSettingsClicked(_:))
+        card.isBordered = false
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 10
+        card.layer?.backgroundColor = unifiedSurfaceColor.cgColor
+        card.layer?.borderColor = unifiedBorderColor.cgColor
+        card.layer?.borderWidth = 1
+        let titleLabel = unifiedLabel(title, size: 13, weight: .medium, color: .white)
+        titleLabel.frame = NSRect(x: 13, y: 11, width: 176, height: 18)
+        let valueLabel = unifiedLabel(value, size: 9.5, weight: .medium, color: unifiedMutedTextColor)
+        valueLabel.font = .monospacedSystemFont(ofSize: 9.5, weight: .medium)
+        valueLabel.alignment = .right
+        valueLabel.lineBreakMode = .byTruncatingHead
+        valueLabel.frame = NSRect(x: 190, y: 12, width: 122, height: 16)
+        card.addSubview(titleLabel)
+        card.addSubview(valueLabel)
+        root.addSubview(card)
+    }
+
+    private func unifiedTabButton(_ title: String, tag: Int, x: CGFloat) -> NSButton {
+        let button = NSButton(frame: NSRect(x: x, y: 329, width: 64, height: 28))
+        button.title = title
+        button.tag = tag
+        button.target = self
+        button.action = #selector(selectCompactPanelTab(_:))
+        button.isBordered = false
+        button.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium)
+        button.contentTintColor = tag == compactPanelTab ? .white : unifiedMutedTextColor
+        return button
+    }
+
+    private func unifiedFooterButton(_ title: String, action: Selector, x: CGFloat) -> NSButton {
+        let button = NSButton(frame: NSRect(x: x, y: 13, width: title.count > 6 ? 76 : 53, height: 24))
+        button.title = title
+        button.target = self
+        button.action = action
+        button.isBordered = false
+        button.font = .systemFont(ofSize: 11, weight: .medium)
+        button.contentTintColor = unifiedMutedTextColor
+        return button
+    }
+
+    private func unifiedLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: size, weight: weight)
+        label.textColor = color
+        label.maximumNumberOfLines = 1
+        label.lineBreakMode = .byTruncatingTail
+        return label
+    }
+
+    private func unifiedSeparator(frame: NSRect) -> NSView {
+        let separator = NSView(frame: frame)
+        separator.wantsLayer = true
+        separator.layer?.backgroundColor = unifiedBorderColor.cgColor
+        return separator
+    }
+
+    private var unifiedBackgroundColor: NSColor { NSColor(calibratedRed: 0.055, green: 0.050, blue: 0.065, alpha: 1) }
+    private var unifiedSurfaceColor: NSColor { NSColor(calibratedRed: 0.115, green: 0.105, blue: 0.130, alpha: 0.92) }
+    private var unifiedBorderColor: NSColor { NSColor(calibratedRed: 0.30, green: 0.27, blue: 0.34, alpha: 0.82) }
+    private var unifiedMutedTextColor: NSColor { NSColor(calibratedWhite: 0.60, alpha: 1) }
+
+    private func compactLanguageName(_ value: DictationLanguage) -> String {
+        switch value {
+        case .auto: return t("АВТО", "AUTO")
+        case .russian: return t("РУССКИЙ", "RUSSIAN")
+        case .ukrainian: return t("УКРАИНСКИЙ", "UKRAINIAN")
+        case .english: return t("АНГЛИЙСКИЙ", "ENGLISH")
+        default: return DICTATION_LANGUAGE_DISPLAY[value, default: value.rawValue].uppercased()
+        }
+    }
+
+    @objc private func selectCompactPanelTab(_ sender: NSButton) {
+        compactPanelTab = sender.tag
+        refresh(force: true)
+    }
+
+    @objc private func closeControlPanelClicked(_ sender: NSButton) {
+        window?.performClose(nil)
     }
 
     private func makeSettingsContentView() -> NSView {
