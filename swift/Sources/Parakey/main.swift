@@ -13866,12 +13866,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func makeStatusPopoverContent() -> NSView {
-        let root = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 360, height: 420))
-        root.material = .hudWindow
-        root.blendingMode = .withinWindow
-        root.state = .active
+        let root = UnifiedBackdropView(frame: NSRect(x: 0, y: 0, width: 360, height: 420))
         root.wantsLayer = true
-        root.layer?.backgroundColor = popoverBackgroundColor.cgColor
         root.layer?.cornerRadius = 14
         root.layer?.masksToBounds = true
 
@@ -22206,6 +22202,36 @@ private final class SettingsDocumentView: NSView {
 }
 
 @MainActor
+private final class UnifiedBackdropView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(calibratedRed: 0.035, green: 0.027, blue: 0.052, alpha: 1).setFill()
+        bounds.fill()
+        NSGradient(colors: [
+            NSColor(calibratedRed: 0.48, green: 0.08, blue: 0.48, alpha: 0.48),
+            NSColor(calibratedRed: 0.08, green: 0.03, blue: 0.16, alpha: 0),
+        ])?.draw(in: bounds.insetBy(dx: -70, dy: -70),
+                 relativeCenterPosition: NSPoint(x: -0.55, y: 0.58))
+        NSGradient(colors: [
+            NSColor(calibratedRed: 0.02, green: 0.40, blue: 0.46, alpha: 0.24),
+            NSColor(calibratedRed: 0.02, green: 0.08, blue: 0.12, alpha: 0),
+        ])?.draw(in: bounds.insetBy(dx: -105, dy: -85),
+                 relativeCenterPosition: NSPoint(x: 0.72, y: -0.52))
+        NSColor(calibratedWhite: 0.015, alpha: 0.34).setFill()
+        bounds.fill(using: .sourceOver)
+    }
+}
+
+@MainActor
 private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var settingsWindow: NSWindow?
@@ -22352,7 +22378,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func renderFingerprint() -> String {
         let state = AgentRuntimeStateStore.read()
         let permissions = Permission.allCases.map { Permissions.isGranted($0) ? "1" : "0" }.joined()
-        let inputDevices = settingsWindow?.isVisible == true
+        let inputDevices = compactPanelTab == 2
             ? availableAudioInputDevices()
                 .map { "\($0.uid)=\($0.name)" }
                 .joined(separator: "|")
@@ -22434,12 +22460,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     // This is deliberately the same compact visual language as the menu-bar
     // popover. Both surfaces read the same Settings and AgentRuntimeState.
     private func makeUnifiedControlSurface() -> NSView {
-        let root = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 360, height: 420))
-        root.material = .hudWindow
-        root.blendingMode = .withinWindow
-        root.state = .active
+        let root = UnifiedBackdropView(frame: NSRect(x: 0, y: 0, width: 360, height: 420))
         root.wantsLayer = true
-        root.layer?.backgroundColor = unifiedBackgroundColor.cgColor
 
         let brand = unifiedLabel("ABX  Voice Assist", size: 16, weight: .semibold, color: .white)
         brand.frame = NSRect(x: 17, y: 382, width: 190, height: 20)
@@ -22469,10 +22491,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         let general = unifiedTabButton(t("ОБЩИЕ", "GENERAL"), tag: 0, x: 17)
         let history = unifiedTabButton(t("ИСТОРИЯ", "HISTORY"), tag: 1, x: 90)
+        let settingsTab = unifiedTabButton(t("НАСТРОЙКИ", "SETTINGS"), tag: 2, x: 174)
         root.addSubview(general)
         root.addSubview(history)
-        let activeX: CGFloat = compactPanelTab == 0 ? 17 : 90
-        let activeWidth: CGFloat = compactPanelTab == 0 ? 48 : 58
+        root.addSubview(settingsTab)
+        let activeX: CGFloat = [17, 90, 174][min(max(compactPanelTab, 0), 2)]
+        let activeWidth: CGFloat = [48, 58, 74][min(max(compactPanelTab, 0), 2)]
         let underline = NSView(frame: NSRect(x: activeX, y: 321, width: activeWidth, height: 2))
         underline.wantsLayer = true
         underline.layer?.backgroundColor = NSColor.white.cgColor
@@ -22481,8 +22505,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         if compactPanelTab == 0 {
             addUnifiedGeneralContent(to: root)
-        } else {
+        } else if compactPanelTab == 1 {
             addUnifiedHistoryContent(to: root)
+        } else {
+            addUnifiedSettingsContent(to: root)
         }
 
         root.addSubview(unifiedSeparator(frame: NSRect(x: 17, y: 48, width: 326, height: 1)))
@@ -22490,7 +22516,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         model.font = .monospacedSystemFont(ofSize: 9.5, weight: .regular)
         model.frame = NSRect(x: 17, y: 18, width: 188, height: 18)
         root.addSubview(model)
-        root.addSubview(unifiedFooterButton(t("Настройки", "Settings"), action: #selector(openSettingsClicked(_:)), x: 213))
+        root.addSubview(unifiedFooterButton(compactPanelTab == 2 ? t("Готово", "Done") : t("Настройки", "Settings"),
+                                            action: #selector(openSettingsClicked(_:)),
+                                            x: 213))
         root.addSubview(unifiedFooterButton(t("Закрыть", "Close"), action: #selector(closeControlPanelClicked(_:)), x: 292))
         return root
     }
@@ -22545,6 +22573,190 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
+    private func addUnifiedSettingsContent(to root: NSView) {
+        let scroll = NSScrollView(frame: NSRect(x: 17, y: 51, width: 326, height: 268))
+        scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        let document = SettingsDocumentView(frame: NSRect(x: 0, y: 0, width: 316, height: 720))
+        document.wantsLayer = true
+        var y: CGFloat = 4
+
+        func section(_ title: String) {
+            let label = unifiedLabel(title, size: 9.5, weight: .medium, color: unifiedMutedTextColor)
+            label.font = .monospacedSystemFont(ofSize: 9.5, weight: .medium)
+            label.frame = NSRect(x: 2, y: y, width: 290, height: 15)
+            document.addSubview(label)
+            y += 22
+        }
+
+        func row(_ title: String, control: NSView) {
+            let card = unifiedCompactSettingsRow(title: title, control: control)
+            card.frame.origin = NSPoint(x: 0, y: y)
+            document.addSubview(card)
+            y += 46
+        }
+
+        section(t("ОБЩИЕ", "GENERAL"))
+        let hotkey = compactSettingsButton(localizedHotkeyName(draft.dictationHotkey, language: language),
+                                           action: #selector(recordDictationShortcutClicked(_:)))
+        hotkey.tag = ControlPanelShortcutKind.dictation.rawValue
+        row(t("Горячая клавиша", "Hotkey"), control: hotkey)
+        row(t("Нажми и говори", "Hold to talk"), control: compactSettingsValue(t("ВСЕГДА", "ALWAYS")))
+
+        section("PARAKEET TDT 0.6B V3")
+        let languagePopup = compactSettingsPopup(
+            options: DictationLanguage.allCases.map { (DICTATION_LANGUAGE_DISPLAY[$0] ?? $0.rawValue, $0.rawValue) },
+            selected: settings.dictationLanguage.rawValue,
+            action: #selector(selectDictationLanguage(_:))
+        )
+        row(t("Язык", "Language"), control: languagePopup)
+        row(t("Микрофон", "Microphone"), control: compactMicrophonePopup(draft))
+
+        section(t("ТЕКСТ", "TEXT"))
+        let periodSwitch = compactSettingsSwitch(isOn: draft.removeFinalPeriod,
+                                                 action: #selector(toggleRemoveFinalPeriod(_:)))
+        row(t("Убирать точку", "Remove final period"), control: periodSwitch)
+        let completionPopup = compactSettingsPopup(
+            options: [(t("Вставить", "Insert"), DictationCompletionBehavior.insert.rawValue),
+                      (t("Вставить + Enter", "Insert + Enter"), DictationCompletionBehavior.insertAndEnter.rawValue)],
+            selected: draft.primaryCompletionBehavior.rawValue,
+            action: #selector(selectCompactCompletionBehavior(_:))
+        )
+        row(t("Завершение", "Completion"), control: completionPopup)
+
+        section(t("ИНДИКАТОР", "INDICATOR"))
+        row(t("Размер", "Size"), control: compactSettingsPopup(
+            options: RecordingHUDSize.allCases.map { (localizedHUDSizeName($0), $0.rawValue) },
+            selected: draft.hudSize.rawValue,
+            action: #selector(selectRecordingHUDSize(_:))))
+        row(t("Цвет записи", "Recording color"), control: compactSettingsPopup(
+            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+            selected: draft.recordingColor.rawValue,
+            action: #selector(selectRecordingHUDRecordingColor(_:))))
+        row(t("Цвет обработки", "Processing color"), control: compactSettingsPopup(
+            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+            selected: draft.transcribingColor.rawValue,
+            action: #selector(selectRecordingHUDTranscribingColor(_:))))
+
+        section("LLM")
+        let aiSwitch = compactSettingsSwitch(isOn: draft.aiCleanupEnabled,
+                                             action: #selector(toggleAICleanupDraft(_:)))
+        aiSwitch.isEnabled = AIKeyStore.read() != nil
+        row(t("Обработка LLM", "LLM processing"), control: aiSwitch)
+        let modelField = compactSettingsField(draft.aiCleanupModel,
+                                              placeholder: AICleanupSettings.defaultModel,
+                                              action: #selector(aiCleanupModelChanged(_:)))
+        aiModelField = modelField
+        row(t("Модель", "Model"), control: modelField)
+        let keyControl = compactAIKeyControl()
+        row(t("API-ключ", "API key"), control: keyControl)
+
+        section(t("СИСТЕМА", "SYSTEM"))
+        row(t("Разрешения macOS", "macOS permissions"),
+            control: compactSettingsButton(t("СБРОСИТЬ", "RESET"), action: #selector(resetPermissionsClicked(_:))))
+        row(t("Изменения", "Changes"),
+            control: compactSettingsButton(t("СОХРАНИТЬ", "SAVE"), action: #selector(saveSettingsClicked(_:))))
+
+        document.setFrameSize(NSSize(width: 316, height: y + 4))
+        scroll.documentView = document
+        settingsScrollView = scroll
+        root.addSubview(scroll)
+    }
+
+    private func unifiedCompactSettingsRow(title: String, control: NSView) -> NSView {
+        let card = NSView(frame: NSRect(x: 0, y: 0, width: 316, height: 42))
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 9
+        card.layer?.backgroundColor = unifiedSurfaceColor.withAlphaComponent(0.78).cgColor
+        card.layer?.borderColor = unifiedBorderColor.cgColor
+        card.layer?.borderWidth = 1
+        let label = unifiedLabel(title, size: 12, weight: .medium, color: .white)
+        label.frame = NSRect(x: 12, y: 12, width: 142, height: 17)
+        control.frame.origin = NSPoint(x: 158, y: 7)
+        card.addSubview(label)
+        card.addSubview(control)
+        return card
+    }
+
+    private func compactSettingsButton(_ title: String, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.frame = NSRect(x: 0, y: 0, width: 146, height: 28)
+        button.bezelStyle = .rounded
+        button.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+        return button
+    }
+
+    private func compactSettingsValue(_ text: String) -> NSTextField {
+        let value = unifiedLabel(text, size: 10, weight: .medium, color: unifiedMutedTextColor)
+        value.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+        value.alignment = .right
+        value.frame = NSRect(x: 0, y: 0, width: 146, height: 28)
+        return value
+    }
+
+    private func compactSettingsSwitch(isOn: Bool, action: Selector) -> NSSwitch {
+        let toggle = NSSwitch(frame: NSRect(x: 104, y: 1, width: 42, height: 26))
+        toggle.target = self
+        toggle.action = action
+        toggle.state = isOn ? .on : .off
+        return toggle
+    }
+
+    private func compactSettingsPopup(options: [(String, String)], selected: String, action: Selector) -> NSPopUpButton {
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 146, height: 28))
+        popup.target = self
+        popup.action = action
+        popup.font = .systemFont(ofSize: 10.5)
+        for option in options {
+            popup.addItem(withTitle: option.0)
+            popup.lastItem?.representedObject = option.1
+        }
+        if let item = popup.itemArray.first(where: { ($0.representedObject as? String) == selected }) {
+            popup.select(item)
+        }
+        return popup
+    }
+
+    private func compactMicrophonePopup(_ draft: ControlPanelSettingsDraft) -> NSPopUpButton {
+        let devices = availableAudioInputDevices()
+        var options: [(String, String)] = [(t("По умолчанию", "Default"), "")]
+        options.append(contentsOf: devices.map { ($0.name, $0.uid) })
+        return compactSettingsPopup(options: options,
+                                    selected: draft.inputDevicePreference,
+                                    action: #selector(selectInputDeviceDraft(_:)))
+    }
+
+    private func compactSettingsField(_ value: String, placeholder: String, action: Selector) -> NSTextField {
+        let field = NSTextField(frame: NSRect(x: 0, y: 1, width: 146, height: 26))
+        field.stringValue = value
+        field.placeholderString = placeholder
+        field.font = .systemFont(ofSize: 10.5)
+        field.target = self
+        field.action = action
+        return field
+    }
+
+    private func compactAIKeyControl() -> NSView {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 146, height: 28))
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 1, width: 86, height: 26))
+        field.stringValue = pendingAIKey
+        field.placeholderString = AIKeyStore.read() == nil ? t("Ключ", "Key") : "••••"
+        field.font = .systemFont(ofSize: 10.5)
+        aiKeyField = field
+        let save = NSButton(title: t("OK", "OK"), target: self, action: #selector(saveAIKeyClicked(_:)))
+        save.frame = NSRect(x: 91, y: 0, width: 55, height: 28)
+        save.bezelStyle = .rounded
+        container.addSubview(field)
+        container.addSubview(save)
+        return container
+    }
+
     private func addUnifiedRow(to root: NSView, title: String, value: String, y: CGFloat) {
         let card = NSButton(frame: NSRect(x: 17, y: y, width: 326, height: 40))
         card.title = ""
@@ -22569,7 +22781,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func unifiedTabButton(_ title: String, tag: Int, x: CGFloat) -> NSButton {
-        let button = NSButton(frame: NSRect(x: x, y: 329, width: 64, height: 28))
+        let button = NSButton(frame: NSRect(x: x, y: 329, width: tag == 2 ? 84 : 64, height: 28))
         button.title = title
         button.tag = tag
         button.target = self
@@ -22624,6 +22836,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     @objc private func selectCompactPanelTab(_ sender: NSButton) {
         compactPanelTab = sender.tag
+        if compactPanelTab == 2 {
+            settingsDraft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        }
         refresh(force: true)
     }
 
@@ -24597,57 +24812,19 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func openSettingsClicked(_ sender: NSButton) {
-        if let settingsWindow {
-            refreshSettingsWindow()
-            settingsWindow.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
+        compactPanelTab = compactPanelTab == 2 ? 0 : 2
+        if compactPanelTab == 2 {
+            settingsDraft = ControlPanelSettingsDraft(settings: settings)
         }
-
-        settingsDraft = ControlPanelSettingsDraft(settings: settings)
-        let visibleFrame = (window?.screen ?? NSScreen.main)?.visibleFrame
-        let contentHeight = settingsWindowContentHeight(
-            visibleScreenHeight: visibleFrame?.height
-        )
-
-        let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: contentHeight),
-            styleMask: [.titled, .closable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        settingsWindow.title = t("Настройки ABX Voice Assist", "ABX Voice Assist Settings")
-        settingsWindow.appearance = NSAppearance(named: .darkAqua)
-        settingsWindow.backgroundColor = studioBackgroundColor
-        settingsWindow.contentMinSize = NSSize(width: 680, height: contentHeight)
-        settingsWindow.contentMaxSize = NSSize(width: 680, height: contentHeight)
-        settingsWindow.isReleasedWhenClosed = false
-        settingsWindow.delegate = self
-        settingsWindow.contentView = makeSettingsContentView()
-        if let mainWindow = window, let visibleFrame {
-            let mainFrame = mainWindow.frame
-            let preferredRight = mainFrame.maxX + 14
-            let preferredLeft = mainFrame.minX - settingsWindow.frame.width - 14
-            let x = preferredRight + settingsWindow.frame.width <= visibleFrame.maxX
-                ? preferredRight
-                : max(visibleFrame.minX, preferredLeft)
-            let y = min(max(visibleFrame.minY,
-                            mainFrame.maxY - settingsWindow.frame.height),
-                        visibleFrame.maxY - settingsWindow.frame.height)
-            settingsWindow.setFrameOrigin(NSPoint(x: x, y: y))
-        } else {
-            settingsWindow.center()
-        }
-        self.settingsWindow = settingsWindow
-        settingsWindow.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        lastRenderFingerprint = ""
+        refresh(force: true)
     }
 
     @objc private func recordDictationShortcutClicked(_ sender: NSButton) {
         guard serviceOperation == nil,
               let kind = ControlPanelShortcutKind(rawValue: sender.tag) else { return }
         if let hotkeyRecorder {
-            hotkeyRecorder.present(relativeTo: settingsWindow)
+            hotkeyRecorder.present(relativeTo: window)
             return
         }
         let state = AgentRuntimeStateStore.read()
@@ -24706,7 +24883,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         hotkeyRecorder = recorder
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self, weak recorder] in
             guard self?.hotkeyRecorder === recorder else { return }
-            recorder?.present(relativeTo: self?.settingsWindow)
+            recorder?.present(relativeTo: self?.window)
         }
     }
 
@@ -24742,6 +24919,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     @objc private func selectPrimaryCompletionBehavior(_ sender: NSSegmentedControl) {
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.primaryCompletionBehavior = sender.selectedSegment == 1 ? .insertAndEnter : .insert
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func selectCompactCompletionBehavior(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let value = DictationCompletionBehavior(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.primaryCompletionBehavior = value
         settingsDraft = draft
         refreshSettingsWindow()
     }
@@ -25014,6 +25200,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func refreshSettingsWindow(captureFields: Bool = true) {
+        if compactPanelTab == 2 {
+            if captureFields {
+                captureAISettingsFields()
+            }
+            lastRenderFingerprint = ""
+            refresh(force: true)
+            return
+        }
         guard let settingsWindow else { return }
         let previousOffset = settingsScrollView?.contentView.bounds.origin.y ?? 0
         if captureFields {
