@@ -12036,17 +12036,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func recordingHUDFrame(size: NSSize) -> NSRect {
-        if let targetFrame = recordingHUDInsertionTargetVisualFrame ?? recordingHUDInsertionTargetFrame {
-            return recordingHUDFrameAboveTarget(targetFrame, size: size)
-        }
-        if let fallbackWindow = recordingHUDFallbackWindowFrame {
-            return recordingHUDFrameInsideFallbackWindow(fallbackWindow, size: size)
-        }
-        let visible = NSScreen.main?.visibleFrame
-            ?? NSScreen.screens.first?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        // The recording capsule is a stable status affordance, not a caret
+        // annotation: keep it at the bottom centre of the current screen.
+        let visible = screenForRecordingHUD().visibleFrame
         let x = visible.midX - (size.width / 2)
-        let y = visible.maxY - size.height - 96
+        let y = visible.minY + 24
         return NSRect(x: x, y: y, width: size.width, height: size.height)
     }
 
@@ -12350,57 +12344,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func animateRecordingHUDRetargetIfNeeded(from previousTargetFrame: NSRect?,
                                                      to newTargetFrame: NSRect) {
-        guard isRecording else { return }
-        guard let panel = recordingHUDPanel,
-              panel.isVisible,
-              recordingHUDView?.mode == .recording else {
-            return
-        }
-
-        let target = recordingHUDFrameAboveTarget(newTargetFrame,
-                                                  size: recordingHUDExpandedSize)
-        let distance = hypot(target.midX - panel.frame.midX,
-                             target.midY - panel.frame.midY)
-        guard distance > 8 else {
-            if distance > 1 {
-                panel.setFrame(target, display: false)
-            }
-            return
-        }
-        if let previousTargetFrame,
-           hypot(previousTargetFrame.midX - newTargetFrame.midX,
-                 previousTargetFrame.midY - newTargetFrame.midY) < 3,
-           abs(previousTargetFrame.width - newTargetFrame.width) < 3,
-           abs(previousTargetFrame.height - newTargetFrame.height) < 3 {
-            return
-        }
-
-        recordingHUDRetargetWorkItem?.cancel()
-        recordingHUDRetargetWorkItem = nil
-        recordingHUDAnimationToken += 1
-        let token = recordingHUDAnimationToken
-        stopRecordingHUDRevealAnimation(finish: false)
-
-        startRecordingHUDRevealAnimation(from: recordingHUDView?.revealProgress ?? 1,
-                                         to: 0,
-                                         duration: RECORDING_HUD_ANIMATE_OUT_SECONDS) { [weak self, weak panel] in
-            let work = DispatchWorkItem { [weak self, weak panel] in
-                guard let self, let panel else { return }
-                self.recordingHUDRetargetWorkItem = nil
-                guard self.recordingHUDAnimationToken == token else { return }
-                panel.setFrame(target, display: false)
-                self.recordingHUDView?.revealProgress = 0
-                panel.alphaValue = 1
-                panel.contentView?.displayIfNeeded()
-                panel.displayIfNeeded()
-                panel.orderFrontRegardless()
-                self.startRecordingHUDRevealAnimation(from: 0,
-                                                      to: 1,
-                                                      duration: RECORDING_HUD_ANIMATE_IN_SECONDS)
-            }
-            self?.recordingHUDRetargetWorkItem = work
-            DispatchQueue.main.async(execute: work)
-        }
+        // Insertion-target updates remain useful for text insertion, but the
+        // HUD itself deliberately stays at the bottom centre of the screen.
+        _ = (previousTargetFrame, newTargetFrame)
     }
 
     private func screenForRecordingHUD() -> NSScreen {
