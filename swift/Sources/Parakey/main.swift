@@ -10667,6 +10667,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// is running; guards against a second click spawning a second
     /// update helper.
     private var isPreparingUpdate = false
+    private var automaticPermissionRequest: Permission?
+    private var automaticallyRequestedPermissions: [Permission] = []
     private var reminderPausedUpdateVersion: String?
     private var reminderPausedUntil: Date?
 
@@ -10827,6 +10829,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.setHistoryHotkey(settings.configuredHistoryHotkey)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.requestNextMissingPermissionAutomatically()
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -11597,6 +11602,27 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Permission.allCases.filter { !Permissions.isGranted($0) }
     }
 
+    private func requestNextMissingPermissionAutomatically() {
+        guard automaticPermissionRequest == nil else { return }
+        guard let permission = missingPermissions().first(where: {
+            !automaticallyRequestedPermissions.contains($0)
+        }) else { return }
+        automaticallyRequestedPermissions.append(permission)
+        automaticPermissionRequest = permission
+        log("automatically requesting missing permission: \(permission.rawValue)")
+        Permissions.request(permission)
+    }
+
+    private func advanceAutomaticPermissionRequestIfNeeded() {
+        guard let permission = automaticPermissionRequest,
+              Permissions.isGranted(permission) else { return }
+        log("automatic permission request granted: \(permission.rawValue)")
+        automaticPermissionRequest = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.requestNextMissingPermissionAutomatically()
+        }
+    }
+
     @discardableResult
     private func logPermissionReadinessWait(_ missing: [Permission]) -> Bool {
         let key = missing.map(\.rawValue).joined(separator: "|")
@@ -11626,6 +11652,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func permissionReadinessTimerFired(_ timer: Timer) {
+        advanceAutomaticPermissionRequestIfNeeded()
         guard isCoreRuntimeReady else {
             let missing = missingPermissions()
             guard !missing.isEmpty else {
@@ -22123,6 +22150,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var aiCleanupBaseURL: String
     var aiCleanupModel: String
     var inputDevicePreference: String
+    var muteWhileRecording: Bool
     var removeFinalPeriod: Bool
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
@@ -22141,6 +22169,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         aiCleanupModel = settings.aiCleanupModel
         let savedInput = settings.inputDevice
         inputDevicePreference = audioInputDevice(matching: savedInput)?.uid ?? savedInput
+        muteWhileRecording = settings.muteWhileRecording
         removeFinalPeriod = settings.removeFinalPeriod
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
@@ -22232,6 +22261,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private weak var settingsScrollView: NSScrollView?
     private var pendingAIKey = ""
     private var compactPanelTab = 0
+    private var desktopNavigationPage = 0
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -22242,6 +22272,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
         NSApp.setActivationPolicy(.regular)
+        settingsDraft = ControlPanelSettingsDraft(settings: settings)
         showWindow()
         startRefreshTimer()
         checkForUpdates()
@@ -22300,15 +22331,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
 
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 420),
-                              styleMask: [.titled, .closable, .miniaturizable],
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1060, height: 760),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered,
                               defer: false)
         window.title = "ABX Voice Assist"
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = studioBackgroundColor
-        window.contentMinSize = NSSize(width: 360, height: 420)
-        window.contentMaxSize = NSSize(width: 360, height: 420)
+        window.contentMinSize = NSSize(width: 900, height: 620)
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -22337,7 +22367,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let fingerprint = renderFingerprint()
         guard force || fingerprint != lastRenderFingerprint else { return }
         lastRenderFingerprint = fingerprint
-        resizeCompactPanel(window)
+        configureDesktopWindow(window)
         window.title = t("ABX Voice Assist — панель управления", "ABX Voice Assist — Control Panel")
         window.contentView = makeContentView()
         if let settingsWindow, settingsWindow.isVisible {
@@ -22345,16 +22375,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
-    private func resizeCompactPanel(_ window: NSWindow) {
-        let height = CGFloat(420)
-        let oldTop = window.frame.maxY
-        let size = NSSize(width: 360, height: height)
-        window.contentMinSize = size
-        window.contentMaxSize = size
-        window.setContentSize(size)
-        var frame = window.frame
-        frame.origin.y = oldTop - frame.height
-        window.setFrame(frame, display: false)
+    private func configureDesktopWindow(_ window: NSWindow) {
+        window.contentMinSize = NSSize(width: 900, height: 620)
     }
 
     private func renderFingerprint() -> String {
@@ -22416,6 +22438,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.recordingHUDTranscribingColor.rawValue,
                 settings.recordingHUDBackgroundStyle.rawValue,
                 settings.recordingHUDSize.rawValue,
+                (settingsDraft?.muteWhileRecording ?? settings.muteWhileRecording) ? "mute-on" : "mute-off",
+                String(desktopNavigationPage),
                 String(compactPanelTab),
                 permissionClickCount.description].joined(separator: "::")
     }
@@ -22436,7 +22460,265 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func makeContentView() -> NSView {
-        makeUnifiedControlSurface()
+        makeDesktopControlSurface()
+    }
+
+    private func makeDesktopControlSurface() -> NSView {
+        let root = UnifiedBackdropView(frame: NSRect(x: 0, y: 0, width: 1060, height: 760))
+
+        let layout = NSStackView()
+        layout.translatesAutoresizingMaskIntoConstraints = false
+        layout.orientation = .horizontal
+        layout.alignment = .top
+        layout.spacing = 0
+        root.addSubview(layout)
+
+        let sidebar = makeDesktopSidebar()
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.widthAnchor.constraint(equalToConstant: 236).isActive = true
+        layout.addArrangedSubview(sidebar)
+
+        let divider = NSView()
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = unifiedBorderColor.withAlphaComponent(0.65).cgColor
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
+        layout.addArrangedSubview(divider)
+
+        let content = desktopNavigationPage == 0
+            ? makeDesktopGeneralSettingsPage()
+            : makeDesktopPendingPage()
+        layout.addArrangedSubview(content)
+
+        NSLayoutConstraint.activate([
+            layout.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            layout.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            layout.topAnchor.constraint(equalTo: root.topAnchor),
+            layout.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            sidebar.heightAnchor.constraint(equalTo: layout.heightAnchor),
+            divider.heightAnchor.constraint(equalTo: layout.heightAnchor),
+            content.heightAnchor.constraint(equalTo: layout.heightAnchor),
+        ])
+        return root
+    }
+
+    private func makeDesktopSidebar() -> NSView {
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .underWindowBackground
+        sidebar.blendingMode = .withinWindow
+        sidebar.state = .active
+        sidebar.wantsLayer = true
+        sidebar.layer?.backgroundColor = NSColor(calibratedWhite: 0.025, alpha: 0.42).cgColor
+
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 7
+        stack.edgeInsets = NSEdgeInsets(top: 28, left: 16, bottom: 24, right: 16)
+        sidebar.addSubview(stack)
+
+        let brand = panelLabel("ABX", size: 28, weight: .heavy, color: .white)
+        brand.font = .systemFont(ofSize: 28, weight: .heavy)
+        stack.addArrangedSubview(brand)
+        let product = panelLabel("VOICE ASSIST", size: 11, weight: .bold, color: unifiedMutedTextColor)
+        product.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
+        stack.addArrangedSubview(product)
+
+        let brandSpacer = NSView()
+        brandSpacer.translatesAutoresizingMaskIntoConstraints = false
+        brandSpacer.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        stack.addArrangedSubview(brandSpacer)
+        let rule = unifiedSeparator(frame: .zero)
+        rule.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(rule)
+        rule.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let navigationSpacer = NSView()
+        navigationSpacer.translatesAutoresizingMaskIntoConstraints = false
+        navigationSpacer.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        stack.addArrangedSubview(navigationSpacer)
+
+        let items: [(String, String)] = [
+            (t("Общие", "General"), "hand.raised.fill"),
+            (t("История", "History"), "clock.arrow.circlepath"),
+            (t("Модели", "Models"), "cpu"),
+            (t("Продвинутые", "Advanced"), "gearshape.2.fill"),
+            (t("Постобработка", "Post-processing"), "wand.and.stars"),
+            (t("О программе", "About"), "info.circle"),
+        ]
+        for (index, item) in items.enumerated() {
+            let button = desktopSidebarButton(title: item.0,
+                                              symbol: item.1,
+                                              tag: index,
+                                              selected: desktopNavigationPage == index)
+            button.isEnabled = index == 0
+            if index != 0 {
+                button.toolTip = t("Будет перенесено на следующем этапе.",
+                                   "Will be migrated in the next stage.")
+            }
+            stack.addArrangedSubview(button)
+        }
+        stack.addArrangedSubview(NSView())
+
+        let version = panelLabel("v\(currentBundleVersion())", size: 10.5, color: unifiedMutedTextColor)
+        version.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        stack.addArrangedSubview(version)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: sidebar.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+        ])
+        return sidebar
+    }
+
+    private func desktopSidebarButton(title: String,
+                                      symbol: String,
+                                      tag: Int,
+                                      selected: Bool) -> NSButton {
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        let button = NSButton(title: title, image: image ?? NSImage(), target: self,
+                              action: #selector(selectDesktopNavigationPage(_:)))
+        button.tag = tag
+        button.imagePosition = .imageLeading
+        button.imageScaling = .scaleProportionallyDown
+        button.alignment = .left
+        button.isBordered = false
+        button.font = .systemFont(ofSize: 15, weight: selected ? .semibold : .medium)
+        button.contentTintColor = selected ? .white : unifiedMutedTextColor
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 10
+        button.layer?.backgroundColor = selected
+            ? NSColor(calibratedRed: 0.36, green: 0.24, blue: 0.47, alpha: 0.82).cgColor
+            : NSColor.clear.cgColor
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 204),
+            button.heightAnchor.constraint(equalToConstant: 48),
+        ])
+        return button
+    }
+
+    private func makeDesktopGeneralSettingsPage() -> NSView {
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 30
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 30, bottom: 30, right: 30)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 12
+        header.addArrangedSubview(panelLabel(t("ОБЩИЕ", "GENERAL"),
+                                             size: 13,
+                                             weight: .medium,
+                                             color: unifiedMutedTextColor))
+        header.addArrangedSubview(NSView())
+        let state = AgentRuntimeStateStore.read()
+        let missingPermissions = Permission.allCases.filter { !Permissions.isGranted($0) }
+        let statusColor: NSColor = state?.isReady == true ? .systemGreen : .systemOrange
+        let statusDot = NSView()
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 4
+        statusDot.layer?.backgroundColor = statusColor.cgColor
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+        statusDot.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        statusDot.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        header.addArrangedSubview(statusDot)
+        header.addArrangedSubview(panelLabel(state?.isReady == true
+                                             ? t("ГОТОВ", "READY")
+                                             : t("НУЖЕН ДОСТУП", "ACCESS NEEDED"),
+                                             size: 10.5,
+                                             weight: .medium,
+                                             color: unifiedMutedTextColor))
+        if let permission = missingPermissions.first,
+           let permissionIndex = Permission.allCases.firstIndex(of: permission) {
+            let grant = panelButton(t("Разрешить", "Grant"),
+                                    action: #selector(grantPermissionClicked(_:)),
+                                    enabled: serviceOperation == nil,
+                                    toolTip: t("Запросить доступ: \(permissionTitle(permission))",
+                                               "Request access: \(permissionTitle(permission))"))
+            grant.controlSize = .small
+            grant.tag = permissionIndex
+            header.addArrangedSubview(grant)
+        }
+        stack.addArrangedSubview(header)
+
+        stack.addArrangedSubview(settingsSection(t("ОБЩИЕ", "GENERAL"), rows: [
+            hotkeyRow(title: t("Горячая клавиша транскрипции", "Transcription hotkey"),
+                      shortcut: draft.dictationHotkey,
+                      kind: .dictation,
+                      toolTip: t("Удерживайте эту клавишу, чтобы записывать диктовку.",
+                                 "Hold this key to record dictation.")),
+            holdToTalkRow(),
+        ]))
+        stack.addArrangedSubview(settingsSection(t("НАСТРОЙКИ PARAKEET TDT 0.6B V3", "PARAKEET TDT 0.6B V3"), rows: [
+            languageSettingsRow(),
+        ]))
+        stack.addArrangedSubview(settingsSection(t("ЗВУК", "AUDIO"), rows: [
+            microphoneSettingsRow(draft),
+            muteSystemAudioSettingsRow(),
+        ]))
+        stack.addArrangedSubview(settingsActionsRow(draft: draft))
+        return desktopSettingsScroll(stack)
+    }
+
+    private func desktopSettingsScroll(_ stack: NSStackView) -> NSView {
+        let container = NSView()
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        settingsScrollView = scroll
+
+        let document = SettingsDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        scroll.documentView = document
+        container.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: container.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+        ])
+        let inset = -(stack.edgeInsets.left + stack.edgeInsets.right)
+        for view in stack.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: inset).isActive = true
+        }
+        return container
+    }
+
+    private func makeDesktopPendingPage() -> NSView {
+        let container = NSView()
+        let label = panelLabel(t("Раздел будет перенесён на следующем этапе.",
+                                 "This section will be migrated in the next stage."),
+                               size: 15,
+                               weight: .medium,
+                               color: unifiedMutedTextColor)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+        return container
     }
 
     // This is deliberately the same compact visual language as the menu-bar
@@ -22820,6 +23102,19 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refresh(force: true)
     }
 
+    @objc private func selectDesktopNavigationPage(_ sender: NSButton) {
+        desktopNavigationPage = sender.tag
+        lastRenderFingerprint = ""
+        refresh(force: true)
+    }
+
+    @objc private func toggleMuteFromDesktopSettings(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.muteWhileRecording = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func closeControlPanelClicked(_ sender: NSButton) {
         window?.performClose(nil)
     }
@@ -22973,6 +23268,44 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
         popup.select(popup.itemArray.first { ($0.representedObject as? String) == settings.dictationLanguage.rawValue })
         row.addArrangedSubview(popup)
+        return row
+    }
+
+    private func muteSystemAudioSettingsRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(t("Отключить звук во время записи",
+                                             "Mute audio while recording"),
+                                           size: 13,
+                                           weight: .semibold))
+        let detail = panelLabel(
+            t("Временно отключает весь системный выход, включая Ableton и Spotify, и возвращает прежнее состояние после записи.",
+              "Temporarily mutes all system output, including Ableton and Spotify, and restores the previous state after recording."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        detail.maximumNumberOfLines = 2
+        detail.preferredMaxLayoutWidth = 510
+        text.addArrangedSubview(detail)
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleMuteFromDesktopSettings(_:))
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        toggle.state = draft.muteWhileRecording ? .on : .off
+        toggle.toolTip = t("Системный выход будет заглушён только на время активной записи.",
+                           "System output is muted only while recording is active.")
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
         return row
     }
 
@@ -25143,6 +25476,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.aiCleanupBaseURL = draft.aiCleanupBaseURL
         settings.aiCleanupModel = draft.aiCleanupModel
         settings.inputDevice = draft.inputDevicePreference
+        settings.muteWhileRecording = draft.muteWhileRecording
         settings.removeFinalPeriod = draft.removeFinalPeriod
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
@@ -25178,27 +25512,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func refreshSettingsWindow(captureFields: Bool = true) {
-        if compactPanelTab == 2 {
-            if captureFields {
-                captureAISettingsFields()
-            }
-            lastRenderFingerprint = ""
-            refresh(force: true)
-            return
-        }
-        guard let settingsWindow else { return }
-        let previousOffset = settingsScrollView?.contentView.bounds.origin.y ?? 0
         if captureFields {
             captureAISettingsFields()
         }
-        settingsWindow.contentView = makeSettingsContentView()
-        settingsWindow.contentView?.layoutSubtreeIfNeeded()
-        guard previousOffset > 0,
-              let scroll = settingsScrollView,
-              let document = scroll.documentView else { return }
-        let maximumOffset = max(0, document.bounds.height - scroll.contentView.bounds.height)
-        scroll.contentView.scroll(to: NSPoint(x: 0, y: min(previousOffset, maximumOffset)))
-        scroll.reflectScrolledClipView(scroll.contentView)
+        lastRenderFingerprint = ""
+        refresh(force: true)
     }
 
     @objc private func resetPermissionsClicked(_ sender: NSButton) {
