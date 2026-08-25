@@ -6438,10 +6438,12 @@ private func finalizedDictationText(_ text: String,
 private struct SuccessfulDictationInsertionContext: Equatable {
     let text: String
     let applicationPID: pid_t
-    let insertedAt: TimeInterval
 }
 
-private let DICTATION_PARAGRAPH_CONTINUATION_SECONDS: TimeInterval = 120
+private struct DictationInsertionSurroundings: Equatable {
+    let textBeforeCursor: String
+    let textAfterCursor: String
+}
 
 private func hasTerminalSentencePunctuation(_ text: String) -> Bool {
     var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -6454,21 +6456,62 @@ private func hasTerminalSentencePunctuation(_ text: String) -> Bool {
     return ".!?…".contains(last)
 }
 
+private func replacingFirstLetter(in text: String,
+                                  transform: (Character) -> String) -> String {
+    guard let index = text.firstIndex(where: \.isLetter) else { return text }
+    var result = text
+    result.replaceSubrange(index...index, with: transform(text[index]))
+    return result
+}
+
+private func cursorFollowsPreviousDictation(
+    _ previous: SuccessfulDictationInsertionContext,
+    surroundings: DictationInsertionSurroundings
+) -> Bool {
+    let textBeforeCursor = surroundings.textBeforeCursor
+        .trimmingCharacters(in: .whitespaces)
+    let previousText = previous.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let comparableSuffix = String(previousText.suffix(512))
+    return !comparableSuffix.isEmpty && textBeforeCursor.hasSuffix(comparableSuffix)
+}
+
+private func cursorIsInsideLogicalContinuation(
+    _ surroundings: DictationInsertionSurroundings
+) -> Bool {
+    guard !surroundings.textAfterCursor
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .isEmpty else {
+        return false
+    }
+    let currentLine = surroundings.textBeforeCursor
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .last
+        .map(String.init) ?? ""
+    let trimmedLine = currentLine.trimmingCharacters(in: .whitespaces)
+    guard !trimmedLine.isEmpty else { return false }
+    return !hasTerminalSentencePunctuation(trimmedLine)
+}
+
 private func dictationTextForInsertion(_ text: String,
                                        previous: SuccessfulDictationInsertionContext?,
                                        applicationPID: pid_t?,
-                                       now: TimeInterval) -> String {
-    guard !text.isEmpty,
-          !text.hasPrefix("\n"),
-          let previous,
-          let applicationPID,
-          previous.applicationPID == applicationPID,
-          now >= previous.insertedAt,
-          now - previous.insertedAt <= DICTATION_PARAGRAPH_CONTINUATION_SECONDS,
-          !hasTerminalSentencePunctuation(previous.text) else {
-        return text
+                                       surroundings: DictationInsertionSurroundings?) -> String {
+    guard !text.isEmpty, !text.hasPrefix("\n") else { return text }
+
+    if let previous,
+       let applicationPID,
+       previous.applicationPID == applicationPID,
+       !hasTerminalSentencePunctuation(previous.text),
+       let surroundings,
+       cursorFollowsPreviousDictation(previous, surroundings: surroundings) {
+        return "\n" + replacingFirstLetter(in: text) { $0.uppercased() }
     }
-    return "\n\n" + text
+
+    if let surroundings,
+       cursorIsInsideLogicalContinuation(surroundings) {
+        return replacingFirstLetter(in: text) { $0.lowercased() }
+    }
+    return text
 }
 
 private let LONG_DICTATION_PAUSE_SECONDS = 1.4
@@ -7400,6 +7443,129 @@ private enum FocusedInsertionTargetLocator {
                y: context.coordinateReferenceMaxY - rect.origin.y - rect.height,
                width: rect.width,
                height: rect.height)
+    }
+}
+
+@MainActor
+private enum FocusedTextInsertionContextReader {
+    private static let maximumContextLength = 512
+
+    static func read(applicationPID: pid_t) -> DictationInsertionSurroundings? {
+        guard AXIsProcessTrusted() else { return nil }
+        let application = AXUIElementCreateApplication(applicationPID)
+        AXUIElementSetMessagingTimeout(application, 0.12)
+        guard var element = elementAttribute(application,
+                                             kAXFocusedUIElementAttribute as CFString) else {
+            return nil
+        }
+        for _ in 0..<4 {
+            guard let nested = elementAttribute(element,
+                                                kAXFocusedUIElementAttribute as CFString),
+                  !CFEqual(nested, element) else {
+                break
+            }
+            element = nested
+        }
+        AXUIElementSetMessagingTimeout(element, 0.12)
+
+        guard let selectedRange = selectedTextRange(in: element),
+              selectedRange.location >= 0,
+              selectedRange.length >= 0 else {
+            return nil
+        }
+        let beforeLength = min(maximumContextLength, selectedRange.location)
+        let afterLocation = selectedRange.location + selectedRange.length
+        let afterLength = characterCount(in: element).map {
+            min(maximumContextLength, max(0, $0 - afterLocation))
+        } ?? maximumContextLength
+        let beforeRange = CFRange(location: selectedRange.location - beforeLength,
+                                  length: beforeLength)
+        let afterRange = CFRange(location: afterLocation,
+                                 length: afterLength)
+
+        if let before = string(in: beforeRange, from: element),
+           let after = string(in: afterRange, from: element) {
+            return DictationInsertionSurroundings(textBeforeCursor: before,
+                                                  textAfterCursor: after)
+        }
+        return surroundingsFromValue(element: element,
+                                     selectedRange: selectedRange)
+    }
+
+    private static func selectedTextRange(in element: AXUIElement) -> CFRange? {
+        guard let raw = attribute(element, kAXSelectedTextRangeAttribute as CFString),
+              CFGetTypeID(raw) == AXValueGetTypeID() else {
+            return nil
+        }
+        let value = unsafeDowncast(raw, to: AXValue.self)
+        guard AXValueGetType(value) == .cfRange else { return nil }
+        var range = CFRange()
+        return AXValueGetValue(value, .cfRange, &range) ? range : nil
+    }
+
+    private static func characterCount(in element: AXUIElement) -> Int? {
+        (attribute(element, kAXNumberOfCharactersAttribute as CFString) as? NSNumber)?
+            .intValue
+    }
+
+    private static func string(in range: CFRange,
+                               from element: AXUIElement) -> String? {
+        guard range.length > 0 else { return "" }
+        var mutableRange = range
+        guard let rangeValue = AXValueCreate(.cfRange, &mutableRange) else { return nil }
+        var raw: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXStringForRangeParameterizedAttribute as CFString,
+            rangeValue,
+            &raw
+        ) == .success else {
+            return nil
+        }
+        return raw as? String
+    }
+
+    private static func surroundingsFromValue(
+        element: AXUIElement,
+        selectedRange: CFRange
+    ) -> DictationInsertionSurroundings? {
+        guard let text = attribute(element, kAXValueAttribute as CFString) as? String else {
+            return nil
+        }
+        let value = text as NSString
+        let selectionEnd = selectedRange.location + selectedRange.length
+        guard selectedRange.location <= value.length,
+              selectionEnd <= value.length else {
+            return nil
+        }
+        let beforeStart = max(0, selectedRange.location - maximumContextLength)
+        let afterLength = min(maximumContextLength, value.length - selectionEnd)
+        return DictationInsertionSurroundings(
+            textBeforeCursor: value.substring(
+                with: NSRange(location: beforeStart,
+                              length: selectedRange.location - beforeStart)
+            ),
+            textAfterCursor: value.substring(
+                with: NSRange(location: selectionEnd, length: afterLength)
+            )
+        )
+    }
+
+    private static func elementAttribute(_ element: AXUIElement,
+                                         _ name: CFString) -> AXUIElement? {
+        guard let raw = attribute(element, name),
+              CFGetTypeID(raw) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeDowncast(raw, to: AXUIElement.self)
+    }
+
+    private static func attribute(_ element: AXUIElement,
+                                  _ name: CFString) -> CFTypeRef? {
+        var raw: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, name, &raw) == .success
+            ? raw
+            : nil
     }
 }
 
@@ -12676,12 +12842,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
                     if !cleaned.isEmpty {
                         let insertionApplicationPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-                        let insertionPreparedAt = Date().timeIntervalSince1970
+                        let insertionSurroundings = insertionApplicationPID.flatMap {
+                            FocusedTextInsertionContextReader.read(applicationPID: $0)
+                        }
                         let textToInsert = dictationTextForInsertion(
                             finalText,
                             previous: lastSuccessfulDictationInsertion,
                             applicationPID: insertionApplicationPID,
-                            now: insertionPreparedAt
+                            surroundings: insertionSurroundings
                         )
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
                         addToHistory(
@@ -12719,8 +12887,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             if let insertionApplicationPID {
                                 lastSuccessfulDictationInsertion = SuccessfulDictationInsertionContext(
                                     text: finalText,
-                                    applicationPID: insertionApplicationPID,
-                                    insertedAt: Date().timeIntervalSince1970
+                                    applicationPID: insertionApplicationPID
                                 )
                             }
                             if shouldPressEnterAfterInsertion {
@@ -18365,26 +18532,30 @@ private enum ParakeySelfTest {
         )
         let previousInsertion = SuccessfulDictationInsertionContext(
             text: "Первая мысль",
-            applicationPID: 42,
-            insertedAt: 100
+            applicationPID: 42
         )
         try expect(
             dictationTextForInsertion("Продолжение",
                                       previous: previousInsertion,
                                       applicationPID: 42,
-                                      now: 110),
-            equals: "\n\nПродолжение",
-            "a quick continuation after text without terminal punctuation should start a paragraph"
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Первая мысль",
+                                        textAfterCursor: ""
+                                      )),
+            equals: "\nПродолжение",
+            "continuation after a previous dictation without terminal punctuation should add one newline"
         )
         try expect(
             dictationTextForInsertion("Продолжение",
                                       previous: SuccessfulDictationInsertionContext(
                                         text: "Первая мысль.",
-                                        applicationPID: 42,
-                                        insertedAt: 100
+                                        applicationPID: 42
                                       ),
                                       applicationPID: 42,
-                                      now: 110),
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Первая мысль.",
+                                        textAfterCursor: ""
+                                      )),
             equals: "Продолжение",
             "terminal punctuation should keep the next dictation inline"
         )
@@ -18392,17 +18563,56 @@ private enum ParakeySelfTest {
             dictationTextForInsertion("Другое поле",
                                       previous: previousInsertion,
                                       applicationPID: 77,
-                                      now: 110),
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Первая мысль",
+                                        textAfterCursor: ""
+                                      )),
             equals: "Другое поле",
             "switching applications should not insert an unwanted paragraph"
         )
         try expect(
-            dictationTextForInsertion("Позднее продолжение",
+            dictationTextForInsertion("Новая позиция",
                                       previous: previousInsertion,
                                       applicationPID: 42,
-                                      now: 221),
-            equals: "Позднее продолжение",
-            "old dictations should not force paragraph breaks indefinitely"
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Несвязанный текст",
+                                        textAfterCursor: ""
+                                      )),
+            equals: "Новая позиция",
+            "moving the cursor should not reuse a previous dictation paragraph rule"
+        )
+        try expect(
+            dictationTextForInsertion("Продолжение",
+                                      previous: nil,
+                                      applicationPID: 42,
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Начало фразы ",
+                                        textAfterCursor: "уже написано"
+                                      )),
+            equals: "продолжение",
+            "dictation inserted inside an unfinished sentence should begin with a lowercase letter"
+        )
+        try expect(
+            dictationTextForInsertion("Продолжение",
+                                      previous: nil,
+                                      applicationPID: 42,
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Готово. ",
+                                        textAfterCursor: "Следующий текст"
+                                      )),
+            equals: "Продолжение",
+            "dictation after a sentence terminator should preserve uppercase"
+        )
+        try expect(
+            dictationTextForInsertion("продолжение",
+                                      previous: previousInsertion,
+                                      applicationPID: 42,
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Первая мысль ",
+                                        textAfterCursor: ""
+                                      )),
+            equals: "\nПродолжение",
+            "a new paragraph should capitalize its first word"
         )
 
         let speech = [Float](repeating: 0.08, count: Int(SAMPLE_RATE))
