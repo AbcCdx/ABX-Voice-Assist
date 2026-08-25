@@ -10541,6 +10541,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private var statusItem: NSStatusItem!
+    private var statusPopover: NSPopover?
+    private var statusPopoverTab = 0
     private var templateImage: NSImage?
     private var recordingImage: NSImage?
     private var errorImage: NSImage?
@@ -11698,6 +11700,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("statusItem: microphone symbol unavailable — text fallback")
         }
         button.toolTip = "ABX Voice Assist"
+        button.target = self
+        button.action = #selector(statusItemClicked(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
 
     private func tintedCopy(of source: NSImage, with color: NSColor) -> NSImage {
@@ -13887,7 +13892,242 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func rebuildMenu() {
         publishAgentState()
-        statusItem.menu = buildMenu()
+        statusItem.menu = nil
+        if statusPopover?.isShown == true {
+            statusPopover?.contentViewController?.view = makeStatusPopoverContent()
+        }
+    }
+
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            statusItem.popUpMenu(buildMenu())
+            return
+        }
+        if statusPopover?.isShown == true {
+            statusPopover?.performClose(nil)
+            return
+        }
+        let popover = statusPopover ?? NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.appearance = NSAppearance(named: .darkAqua)
+        popover.contentSize = NSSize(width: 360, height: 420)
+        let controller = NSViewController()
+        controller.view = makeStatusPopoverContent()
+        popover.contentViewController = controller
+        popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+        statusPopover = popover
+    }
+
+    private func makeStatusPopoverContent() -> NSView {
+        let root = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 360, height: 420))
+        root.material = .hudWindow
+        root.blendingMode = .withinWindow
+        root.state = .active
+        root.wantsLayer = true
+        root.layer?.backgroundColor = popoverBackgroundColor.cgColor
+        root.layer?.cornerRadius = 14
+        root.layer?.masksToBounds = true
+
+        let brand = popoverLabel("ABX  Voice Assist", size: 16, weight: .semibold, color: .white)
+        brand.frame = NSRect(x: 17, y: 382, width: 190, height: 20)
+        root.addSubview(brand)
+
+        let status = NSStackView(frame: NSRect(x: 244, y: 384, width: 99, height: 16))
+        status.orientation = .horizontal
+        status.alignment = .centerY
+        status.spacing = 6
+        let dot = NSView(frame: NSRect(x: 0, y: 0, width: 6, height: 6))
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3
+        dot.layer?.backgroundColor = popoverStatusColor.cgColor
+        status.addArrangedSubview(dot)
+        let statusText = popoverLabel(popoverStatusText, size: 10, color: popoverMutedTextColor)
+        statusText.maximumNumberOfLines = 1
+        statusText.lineBreakMode = .byTruncatingTail
+        status.addArrangedSubview(statusText)
+        root.addSubview(status)
+
+        let separator = popoverSeparator(frame: NSRect(x: 17, y: 365, width: 326, height: 1))
+        root.addSubview(separator)
+
+        let general = popoverTabButton("ОБЩИЕ", tag: 0, x: 17)
+        let history = popoverTabButton("ИСТОРИЯ", tag: 1, x: 90)
+        root.addSubview(general)
+        root.addSubview(history)
+        let activeX: CGFloat = statusPopoverTab == 0 ? 17 : 90
+        let activeWidth: CGFloat = statusPopoverTab == 0 ? 48 : 58
+        let underline = NSView(frame: NSRect(x: activeX, y: 321, width: activeWidth, height: 2))
+        underline.wantsLayer = true
+        underline.layer?.backgroundColor = NSColor.white.cgColor
+        root.addSubview(underline)
+        root.addSubview(popoverSeparator(frame: NSRect(x: 17, y: 320, width: 326, height: 1)))
+
+        if statusPopoverTab == 0 {
+            addGeneralPopoverContent(to: root)
+        } else {
+            addHistoryPopoverContent(to: root)
+        }
+
+        root.addSubview(popoverSeparator(frame: NSRect(x: 17, y: 48, width: 326, height: 1)))
+        let model = popoverLabel("•  PAR AKEET TDT 0.6  ·  ЛОКАЛЬНО", size: 9.5, color: popoverMutedTextColor)
+        model.font = .monospacedSystemFont(ofSize: 9.5, weight: .regular)
+        model.frame = NSRect(x: 17, y: 18, width: 188, height: 18)
+        root.addSubview(model)
+        let settingsButton = popoverFooterButton("Настройки", action: #selector(openPopoverControlPanel(_:)), x: 213)
+        let quitButton = popoverFooterButton("Выйти", action: #selector(quitFromPopover(_:)), x: 290)
+        root.addSubview(settingsButton)
+        root.addSubview(quitButton)
+        return root
+    }
+
+    private func addGeneralPopoverContent(to root: NSView) {
+        let dictation = popoverLabel("ДИКТОВКА", size: 9.5, weight: .medium, color: popoverMutedTextColor)
+        dictation.font = .monospacedSystemFont(ofSize: 9.5, weight: .medium)
+        dictation.frame = NSRect(x: 19, y: 294, width: 120, height: 14)
+        root.addSubview(dictation)
+        addPopoverRow(to: root, title: "Горячая клавиша", value: localizedHotkeyName(settings.configuredHotkey, language: settings.interfaceLanguage), y: 251)
+        addPopoverRow(to: root, title: "Нажми и говори", value: settings.triggerMode == .hold ? "ВКЛ" : "ВЫКЛ", y: 211)
+        addPopoverRow(to: root, title: "Язык", value: popoverLanguageText(settings.dictationLanguage), y: 171)
+        let audio = popoverLabel("ЗВУК", size: 9.5, weight: .medium, color: popoverMutedTextColor)
+        audio.font = .monospacedSystemFont(ofSize: 9.5, weight: .medium)
+        audio.frame = NSRect(x: 19, y: 143, width: 120, height: 14)
+        root.addSubview(audio)
+        addPopoverRow(to: root, title: "Микрофон", value: settings.inputDevice.isEmpty ? "ПО УМОЛЧАНИЮ" : "ВЫБРАН", y: 100)
+        addPopoverRow(to: root, title: "Финальная точка", value: settings.removeFinalPeriod ? "УБИРАТЬ" : "СОХРАНЯТЬ", y: 60)
+    }
+
+    private func addHistoryPopoverContent(to root: NSView) {
+        let title = popoverLabel("ПОСЛЕДНИЕ ДИКТОВКИ", size: 9.5, weight: .medium, color: popoverMutedTextColor)
+        title.font = .monospacedSystemFont(ofSize: 9.5, weight: .medium)
+        title.frame = NSRect(x: 19, y: 294, width: 180, height: 14)
+        root.addSubview(title)
+        let entries = Array(visibleHistory.prefix(3))
+        if entries.isEmpty {
+            let empty = popoverLabel("История появится после первой диктовки.", size: 12, color: popoverMutedTextColor)
+            empty.frame = NSRect(x: 19, y: 236, width: 320, height: 18)
+            root.addSubview(empty)
+            return
+        }
+        for (index, entry) in entries.enumerated() {
+            let y = 250 - CGFloat(index) * 64
+            let card = NSView(frame: NSRect(x: 17, y: y, width: 326, height: 56))
+            card.wantsLayer = true
+            card.layer?.cornerRadius = 10
+            card.layer?.backgroundColor = popoverSurfaceColor.cgColor
+            card.layer?.borderColor = popoverBorderColor.cgColor
+            card.layer?.borderWidth = 1
+            let text = popoverLabel(previewLine(for: entry.text), size: 12, weight: .medium, color: .white)
+            text.frame = NSRect(x: 12, y: 27, width: 300, height: 17)
+            let meta = popoverLabel("ЛОКАЛЬНАЯ ДИКТОВКА", size: 9.5, color: popoverMutedTextColor)
+            meta.font = .monospacedSystemFont(ofSize: 9.5, weight: .regular)
+            meta.frame = NSRect(x: 12, y: 10, width: 240, height: 14)
+            card.addSubview(text)
+            card.addSubview(meta)
+            root.addSubview(card)
+        }
+    }
+
+    private func addPopoverRow(to root: NSView, title: String, value: String, y: CGFloat) {
+        let card = NSButton(frame: NSRect(x: 17, y: y, width: 326, height: 40))
+        card.title = ""
+        card.target = self
+        card.action = #selector(openPopoverControlPanel(_:))
+        card.bezelStyle = .regularSquare
+        card.isBordered = false
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 10
+        card.layer?.backgroundColor = popoverSurfaceColor.cgColor
+        card.layer?.borderColor = popoverBorderColor.cgColor
+        card.layer?.borderWidth = 1
+        let titleLabel = popoverLabel(title, size: 13, weight: .medium, color: .white)
+        titleLabel.frame = NSRect(x: 13, y: 11, width: 176, height: 18)
+        let valueLabel = popoverLabel(value, size: 9.5, weight: .medium, color: popoverMutedTextColor)
+        valueLabel.font = .monospacedSystemFont(ofSize: 9.5, weight: .medium)
+        valueLabel.alignment = .right
+        valueLabel.lineBreakMode = .byTruncatingHead
+        valueLabel.frame = NSRect(x: 190, y: 12, width: 122, height: 16)
+        card.addSubview(titleLabel)
+        card.addSubview(valueLabel)
+        root.addSubview(card)
+    }
+
+    private func popoverTabButton(_ title: String, tag: Int, x: CGFloat) -> NSButton {
+        let button = NSButton(frame: NSRect(x: x, y: 329, width: 64, height: 28))
+        button.title = title
+        button.tag = tag
+        button.target = self
+        button.action = #selector(selectPopoverTab(_:))
+        button.isBordered = false
+        button.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium)
+        button.contentTintColor = tag == statusPopoverTab ? .white : popoverMutedTextColor
+        return button
+    }
+
+    private func popoverFooterButton(_ title: String, action: Selector, x: CGFloat) -> NSButton {
+        let button = NSButton(frame: NSRect(x: x, y: 13, width: title == "Настройки" ? 76 : 53, height: 24))
+        button.title = title
+        button.target = self
+        button.action = action
+        button.bezelStyle = .regularSquare
+        button.isBordered = false
+        button.font = .systemFont(ofSize: 11, weight: .medium)
+        button.contentTintColor = popoverMutedTextColor
+        return button
+    }
+
+    private func popoverLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: size, weight: weight)
+        label.textColor = color
+        label.maximumNumberOfLines = 1
+        label.lineBreakMode = .byTruncatingTail
+        return label
+    }
+
+    private func popoverSeparator(frame: NSRect) -> NSView {
+        let separator = NSView(frame: frame)
+        separator.wantsLayer = true
+        separator.layer?.backgroundColor = popoverBorderColor.cgColor
+        return separator
+    }
+
+    private var popoverBackgroundColor: NSColor { NSColor(calibratedRed: 0.055, green: 0.050, blue: 0.065, alpha: 1) }
+    private var popoverSurfaceColor: NSColor { NSColor(calibratedRed: 0.115, green: 0.105, blue: 0.130, alpha: 0.92) }
+    private var popoverBorderColor: NSColor { NSColor(calibratedRed: 0.30, green: 0.27, blue: 0.34, alpha: 0.82) }
+    private var popoverMutedTextColor: NSColor { NSColor(calibratedWhite: 0.60, alpha: 1) }
+    private var popoverStatusColor: NSColor { missingPermissions().isEmpty ? .white : .systemOrange }
+    private var popoverStatusText: String {
+        if !missingPermissions().isEmpty { return t("нет доступа", "access needed") }
+        if isRecording { return t("запись", "recording") }
+        if isBusy { return t("обработка", "processing") }
+        return isReady ? t("готов", "ready") : t("запуск", "starting")
+    }
+
+    private func popoverLanguageText(_ language: DictationLanguage) -> String {
+        switch language {
+        case .auto: return t("АВТО", "AUTO")
+        case .russian: return t("РУССКИЙ", "RUSSIAN")
+        case .ukrainian: return t("УКРАИНСКИЙ", "UKRAINIAN")
+        case .english: return t("АНГЛИЙСКИЙ", "ENGLISH")
+        default: return DICTATION_LANGUAGE_DISPLAY[language, default: language.rawValue].uppercased()
+        }
+    }
+
+    @objc private func selectPopoverTab(_ sender: NSButton) {
+        statusPopoverTab = sender.tag
+        statusPopover?.contentViewController?.view = makeStatusPopoverContent()
+    }
+
+    @objc private func openPopoverControlPanel(_ sender: Any) {
+        statusPopover?.performClose(nil)
+        openControlPanelFromAgent()
+    }
+
+    @objc private func quitFromPopover(_ sender: Any) {
+        statusPopover?.performClose(nil)
+        guard confirmStopDictation() else { return }
+        NSApp.terminate(self)
     }
 
     private func publishAgentState(status explicitStatus: String? = nil,
@@ -23397,8 +23637,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                            size: 13,
                                            weight: .semibold))
         let detail = panelLabel(
-            t("Убирает только последнюю точку. !, ?, многоточия и точки внутри текста сохраняются.",
-              "Removes only the final period. !, ?, ellipses, and periods inside the text remain."),
+            t("Применяется сразу. Убирает только последнюю точку; !, ?, многоточия и точки внутри текста сохраняются.",
+              "Applies immediately. Removes only the final period; !, ?, ellipses, and periods inside the text remain."),
             size: 12,
             color: .secondaryLabelColor
         )
@@ -24236,6 +24476,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.removeFinalPeriod = sender.state == .on
         settingsDraft = draft
+        settings.removeFinalPeriod = draft.removeFinalPeriod
+        _ = settings.refreshFromDisk()
+        DistributedNotificationCenter.default().postNotificationName(
+            SETTINGS_CHANGED_NOTIFICATION,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
         refreshSettingsWindow()
     }
 
