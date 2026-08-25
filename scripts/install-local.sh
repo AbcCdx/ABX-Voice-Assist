@@ -44,10 +44,13 @@ identifier="$(codesign -d --verbose=4 "$STAGED_APP" 2>&1 \
 if [[ -d "$APP_PATH" ]]; then
     installed_requirement="$(codesign -d -r- "$APP_PATH" 2>&1 | tail -n 1)"
     staged_requirement="$(codesign -d -r- "$STAGED_APP" 2>&1 | tail -n 1)"
-    [[ "$installed_requirement" == "$staged_requirement" ]] || {
+    [[ "$installed_requirement" == "$staged_requirement" || "$identity" == "-" ]] || {
         printf 'ABX Voice Assist: refusing to change the installed signing identity because that would reset macOS permissions.\n' >&2
         exit 1
     }
+    if [[ "$identity" == "-" && "$installed_requirement" != "$staged_requirement" ]]; then
+        printf 'ABX Voice Assist: replacing the installed app with the explicitly requested ad-hoc signature.\n'
+    fi
 fi
 
 uid="$(id -u)"
