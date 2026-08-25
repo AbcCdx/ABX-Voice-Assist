@@ -2709,6 +2709,7 @@ final class Settings: @unchecked Sendable {
     private static let keyAICleanupModel = "ai_cleanup_model"
     private static let keyRemoveFinalPeriod = "remove_final_period_v1"
     private static let keyTranslationHotkeyEnabled = "translation_hotkey_enabled_v1"
+    private static let keyExperimentalLayoutCorrectionEnabled = "experimental_layout_correction_enabled_v1"
     private static let keyEnterDelayMilliseconds = "enter_delay_milliseconds_v1"
     private static let keyActiveRunMarker = "active_run_marker"
     private static let keyAgentEnabled = "agent_enabled"
@@ -3355,6 +3356,11 @@ final class Settings: @unchecked Sendable {
     var translationHotkeyEnabled: Bool {
         get { defaults.bool(forKey: Self.keyTranslationHotkeyEnabled) }
         set { defaults.set(newValue, forKey: Self.keyTranslationHotkeyEnabled) }
+    }
+
+    var experimentalLayoutCorrectionEnabled: Bool {
+        get { defaults.bool(forKey: Self.keyExperimentalLayoutCorrectionEnabled) }
+        set { defaults.set(newValue, forKey: Self.keyExperimentalLayoutCorrectionEnabled) }
     }
 
     var aiCleanupEnabled: Bool {
@@ -4635,6 +4641,7 @@ final class HotkeyListener {
     var historyHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                    modifiers: .maskShift)
     var translationEnabled = false
+    var experimentalLayoutCorrectionEnabled = false
     var triggerMode: TriggerMode = .hold
 
     /// onPress fires when a recording should start (press in hold mode,
@@ -4647,6 +4654,7 @@ final class HotkeyListener {
     var onCancel: (() -> Void)?
     var onShowHistory: (() -> Void)?
     var onTranslateFocusedText: (() -> Void)?
+    var onTextBoundaryTyped: (() -> Void)?
     /// Toggle mode: a press arrived while the app is busy (transcription
     /// in flight). The toggle did NOT flip. Play feedback so the user
     /// knows the press was received but rejected.
@@ -4755,6 +4763,12 @@ final class HotkeyListener {
         log("HotkeyListener: field translation → \(enabled ? "enabled" : "disabled")")
     }
 
+    func setExperimentalLayoutCorrectionEnabled(_ enabled: Bool) {
+        guard enabled != experimentalLayoutCorrectionEnabled else { return }
+        experimentalLayoutCorrectionEnabled = enabled
+        log("HotkeyListener: experimental layout correction → \(enabled ? "enabled" : "disabled")")
+    }
+
     func setTriggerMode(_ mode: TriggerMode) {
         guard mode != triggerMode else { return }
         // Reset toggle state when switching modes so we don't get
@@ -4784,7 +4798,21 @@ final class HotkeyListener {
                                                 isRecording: isRecordingActive?() ?? false,
                                                 canStartRecording: canStartRecording?() ?? true)
         dispatchHotkeyActions(result.actions)
+        observeTextBoundaryIfNeeded(event)
         return result.suppress
+    }
+
+    private func observeTextBoundaryIfNeeded(_ event: HotkeyEventSnapshot) {
+        guard experimentalLayoutCorrectionEnabled,
+              event.typeRawValue == CGEventType.keyDown.rawValue,
+              !event.isAutoRepeat,
+              [CGKeyCode(36), 48, 49].contains(event.keycode),
+              event.flags.intersection([.maskControl, .maskAlternate, .maskCommand]).isEmpty else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            self?.onTextBoundaryTyped?()
+        }
     }
 
     private func dispatchHotkeyActions(_ actions: [HotkeyTransitionAction]) {
@@ -7894,10 +7922,181 @@ enum TextInserter {
     }
 }
 
+private enum KeyboardLayoutCorrectionDirection: String, Equatable {
+    case englishKeysToRussian
+    case russianKeysToEnglish
+}
+
+private struct KeyboardLayoutCorrection: Equatable {
+    let range: NSRange
+    let replacement: String
+    let direction: KeyboardLayoutCorrectionDirection
+}
+
+private enum KeyboardLayoutMistypeDetector {
+    private static let englishKeys = Array("`qwertyuiop[]asdfghjkl;'zxcvbnm,.")
+    private static let russianKeys = Array("ёйцукенгшщзхъфывапролджэячсмитьбю")
+    private static let englishSignals = [
+        "the", "and", "ing", "ion", "you", "this", "that", "with", "for", "not",
+        "hello", "world", "have", "from", "your", "what", "when", "where", "how",
+    ]
+    private static let russianSignals = [
+        "что", "это", "как", "при", "про", "ого", "ени", "ова", "ать", "ить",
+        "привет", "дела", "для", "меня", "тебя", "когда", "где", "почему", "можно",
+    ]
+    private static let unsafeMarkers = ["://", "@", "\\", "/", "{", "}", "=", "<", ">"]
+
+    static func correction(in text: String, cursorUTF16Location: Int) -> KeyboardLayoutCorrection? {
+        let value = text as NSString
+        guard cursorUTF16Location >= 0, cursorUTF16Location <= value.length else { return nil }
+        var end = cursorUTF16Location
+        let whitespace = CharacterSet.whitespacesAndNewlines
+        while end > 0 {
+            let scalar = value.character(at: end - 1)
+            guard let unicode = UnicodeScalar(scalar), whitespace.contains(unicode) else { break }
+            end -= 1
+        }
+        guard end > 0 else { return nil }
+
+        let boundaries = CharacterSet(charactersIn: "\n\r.!?;:")
+        var start = end
+        while start > 0 {
+            let scalar = value.character(at: start - 1)
+            if let unicode = UnicodeScalar(scalar), boundaries.contains(unicode) { break }
+            start -= 1
+        }
+        while start < end {
+            let scalar = value.character(at: start)
+            guard let unicode = UnicodeScalar(scalar), whitespace.contains(unicode) else { break }
+            start += 1
+        }
+        guard end > start else { return nil }
+
+        var trailingScriptIsLatin: Bool?
+        var index = end
+        while index > start, trailingScriptIsLatin == nil {
+            index -= 1
+            guard let scalar = UnicodeScalar(value.character(at: index)) else { continue }
+            if isLatinLetter(scalar) { trailingScriptIsLatin = true }
+            if isCyrillicLetter(scalar) { trailingScriptIsLatin = false }
+        }
+        guard let trailingScriptIsLatin else { return nil }
+        index = end
+        while index > start {
+            index -= 1
+            guard let scalar = UnicodeScalar(value.character(at: index)) else { continue }
+            let isOppositeScript = trailingScriptIsLatin
+                ? isCyrillicLetter(scalar)
+                : isLatinLetter(scalar)
+            if isOppositeScript {
+                start = index + 1
+                break
+            }
+        }
+        while start < end {
+            let scalar = value.character(at: start)
+            guard let unicode = UnicodeScalar(scalar), whitespace.contains(unicode) else { break }
+            start += 1
+        }
+        guard end > start else { return nil }
+
+        let range = NSRange(location: start, length: end - start)
+        let source = value.substring(with: range)
+        guard !unsafeMarkers.contains(where: source.contains) else { return nil }
+        let latinCount = source.unicodeScalars.filter { isLatinLetter($0) }.count
+        let cyrillicCount = source.unicodeScalars.filter { isCyrillicLetter($0) }.count
+        let letterCount = latinCount + cyrillicCount
+        guard letterCount >= 4,
+              latinCount == 0 || cyrillicCount == 0 else { return nil }
+
+        if latinCount > 0,
+           let candidate = mapped(source, from: englishKeys, to: russianKeys),
+           shouldCorrect(source: source,
+                         candidate: candidate,
+                         sourceSignals: englishSignals,
+                         candidateSignals: russianSignals,
+                         letterCount: letterCount) {
+            return KeyboardLayoutCorrection(range: range,
+                                            replacement: candidate,
+                                            direction: .englishKeysToRussian)
+        }
+        if cyrillicCount > 0,
+           let candidate = mapped(source, from: russianKeys, to: englishKeys),
+           shouldCorrect(source: source,
+                         candidate: candidate,
+                         sourceSignals: russianSignals,
+                         candidateSignals: englishSignals,
+                         letterCount: letterCount) {
+            return KeyboardLayoutCorrection(range: range,
+                                            replacement: candidate,
+                                            direction: .russianKeysToEnglish)
+        }
+        return nil
+    }
+
+    private static func shouldCorrect(source: String,
+                                      candidate: String,
+                                      sourceSignals: [String],
+                                      candidateSignals: [String],
+                                      letterCount: Int) -> Bool {
+        let sourceScore = languageScore(source, signals: sourceSignals)
+        let candidateScore = languageScore(candidate, signals: candidateSignals)
+        let candidateWords = candidate.lowercased().split { !$0.isLetter }
+        let exactSignalWord = candidateWords.contains { candidateSignals.contains(String($0)) }
+        if letterCount < 8 { return exactSignalWord && candidateScore >= sourceScore + 2 }
+        return candidateScore >= max(3, sourceScore + 3)
+    }
+
+    private static func languageScore(_ text: String, signals: [String]) -> Int {
+        let lowered = text.lowercased()
+        let words = lowered.split { !$0.isLetter }.map(String.init)
+        var score = 0
+        for signal in signals {
+            if signal.count <= 3 {
+                score += lowered.components(separatedBy: signal).count - 1
+            } else if words.contains(signal) {
+                score += 3
+            }
+        }
+        return score
+    }
+
+    private static func mapped(_ text: String,
+                               from source: [Character],
+                               to destination: [Character]) -> String? {
+        let pairs = Dictionary(uniqueKeysWithValues: zip(source, destination))
+        var output = ""
+        for character in text {
+            let lowered = Character(String(character).lowercased())
+            if let replacement = pairs[lowered] {
+                let mapped = String(replacement)
+                output += String(character).uppercased() == String(character)
+                    && String(character).lowercased() != String(character)
+                    ? mapped.uppercased()
+                    : mapped
+            } else if character.isLetter {
+                return nil
+            } else {
+                output.append(character)
+            }
+        }
+        return output
+    }
+
+    private static func isLatinLetter(_ scalar: UnicodeScalar) -> Bool {
+        (0x41...0x5A).contains(scalar.value) || (0x61...0x7A).contains(scalar.value)
+    }
+
+    private static func isCyrillicLetter(_ scalar: UnicodeScalar) -> Bool {
+        (0x0400...0x04FF).contains(scalar.value)
+    }
+}
+
 private struct FocusedTextFieldSnapshot {
     let applicationPID: pid_t
     let element: AXUIElement
     let text: String
+    let selectedRange: CFRange?
 }
 
 @MainActor
@@ -7928,9 +8127,26 @@ private enum FocusedTextFieldEditor {
               let text = rawValue as? String else {
             return nil
         }
+        var rawRange: CFTypeRef?
+        var selectedRange: CFRange?
+        if AXUIElementCopyAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            &rawRange
+        ) == .success,
+           let rawRange,
+           CFGetTypeID(rawRange) == AXValueGetTypeID(),
+           AXValueGetType(unsafeDowncast(rawRange, to: AXValue.self)) == .cfRange {
+            let rangeValue = unsafeDowncast(rawRange, to: AXValue.self)
+            var range = CFRange()
+            if AXValueGetValue(rangeValue, .cfRange, &range) {
+                selectedRange = range
+            }
+        }
         return FocusedTextFieldSnapshot(applicationPID: applicationPID,
                                         element: element,
-                                        text: text)
+                                        text: text,
+                                        selectedRange: selectedRange)
     }
 
     static func replace(_ snapshot: FocusedTextFieldSnapshot, with text: String) -> Bool {
@@ -7963,6 +8179,56 @@ private enum FocusedTextFieldEditor {
             kAXValueAttribute as CFString,
             text as CFTypeRef
         ) == .success
+    }
+
+    static func apply(_ correction: KeyboardLayoutCorrection,
+                      to snapshot: FocusedTextFieldSnapshot) -> Bool {
+        guard focusedElementStillMatches(snapshot) else { return false }
+        var rawValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            snapshot.element,
+            kAXValueAttribute as CFString,
+            &rawValue
+        ) == .success,
+              let currentText = rawValue as? String,
+              currentText == snapshot.text else { return false }
+        let value = snapshot.text as NSString
+        guard NSMaxRange(correction.range) <= value.length else { return false }
+        let replaced = value.replacingCharacters(in: correction.range,
+                                                 with: correction.replacement)
+        guard AXUIElementSetAttributeValue(
+            snapshot.element,
+            kAXValueAttribute as CFString,
+            replaced as CFTypeRef
+        ) == .success else { return false }
+
+        if let selectedRange = snapshot.selectedRange {
+            let delta = (correction.replacement as NSString).length - correction.range.length
+            var restoredRange = CFRange(location: selectedRange.location + delta,
+                                        length: selectedRange.length)
+            if let rangeValue = AXValueCreate(.cfRange, &restoredRange) {
+                _ = AXUIElementSetAttributeValue(
+                    snapshot.element,
+                    kAXSelectedTextRangeAttribute as CFString,
+                    rangeValue
+                )
+            }
+        }
+        return true
+    }
+
+    private static func focusedElementStillMatches(_ snapshot: FocusedTextFieldSnapshot) -> Bool {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.applicationPID else {
+            return false
+        }
+        let application = AXUIElementCreateApplication(snapshot.applicationPID)
+        var rawFocused: CFTypeRef?
+        return AXUIElementCopyAttributeValue(
+            application,
+            kAXFocusedUIElementAttribute as CFString,
+            &rawFocused
+        ) == .success
+            && rawFocused.map { CFGetTypeID($0) == AXUIElementGetTypeID() && CFEqual($0, snapshot.element) } == true
     }
 }
 
@@ -11075,6 +11341,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var updateCheckLoopTask: Task<Void, Never>?
     private var manualUpdateCheckTask: Task<Void, Never>?
     private var settingsReloadRetryWorkItem: DispatchWorkItem?
+    private var layoutCorrectionWorkItem: DispatchWorkItem?
     private var startupStatusTitle = "Loading speech model…"
     private var speechModelStartupProgressFraction: Double?
     private var speechModelDownloadPhase: String?
@@ -11245,6 +11512,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onCancel = { [weak self] in self?.cancelActiveRecording(reason: "escape") }
         hotkey.onShowHistory = { [weak self] in self?.toggleHistoryOverlay() }
         hotkey.onTranslateFocusedText = { [weak self] in self?.translateFocusedTextField() }
+        hotkey.onTextBoundaryTyped = { [weak self] in self?.scheduleExperimentalLayoutCorrection() }
         hotkey.onRejectedBusyPress = { [weak self] in
             guard let self, self.isBusy, self.settings.playFeedbackSounds else { return }
             Sounds.playError()
@@ -11273,6 +11541,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.onCancel = nil
             hotkey.onShowHistory = nil
             hotkey.onTranslateFocusedText = nil
+            hotkey.onTextBoundaryTyped = nil
         hotkey.onRejectedBusyPress = nil
             hotkey.isRecordingActive = nil
             hotkey.canStartRecording = nil
@@ -11339,6 +11608,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.setAlternateCompletionEnabled(settings.alternateCompletionEnabled)
         hotkey.setHistoryHotkey(settings.configuredHistoryHotkey)
         hotkey.setTranslationEnabled(settings.translationHotkeyEnabled)
+        hotkey.setExperimentalLayoutCorrectionEnabled(settings.experimentalLayoutCorrectionEnabled)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
     }
@@ -11411,6 +11681,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         manualUpdateCheckTask = nil
         settingsReloadRetryWorkItem?.cancel()
         settingsReloadRetryWorkItem = nil
+        layoutCorrectionWorkItem?.cancel()
+        layoutCorrectionWorkItem = nil
         stopPermissionReadinessMonitor()
         stopSetupChecklistRefreshTimer()
         removeWorkspacePowerObservers()
@@ -11482,6 +11754,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.setAlternateCompletionEnabled(settings.alternateCompletionEnabled)
         hotkey.setHistoryHotkey(settings.configuredHistoryHotkey)
         hotkey.setTranslationEnabled(settings.translationHotkeyEnabled)
+        hotkey.setExperimentalLayoutCorrectionEnabled(settings.experimentalLayoutCorrectionEnabled)
         hotkey.setTriggerMode(settings.triggerMode)
         rebuildMenu()
         if shouldRestartAudioInputForSettingsChange(
@@ -12952,6 +13225,33 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     // MARK: - Recording loop
+
+    private func scheduleExperimentalLayoutCorrection() {
+        guard settings.experimentalLayoutCorrectionEnabled,
+              isReady,
+              !isRecording,
+              !isBusy,
+              !isTerminating else { return }
+        layoutCorrectionWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.settings.experimentalLayoutCorrectionEnabled,
+                  !self.isRecording,
+                  !self.isBusy,
+                  let snapshot = FocusedTextFieldEditor.capture(),
+                  let selectedRange = snapshot.selectedRange,
+                  selectedRange.length == 0,
+                  let correction = KeyboardLayoutMistypeDetector.correction(
+                    in: snapshot.text,
+                    cursorUTF16Location: selectedRange.location
+                  ) else { return }
+            if FocusedTextFieldEditor.apply(correction, to: snapshot) {
+                log("experimental layout correction: \(correction.direction.rawValue), \(correction.range.length) characters")
+            }
+        }
+        layoutCorrectionWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: workItem)
+    }
 
     private func translateFocusedTextField() {
         // This persisted opt-in is controlled by the disclosure switch in
@@ -18347,6 +18647,7 @@ private enum ParakeySelfTest {
         try testEscapePassesThroughWhenNotRecording()
         try testEscapeSuppressesCancelRepeatAndKeyUpWhileRecording()
         try testTranslationHotkeyDoesNotBreakControlChords()
+        try testKeyboardLayoutMistypeDetector()
     }
 
     private static func testHotkeyPreferenceNormalization() throws {
@@ -22886,6 +23187,68 @@ private enum ParakeySelfTest {
         )
     }
 
+    private static func testKeyboardLayoutMistypeDetector() throws {
+        let russian = KeyboardLayoutMistypeDetector.correction(
+            in: "ghbdtn ",
+            cursorUTF16Location: 7
+        )
+        try expect(russian?.replacement,
+                   equals: "привет",
+                   "English keys should recover a high-confidence Russian word")
+        try expect(russian?.direction,
+                   equals: .englishKeysToRussian,
+                   "English-key correction should report its direction")
+
+        let english = KeyboardLayoutMistypeDetector.correction(
+            in: "руддщ ",
+            cursorUTF16Location: 6
+        )
+        try expect(english?.replacement,
+                   equals: "hello",
+                   "Russian keys should recover a high-confidence English word")
+
+        let paragraph = "Готово.\nghbdtn rfr ltkf "
+        let paragraphCorrection = KeyboardLayoutMistypeDetector.correction(
+            in: paragraph,
+            cursorUTF16Location: (paragraph as NSString).length
+        )
+        try expect(paragraphCorrection?.replacement,
+                   equals: "привет как дела",
+                   "a completed wrong-layout phrase should be corrected together")
+        try expect(paragraphCorrection?.range.location,
+                   equals: ("Готово.\n" as NSString).length,
+                   "correction should touch only the trailing fragment")
+
+        let continued = "привет rfr ltkf "
+        let continuedCorrection = KeyboardLayoutMistypeDetector.correction(
+            in: continued,
+            cursorUTF16Location: (continued as NSString).length
+        )
+        try expect(continuedCorrection?.replacement,
+                   equals: "как дела",
+                   "correction should continue after an already corrected word")
+        try expect(continuedCorrection?.range.location,
+                   equals: ("привет " as NSString).length,
+                   "mixed fields should preserve the preceding correct script")
+
+        for safeText in [
+            "hello world ",
+            "привет как дела ",
+            "privet kak dela ",
+            "hello привет ",
+            "let value = ghbdtn ",
+        ] {
+            try expect(
+                KeyboardLayoutMistypeDetector.correction(
+                    in: safeText,
+                    cursorUTF16Location: (safeText as NSString).length
+                ),
+                equals: KeyboardLayoutCorrection?.none,
+                "valid, mixed, transliterated, and code-like text should remain untouched: \(safeText)"
+            )
+        }
+    }
+
     private static func event(
         _ type: CGEventType,
         keycode: CGKeyCode,
@@ -23717,6 +24080,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
         note.preferredMaxLayoutWidth = 650
         stack.addArrangedSubview(note)
+        stack.addArrangedSubview(settingsSection(t("ЭКСПЕРИМЕНТАЛЬНО", "EXPERIMENTAL"), rows: [
+            experimentalLayoutCorrectionRow(),
+        ]))
         return desktopSettingsScroll(stack)
     }
 
@@ -23744,6 +24110,38 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         toggle.action = #selector(toggleTranslationHotkey(_:))
         toggle.state = settings.translationHotkeyEnabled ? .on : .off
         toggle.isEnabled = AIKeyStore.read() != nil
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func experimentalLayoutCorrectionRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Коррекция неверной раскладки", "Wrong-layout correction"),
+            size: 13,
+            weight: .semibold
+        ))
+        let detail = panelLabel(
+            t("Локально исправляет уверенно распознанные фрагменты: ghbdtn → привет, руддщ → hello. Короткие, смешанные и похожие на код фрагменты не меняются.",
+              "Locally fixes high-confidence fragments: ghbdtn → привет, руддщ → hello. Short, mixed, and code-like fragments are left unchanged."),
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        detail.preferredMaxLayoutWidth = 500
+        text.addArrangedSubview(detail)
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleExperimentalLayoutCorrection(_:))
+        toggle.state = settings.experimentalLayoutCorrectionEnabled ? .on : .off
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(toggle)
@@ -24399,6 +24797,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     @objc private func toggleTranslationHotkey(_ sender: NSSwitch) {
         settings.translationHotkeyEnabled = sender.state == .on
+        _ = settings.refreshFromDisk()
+        DistributedNotificationCenter.default().postNotificationName(
+            SETTINGS_CHANGED_NOTIFICATION,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+        refreshSettingsWindow()
+    }
+
+    @objc private func toggleExperimentalLayoutCorrection(_ sender: NSSwitch) {
+        settings.experimentalLayoutCorrectionEnabled = sender.state == .on
         _ = settings.refreshFromDisk()
         DistributedNotificationCenter.default().postNotificationName(
             SETTINGS_CHANGED_NOTIFICATION,
