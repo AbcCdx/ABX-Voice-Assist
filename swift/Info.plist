@@ -3,32 +3,32 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>SuperDictate</string>
+	<string>ABX Voice Assist</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
 			<key>CFBundleTypeName</key>
-			<string>SuperDictate Corrections</string>
+			<string>ABX Voice Assist Corrections</string>
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>LSHandlerRank</key>
 			<string>Owner</string>
 			<key>LSItemContentTypes</key>
 			<array>
-				<string>com.local.superdictate.corrections</string>
+				<string>com.abc.abxvoiceassist.corrections</string>
 			</array>
 		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
-	<string>SuperDictate</string>
+	<string>ABXVoiceAssist</string>
 	<key>CFBundleIconFile</key>
 	<string>Parakey</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.local.superdictate</string>
+	<string>com.abc.abxvoiceassist</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>SuperDictate</string>
+	<string>ABX Voice Assist</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -40,13 +40,13 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>SuperDictate uses System Events to paste transcribed text at your cursor and to mute the system audio output during recording.</string>
+	<string>ABX Voice Assist uses System Events to paste transcribed text at your cursor and to mute the system audio output during recording.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>SuperDictate, based on Parakey. MIT licensed.</string>
+	<string>ABX Voice Assist, based on Parakey. MIT licensed.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>SuperDictate records audio while dictation is active, then transcribes it locally on your Mac.</string>
+	<string>ABX Voice Assist records audio while dictation is active, then transcribes it locally on your Mac.</string>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
@@ -55,15 +55,15 @@
 				<string>public.json</string>
 			</array>
 			<key>UTTypeDescription</key>
-			<string>SuperDictate Corrections</string>
+			<string>ABX Voice Assist Corrections</string>
 			<key>UTTypeIdentifier</key>
-			<string>com.local.superdictate.corrections</string>
+			<string>com.abc.abxvoiceassist.corrections</string>
 			<key>UTTypeTagSpecification</key>
 			<dict>
 				<key>public.filename-extension</key>
-				<string>superdictate-corrections</string>
+				<string>abxvoiceassist-corrections</string>
 				<key>public.mime-type</key>
-				<string>application/vnd.superdictate.corrections+json</string>
+				<string>application/vnd.abxvoiceassist.corrections+json</string>
 			</dict>
 		</dict>
 	</array>

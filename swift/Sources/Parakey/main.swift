@@ -58,24 +58,24 @@ let MIN_CLIP_SECONDS: Double = 0.25
 let UPDATE_CHECK_FIRST_DELAY_SECONDS: TimeInterval = 30
 let UPDATE_CHECK_INTERVAL_SECONDS: TimeInterval = 6 * 3600  // 6h
 let UPDATE_REMIND_LATER_SECONDS: TimeInterval = 24 * 3600  // 24h
-let GITHUB_LATEST_RELEASE_URL = URL(string: "https://api.github.com/repos/shlgd/SuperDictate/releases/latest")!
-let GITHUB_REPOSITORY_PAGE = URL(string: "https://github.com/shlgd/SuperDictate")!
-let GITHUB_RELEASES_PAGE = URL(string: "https://github.com/shlgd/SuperDictate/releases/latest")!
-let GITHUB_UPDATE_MANIFEST_URL = URL(string: "https://raw.githubusercontent.com/shlgd/SuperDictate/main/update.json")!
+let GITHUB_LATEST_RELEASE_URL = URL(string: "https://api.github.com/repos/AbcCdx/ABX-Voice-Assist/releases/latest")!
+let GITHUB_REPOSITORY_PAGE = URL(string: "https://github.com/AbcCdx/ABX-Voice-Assist")!
+let GITHUB_RELEASES_PAGE = URL(string: "https://github.com/AbcCdx/ABX-Voice-Assist/releases/latest")!
+let GITHUB_UPDATE_MANIFEST_URL = URL(string: "https://raw.githubusercontent.com/AbcCdx/ABX-Voice-Assist/main/update.json")!
 let UPDATE_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
-let HOMEBREW_CASK_TAP = "shlgd/superdictate"
-let HOMEBREW_CASK_TOKEN = "shlgd/superdictate/superdictate"
-let HOMEBREW_CASK_INSTALLED_TOKEN = "parakey"
-let INSTALLED_APP_BUNDLE_PATH = "/Applications/SuperDictate.app"
+let HOMEBREW_CASK_TAP = "AbcCdx/ABX-Voice-Assist"
+let HOMEBREW_CASK_TOKEN = "AbcCdx/ABX-Voice-Assist/abx-voice-assist"
+let HOMEBREW_CASK_INSTALLED_TOKEN = "abx-voice-assist"
+let INSTALLED_APP_BUNDLE_PATH = "/Applications/ABX Voice Assist.app"
 let AGENT_ARGUMENT = "--agent"
-let AGENT_LABEL = "com.local.superdictate.agent"
-let APP_SUPPORT_DIR_NAME = "SuperDictate"
+let AGENT_LABEL = "com.abc.abxvoiceassist.agent"
+let APP_SUPPORT_DIR_NAME = "ABX Voice Assist"
 let AGENT_STATUS_FILE_NAME = "AgentStatus.json"
 let CONTROL_PANEL_PID_FILE_NAME = "ControlPanel.pid"
 let UPDATE_HELPER_LOG_PATH = (NSHomeDirectory() as NSString)
-    .appendingPathComponent("Library/Logs/SuperDictate-update.log")
+    .appendingPathComponent("Library/Logs/ABX Voice Assist-update.log")
 let UPDATE_PROGRESS_ARGUMENT = "--update-progress"
-let UPDATE_PROGRESS_APP_PREFIX = "SuperDictate-update-progress-"
+let UPDATE_PROGRESS_APP_PREFIX = "ABX Voice Assist-update-progress-"
 let MAX_SKIPPED_UPDATE_VERSIONS = 20
 let MAX_CORRECTION_SYNC_PATH_BYTES = 4096
 let MAX_INPUT_DEVICE_PREFERENCE_BYTES = 512
@@ -96,9 +96,9 @@ let RECORDING_HUD_DISPLAY_LINK_MAX_FPS: Float = 120
 let RECORDING_HUD_RECORDING_BASE_PHASE_SPEED: CGFloat = 16.96
 let RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED: CGFloat = 10.08
 let RECORDING_HUD_TRANSCRIBING_PHASE_SPEED: CGFloat = 10.2
-let HOTKEY_CAPTURE_BEGIN_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-begin")
-let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-end")
-let SETTINGS_CHANGED_NOTIFICATION = Notification.Name("com.local.superdictate.settings-changed")
+let HOTKEY_CAPTURE_BEGIN_NOTIFICATION = Notification.Name("com.abc.abxvoiceassist.hotkey-capture-begin")
+let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.abc.abxvoiceassist.hotkey-capture-end")
+let SETTINGS_CHANGED_NOTIFICATION = Notification.Name("com.abc.abxvoiceassist.settings-changed")
 let HOTKEY_CAPTURE_FAILSAFE_SECONDS: TimeInterval = 45
 let DICTATION_ERROR_FLASH_SECONDS: TimeInterval = 1.5  // how long the menu-bar icon flags a dropped dictation before returning to idle
 let AUDIO_START_RETRY_DELAYS_SECONDS: [UInt64] = [1, 3, 8]
@@ -106,10 +106,10 @@ let AUDIO_IDLE_STOP_DELAY_SECONDS: TimeInterval = 5
 let AUDIO_CONFIGURATION_CHANGE_SUPPRESSION_SECONDS: TimeInterval = 1
 let MODEL_DOWNLOAD_HEADROOM_BYTES: Int64 = 500 * 1024 * 1024
 
-let SETTINGS_SUITE = "com.local.superdictate"
-let CORRECTIONS_FILE_UTI = "com.local.superdictate.corrections"
-let CORRECTIONS_FILE_EXTENSION = "superdictate-corrections"
-let CORRECTIONS_FILE_NAME = "SuperDictate Corrections.\(CORRECTIONS_FILE_EXTENSION)"
+let SETTINGS_SUITE = "com.abc.abxvoiceassist"
+let CORRECTIONS_FILE_UTI = "com.abc.abxvoiceassist.corrections"
+let CORRECTIONS_FILE_EXTENSION = "abxvoiceassist-corrections"
+let CORRECTIONS_FILE_NAME = "ABX Voice Assist Corrections.\(CORRECTIONS_FILE_EXTENSION)"
 let MAX_TRANSCRIPT_CORRECTIONS = 512
 let MAX_TRANSCRIPT_CORRECTION_SOURCE_BYTES = 512
 let MAX_TRANSCRIPT_CORRECTION_REPLACEMENT_BYTES = 4096
@@ -2172,7 +2172,7 @@ func shouldRestartAudioInputForSettingsChange(previousPreference: String,
 // MARK: - Logger
 //
 // All output goes to stderr (line-buffered, so we don't lose lines
-// across an abrupt exit) and to ~/Library/Logs/SuperDictate.log.
+// across an abrupt exit) and to ~/Library/Logs/ABX Voice Assist.log.
 
 final class Logger: @unchecked Sendable {
     static let shared = Logger()
@@ -2184,7 +2184,7 @@ final class Logger: @unchecked Sendable {
     init() {
         let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Logs", isDirectory: true)
-        url = logs.appendingPathComponent("SuperDictate.log")
+        url = logs.appendingPathComponent("ABX Voice Assist.log")
     }
 
     func log(_ msg: String) {
@@ -2366,7 +2366,7 @@ enum SuperDictateAgentService {
 
     static func agentExecutablePath() -> String {
         Bundle.main.executablePath ??
-        "\(INSTALLED_APP_BUNDLE_PATH)/Contents/MacOS/SuperDictate"
+        "\(INSTALLED_APP_BUNDLE_PATH)/Contents/MacOS/ABXVoiceAssist"
     }
 
     static func installAndStart() throws {
@@ -2431,7 +2431,7 @@ enum SuperDictateAgentService {
                                                 attributes: [.posixPermissions: 0o700])
 
         let logPath = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs/SuperDictate-agent.launchd.log").path
+            .appendingPathComponent("Logs/ABX Voice Assist-agent.launchd.log").path
         let plist: [String: Any] = [
             "Label": AGENT_LABEL,
             "ProgramArguments": [agentExecutablePath(), AGENT_ARGUMENT],
@@ -2508,7 +2508,7 @@ func privacySafeLogPath(_ url: URL) -> String {
 
 func privacySafeBundlePath(_ path: String) -> String {
     switch path {
-    case "/Applications/SuperDictate.app", "/tmp/SuperDictate-dev.app":
+    case "/Applications/ABX Voice Assist.app", "/tmp/ABX Voice Assist-dev.app":
         return path
     default:
         return privacySafeLogPath(path)
@@ -2585,7 +2585,7 @@ extension ISO8601DateFormatter {
 // MARK: - Settings
 //
 // Thin wrapper around the app's standard NSUserDefaults domain, so
-// settings persist at `~/Library/Preferences/com.local.superdictate.plist`.
+// settings persist at `~/Library/Preferences/com.abc.abxvoiceassist.plist`.
 // One property per user-visible setting; defaults are returned inline
 // by each getter when the key is missing, rather than via a central
 // `register()` call.
@@ -3960,7 +3960,7 @@ private final class HotkeyRecorderController: NSObject, NSWindowDelegate {
                               action: nil)
         super.init()
 
-        panel.title = "SuperDictate"
+        panel.title = "ABX Voice Assist"
         panel.isReleasedWhenClosed = false
         panel.level = .floating
         panel.delegate = self
@@ -4846,7 +4846,7 @@ private enum PendingDictationRecovery {
 
 private final class PendingDictationJournal: @unchecked Sendable {
     let url: URL
-    private let queue = DispatchQueue(label: "SuperDictate.PendingDictationJournal",
+    private let queue = DispatchQueue(label: "ABX Voice Assist.PendingDictationJournal",
                                       qos: .utility)
     private var fileDescriptor: Int32
     private var didLogWriteFailure = false
@@ -5199,7 +5199,7 @@ final class AudioCapture: @unchecked Sendable {
         let inputFormat = input.inputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw NSError(
-                domain: "SuperDictate.AudioCapture",
+                domain: "ABX Voice Assist.AudioCapture",
                 code: -2,
                 userInfo: [NSLocalizedDescriptionKey: "The selected microphone has no active audio stream."]
             )
@@ -5211,7 +5211,7 @@ final class AudioCapture: @unchecked Sendable {
             interleaved: false
         ) else {
             throw NSError(
-                domain: "SuperDictate.AudioCapture",
+                domain: "ABX Voice Assist.AudioCapture",
                 code: -3,
                 userInfo: [NSLocalizedDescriptionKey: "Could not create the transcription audio format."]
             )
@@ -5221,7 +5221,7 @@ final class AudioCapture: @unchecked Sendable {
         let mixToMono = inputFormat.channelCount > 1 && sourceFormat.channelCount == 1
         guard let newConverter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
             throw NSError(
-                domain: "SuperDictate.AudioCapture",
+                domain: "ABX Voice Assist.AudioCapture",
                 code: -4,
                 userInfo: [NSLocalizedDescriptionKey: "Could not convert audio from the selected microphone."]
             )
@@ -6276,7 +6276,7 @@ enum AIKeyStore {
         }
     }
 
-    private static let service = "com.local.superdictate.ai"
+    private static let service = "com.abc.abxvoiceassist.ai"
     private static let account = "api-key"
 
     private static var baseQuery: [String: Any] {
@@ -8144,18 +8144,18 @@ enum UpdateCheckFailure: Error, Equatable, Sendable {
 func manualUpdateCheckFailureText(_ failure: UpdateCheckFailure) -> String {
     switch failure {
     case .network:
-        return "SuperDictate couldn't reach GitHub. Check your internet connection and try again."
+        return "ABX Voice Assist couldn't reach GitHub. Check your internet connection and try again."
     case .httpStatus(403):
         return "GitHub declined the update check (HTTP 403). This is usually temporary rate limiting — try again in a few minutes."
     case .httpStatus(let code):
         return "GitHub returned an error (HTTP \(code)). Try again later."
     case .unexpectedResponse:
-        return "GitHub returned a response SuperDictate couldn't read. Try again later, or check the releases page on GitHub directly."
+        return "GitHub returned a response ABX Voice Assist couldn't read. Try again later, or check the releases page on GitHub directly."
     }
 }
 
 enum UpdateCheck {
-    private static let githubReleaseURLPathPrefix = "/shlgd/SuperDictate/releases/tag/"
+    private static let githubReleaseURLPathPrefix = "/AbcCdx/ABX-Voice-Assist/releases/tag/"
     static let maxReleaseResponseBytes = 512 * 1024
 
     static func fetchLatest() async -> Result<GitHubRelease, UpdateCheckFailure> {
@@ -8164,7 +8164,7 @@ enum UpdateCheck {
         // The privacy docs promise exactly this fixed token — no
         // version, device, or user identifiers. Must stay in sync with
         // docs/privacy/network-calls.json.
-        req.setValue("superdictate-update-check", forHTTPHeaderField: "User-Agent")
+        req.setValue("abxvoiceassist-update-check", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 10
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -8287,7 +8287,7 @@ enum SuperDictateUpdateInstallerError: LocalizedError, Equatable, Sendable {
             case .invalidBundle(let detail):
                 return "The new application failed verification: \(detail)"
             case .appNotWritable:
-                return "SuperDictate cannot replace the application in Applications. Run the regular installer once."
+                return "ABX Voice Assist cannot replace the application in Applications. Run the regular installer once."
             }
         }
         switch self {
@@ -8308,7 +8308,7 @@ enum SuperDictateUpdateInstallerError: LocalizedError, Equatable, Sendable {
         case .invalidBundle(let detail):
             return "Проверка нового приложения не пройдена: \(detail)"
         case .appNotWritable:
-            return "SuperDictate не может заменить приложение в папке Applications. Запустите обычный установщик один раз."
+            return "ABX Voice Assist не может заменить приложение в папке Applications. Запустите обычный установщик один раз."
         }
     }
 }
@@ -8318,7 +8318,7 @@ enum SuperDictateUpdateInstaller {
 
     static func fetchManifest(expectedVersion: String) async throws -> SuperDictateUpdateManifest {
         var request = URLRequest(url: GITHUB_UPDATE_MANIFEST_URL)
-        request.setValue("superdictate-in-app-update", forHTTPHeaderField: "User-Agent")
+        request.setValue("abxvoiceassist-in-app-update", forHTTPHeaderField: "User-Agent")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         request.timeoutInterval = 15
         let (data, response) = try await fetch(request: request, maxBytes: manifestMaxBytes)
@@ -8350,9 +8350,9 @@ enum SuperDictateUpdateInstaller {
             throw SuperDictateUpdateInstallerError.appNotWritable
         }
 
-        let archiveURL = URL(string: "https://github.com/shlgd/SuperDictate/releases/download/v\(manifest.version)/SuperDictate.zip")!
+        let archiveURL = URL(string: "https://github.com/AbcCdx/ABX-Voice-Assist/releases/download/v\(manifest.version)/ABX Voice Assist.zip")!
         var request = URLRequest(url: archiveURL)
-        request.setValue("superdictate-in-app-update", forHTTPHeaderField: "User-Agent")
+        request.setValue("abxvoiceassist-in-app-update", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 60
         let (archiveData, response) = try await fetch(request: request,
                                                       maxBytes: UPDATE_ARCHIVE_MAX_BYTES)
@@ -8368,8 +8368,8 @@ enum SuperDictateUpdateInstaller {
         }
 
         let workDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("SuperDictate-update-\(UUID().uuidString)", isDirectory: true)
-        let archiveFile = workDirectory.appendingPathComponent("SuperDictate.zip")
+            .appendingPathComponent("ABX Voice Assist-update-\(UUID().uuidString)", isDirectory: true)
+        let archiveFile = workDirectory.appendingPathComponent("ABX Voice Assist.zip")
         let extractedDirectory = workDirectory.appendingPathComponent("release", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: extractedDirectory,
@@ -8390,7 +8390,7 @@ enum SuperDictateUpdateInstaller {
             throw SuperDictateUpdateInstallerError.extractionFailed(extraction.output)
         }
 
-        let stagedAppURL = extractedDirectory.appendingPathComponent("SuperDictate.app",
+        let stagedAppURL = extractedDirectory.appendingPathComponent("ABX Voice Assist.app",
                                                                       isDirectory: true)
         do {
             try validateApp(at: stagedAppURL, expectedVersion: manifest.version)
@@ -8417,14 +8417,14 @@ enum SuperDictateUpdateInstaller {
     static func validateApp(at appURL: URL, expectedVersion: String) throws {
         let fileManager = FileManager.default
         let infoURL = appURL.appendingPathComponent("Contents/Info.plist")
-        let executableURL = appURL.appendingPathComponent("Contents/MacOS/SuperDictate")
-        guard appURL.lastPathComponent == "SuperDictate.app",
+        let executableURL = appURL.appendingPathComponent("Contents/MacOS/ABXVoiceAssist")
+        guard appURL.lastPathComponent == "ABX Voice Assist.app",
               fileManager.fileExists(atPath: infoURL.path),
               fileManager.isExecutableFile(atPath: executableURL.path),
               let infoData = try? Data(contentsOf: infoURL),
               let info = try? PropertyListSerialization.propertyList(from: infoData,
                                                                      format: nil) as? [String: Any],
-              info["CFBundleIdentifier"] as? String == "com.local.superdictate",
+              info["CFBundleIdentifier"] as? String == "com.abc.abxvoiceassist",
               info["CFBundleShortVersionString"] as? String == expectedVersion else {
             throw SuperDictateUpdateInstallerError.invalidBundle("неверный идентификатор или версия")
         }
@@ -8703,17 +8703,17 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
     let preparing = localizedText("Подготавливаю замену приложения…",
                                   "Preparing to replace the application…",
                                   language: language)
-    let installing = localizedText("Устанавливаю SuperDictate v\(targetVersion)…",
-                                    "Installing SuperDictate v\(targetVersion)…",
+    let installing = localizedText("Устанавливаю ABX Voice Assist v\(targetVersion)…",
+                                    "Installing ABX Voice Assist v\(targetVersion)…",
                                     language: language)
     let verifying = localizedText("Проверяю установленную версию…",
                                    "Verifying the installed version…",
                                    language: language)
-    let relaunching = localizedText("Обновление готово. Запускаю SuperDictate…",
-                                    "Update complete. Reopening SuperDictate…",
+    let relaunching = localizedText("Обновление готово. Запускаю ABX Voice Assist…",
+                                    "Update complete. Reopening ABX Voice Assist…",
                                     language: language)
-    let complete = localizedText("SuperDictate v\(targetVersion) установлена.",
-                                  "SuperDictate v\(targetVersion) is installed.",
+    let complete = localizedText("ABX Voice Assist v\(targetVersion) установлена.",
+                                  "ABX Voice Assist v\(targetVersion) is installed.",
                                   language: language)
     let failed = localizedText("Обновление не установлено. Предыдущая версия восстановлена.",
                                 "The update was not installed. The previous version was restored.",
@@ -8778,8 +8778,8 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
     }
 
     verify_app() {
-        [ -x "$APP_PATH/Contents/MacOS/SuperDictate" ] || return 1
-        [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST" 2>/dev/null)" = "com.local.superdictate" ] || return 1
+        [ -x "$APP_PATH/Contents/MacOS/ABXVoiceAssist" ] || return 1
+        [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST" 2>/dev/null)" = "com.abc.abxvoiceassist" ] || return 1
         [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST" 2>/dev/null)" = "$TARGET_VERSION" ] || return 1
         /usr/bin/codesign --verify --deep --strict "$APP_PATH"
     }
@@ -8805,7 +8805,7 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
     wait_for_panel_exit || rollback
 
     /bin/launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
-    /usr/bin/pkill -f "$APP_PATH/Contents/MacOS/SuperDictate --agent" >/dev/null 2>&1 || true
+    /usr/bin/pkill -f "$APP_PATH/Contents/MacOS/ABXVoiceAssist --agent" >/dev/null 2>&1 || true
 
     state "installing" \#(shellSingleQuoted(installing))
     /bin/mv "$APP_PATH" "$BACKUP_APP" || rollback
@@ -9558,7 +9558,7 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
                               styleMask: [.titled, .closable],
                               backing: .buffered,
                               defer: false)
-        window.title = t("Обновление SuperDictate", "Updating SuperDictate")
+        window.title = t("Обновление ABX Voice Assist", "Updating ABX Voice Assist")
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -9570,13 +9570,13 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
         root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        let title = updateProgressLabel(t("Обновление SuperDictate до v\(launch.targetVersion)",
-                                          "Updating SuperDictate to v\(launch.targetVersion)"),
+        let title = updateProgressLabel(t("Обновление ABX Voice Assist до v\(launch.targetVersion)",
+                                          "Updating ABX Voice Assist to v\(launch.targetVersion)"),
                                         font: .systemFont(ofSize: 18, weight: .semibold))
         messageLabel = updateProgressLabel(t("Запускаю обновление…", "Starting update…"),
                                            font: .systemFont(ofSize: 13, weight: .medium))
-        detailLabel = updateProgressLabel(t("SuperDictate автоматически откроется после установки.",
-                                             "SuperDictate will reopen automatically when the update finishes."),
+        detailLabel = updateProgressLabel(t("ABX Voice Assist автоматически откроется после установки.",
+                                             "ABX Voice Assist will reopen automatically when the update finishes."),
                                           font: .systemFont(ofSize: 12),
                                           color: .secondaryLabelColor)
         detailLabel.preferredMaxLayoutWidth = 390
@@ -9689,12 +9689,12 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
             detailLabel.stringValue = t("Старая версия закрыта, новая устанавливается. Приложение откроется автоматически.",
                                         "The old version has closed while the new one is installed. It will reopen automatically.")
         case "relaunching":
-            detailLabel.stringValue = t("Запускаю новую версию SuperDictate.",
-                                        "Opening the new version of SuperDictate.")
+            detailLabel.stringValue = t("Запускаю новую версию ABX Voice Assist.",
+                                        "Opening the new version of ABX Voice Assist.")
             scheduleClose(after: 0.5)
         default:
-            detailLabel.stringValue = t("SuperDictate автоматически откроется после установки.",
-                                        "SuperDictate will reopen automatically when the update finishes.")
+            detailLabel.stringValue = t("ABX Voice Assist автоматически откроется после установки.",
+                                        "ABX Voice Assist will reopen automatically when the update finishes.")
         }
     }
 
@@ -10914,7 +10914,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             recordStartupFailure(
                 stage: .hotkeyListener,
                 error: NSError(
-                    domain: "SuperDictate",
+                    domain: "ABX Voice Assist",
                     code: -6,
                     userInfo: [NSLocalizedDescriptionKey: "The hotkey listener could not resume after shortcut capture."]
                 ),
@@ -13705,8 +13705,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func confirmStopDictation() -> Bool {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Stop SuperDictate?"
-        alert.informativeText = "The \(hotkey.hotkey.name) dictation shortcut will stop until you open SuperDictate again. Use Close to hide windows while keeping dictation running."
+        alert.messageText = "Stop ABX Voice Assist?"
+        alert.informativeText = "The \(hotkey.hotkey.name) dictation shortcut will stop until you open ABX Voice Assist again. Use Close to hide windows while keeping dictation running."
         alert.addButton(withTitle: "Keep Running")
         alert.addButton(withTitle: "Stop Dictation")
         return alert.runModal() == .alertSecondButtonReturn
@@ -13738,7 +13738,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         showAppForModal()
         let alert = NSAlert()
         alert.alertStyle = .informational
-        alert.messageText = "SuperDictate Reopened After an Unexpected Exit"
+        alert.messageText = "ABX Voice Assist Reopened After an Unexpected Exit"
         alert.informativeText = """
             Parakey appears to have exited last time without a normal shutdown. Nothing was sent anywhere.
 
@@ -13927,7 +13927,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // in the menu that gets such an indicator — every other row
         // sits flush against the left edge. The wrapper produces the
         // identical behaviour with no auto-glyph.
-        let quit = NSMenuItem(title: "Quit SuperDictate",
+        let quit = NSMenuItem(title: "Quit ABX Voice Assist",
                               action: #selector(quitClicked(_:)),
                               keyEquivalent: "q")
         quit.target = self
@@ -13984,7 +13984,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(.separator())
 
-        let about = NSMenuItem(title: "About SuperDictate",
+        let about = NSMenuItem(title: "About ABX Voice Assist",
                                action: #selector(showAboutClicked(_:)),
                                keyEquivalent: "")
         about.target = self
@@ -14076,16 +14076,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if isCoreRuntimeReady {
             return "Starting hotkey listener…"
         }
-        return "SuperDictate is not ready"
+        return "ABX Voice Assist is not ready"
     }
 
     private func diagnosticsText() -> String {
         let generated = ISO8601DateFormatter().string(from: Date())
         let bundlePath = Bundle.main.bundlePath
         let installKind: String
-        if bundlePath == "/Applications/SuperDictate.app" {
+        if bundlePath == "/Applications/ABX Voice Assist.app" {
             installKind = "Applications app"
-        } else if bundlePath == "/tmp/SuperDictate-dev.app" {
+        } else if bundlePath == "/tmp/ABX Voice Assist-dev.app" {
             installKind = "signed dev app"
         } else {
             installKind = "other"
@@ -14249,7 +14249,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                               styleMask: [.titled, .closable],
                               backing: .buffered,
                               defer: false)
-        window.title = "Set Up SuperDictate"
+        window.title = "Set Up ABX Voice Assist"
         window.isReleasedWhenClosed = false
         window.delegate = self
         setupChecklistWindow = window
@@ -14312,8 +14312,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         root.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 18, right: 22)
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        let title = setupLabel("Set Up SuperDictate", font: .systemFont(ofSize: 22, weight: .semibold))
-        let subtitle = setupLabel("Finish these checks before dictating. SuperDictate keeps this setup local to your Mac.",
+        let title = setupLabel("Set Up ABX Voice Assist", font: .systemFont(ofSize: 22, weight: .semibold))
+        let subtitle = setupLabel("Finish these checks before dictating. ABX Voice Assist keeps this setup local to your Mac.",
                                   font: .systemFont(ofSize: 13),
                                   color: .secondaryLabelColor)
         subtitle.preferredMaxLayoutWidth = 476
@@ -14331,7 +14331,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         root.addArrangedSubview(makeHotkeySetupRow())
 
         if !setupChecklistIsComplete {
-            let tip = setupLabel("Tip: If macOS does not show a permission prompt, click 'Open Settings' and enable SuperDictate in the displayed privacy section.",
+            let tip = setupLabel("Tip: If macOS does not show a permission prompt, click 'Open Settings' and enable ABX Voice Assist in the displayed privacy section.",
                                  font: .systemFont(ofSize: 11),
                                  color: .secondaryLabelColor)
             tip.preferredMaxLayoutWidth = 476
@@ -14390,7 +14390,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func setupChecklistSummary() -> String {
         setupChecklistIsComplete
-            ? "Setup is complete. Use SuperDictate from the Dock or shortcuts."
+            ? "Setup is complete. Use ABX Voice Assist from the Dock or shortcuts."
             : "You can close this window; the menu will keep tracking setup."
     }
 
@@ -14451,9 +14451,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .microphone:
             return "Captures your voice while dictating. Click 'Grant', then click 'OK' in the macOS prompt."
         case .accessibility:
-            return "Pastes the transcript at your cursor. Click 'Grant' to open System Settings → Privacy & Security → Accessibility, then enable the toggle next to 'SuperDictate'."
+            return "Pastes the transcript at your cursor. Click 'Grant' to open System Settings → Privacy & Security → Accessibility, then enable the toggle next to 'ABX Voice Assist'."
         case .inputMonitoring:
-            return "Lets SuperDictate detect the dictation hotkey. Click 'Grant' to open System Settings → Privacy & Security → Input Monitoring, then enable the toggle next to 'SuperDictate'."
+            return "Lets ABX Voice Assist detect the dictation hotkey. Click 'Grant' to open System Settings → Privacy & Security → Input Monitoring, then enable the toggle next to 'ABX Voice Assist'."
         }
     }
 
@@ -14679,13 +14679,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             launchAtLogin.state = .on
         case .requiresApproval:
             launchAtLogin.state = .mixed
-            launchAtLogin.toolTip = "Approve SuperDictate in System Settings → General → Login Items."
+            launchAtLogin.toolTip = "Approve ABX Voice Assist in System Settings → General → Login Items."
         default:
             launchAtLogin.state = .off
         }
         sub.addItem(launchAtLogin)
 
-        let dock = NSMenuItem(title: "Show SuperDictate in Dock",
+        let dock = NSMenuItem(title: "Show ABX Voice Assist in Dock",
                               action: #selector(toggleDock(_:)),
                               keyEquivalent: "")
         dock.target = self
@@ -16228,7 +16228,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func showAboutClicked(_ sender: NSMenuItem) {
         showAppForModal()
         let alert = NSAlert()
-        alert.messageText = "SuperDictate \(currentBundleVersion())"
+        alert.messageText = "ABX Voice Assist \(currentBundleVersion())"
         alert.informativeText = """
             Lightweight push-to-talk dictation for Apple Silicon Macs.
 
@@ -16241,7 +16241,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Permissions: microphone audio, paste-at-cursor, push-to-talk hotkey.
 
             Open source, based on Parakey by Richard Courtman.
-            github.com/shlgd/SuperDictate · MIT licensed
+            github.com/AbcCdx/ABX-Voice-Assist · MIT licensed
             """
         // Use our app icon instead of NSAlert's default exclamation
         // mark. .icns lives in Contents/Resources/Parakey.icns;
@@ -16561,7 +16561,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         To update, run this command in Terminal:
 
-        curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | bash
+        curl -fsSL https://raw.githubusercontent.com/AbcCdx/ABX-Voice-Assist/main/install.sh | bash
         """
         alert.addButton(withTitle: "Open Release Page")
         alert.addButton(withTitle: "Close")
@@ -16583,7 +16583,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         You can update from Terminal:
 
-        curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | bash
+        curl -fsSL https://raw.githubusercontent.com/AbcCdx/ABX-Voice-Assist/main/install.sh | bash
         """
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -16683,7 +16683,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Detached shell helper refreshes Homebrew, downloads the cask,
         // waits for THIS process to exit, upgrades/reinstalls the app,
         // verifies the installed bundle version, then re-opens
-        // /Applications/SuperDictate.app. We can't run the install step
+        // /Applications/ABX Voice Assist.app. We can't run the install step
         // in-process because it replaces the bundle we're executing from.
         let script = updateHelperScript(pid: getpid(),
                                         brewPath: brewPath,
@@ -17128,7 +17128,7 @@ private enum ParakeySelfTest {
                    equals: 600,
                    "settings should shrink on a shorter visible screen")
 
-        let settingsSuiteName = "com.local.superdictate.self-test.ai-cleanup.\(UUID().uuidString)"
+        let settingsSuiteName = "com.abc.abxvoiceassist.self-test.ai-cleanup.\(UUID().uuidString)"
         guard let settingsDefaults = UserDefaults(suiteName: settingsSuiteName) else {
             throw SelfTestFailure.failed("could not create isolated AI cleanup defaults")
         }
@@ -17302,13 +17302,13 @@ private enum ParakeySelfTest {
             "log path labels should fall back when no filename is available"
         )
         try expect(
-            privacySafeBundlePath("/Applications/SuperDictate.app"),
-            equals: "/Applications/SuperDictate.app",
+            privacySafeBundlePath("/Applications/ABX Voice Assist.app"),
+            equals: "/Applications/ABX Voice Assist.app",
             "bundle path labels should keep the canonical install path"
         )
         try expect(
-            privacySafeBundlePath("/Users/example/Downloads/SuperDictate.app"),
-            equals: "SuperDictate.app",
+            privacySafeBundlePath("/Users/example/Downloads/ABX Voice Assist.app"),
+            equals: "ABX Voice Assist.app",
             "bundle path labels should omit parent directories for nonstandard installs"
         )
 
@@ -17318,7 +17318,7 @@ private enum ParakeySelfTest {
         try fm.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? fm.removeItem(at: root) }
 
-        let logFile = root.appendingPathComponent("SuperDictate.log")
+        let logFile = root.appendingPathComponent("ABX Voice Assist.log")
         try appendPrivateLogData(Data("one\n".utf8), to: logFile)
         try appendPrivateLogData(Data("two\n".utf8), to: logFile)
 
@@ -17385,8 +17385,8 @@ private enum ParakeySelfTest {
                 appVersion: "9.8.7",
                 appBuild: "123",
                 macOS: "Version 26.0",
-                bundleID: "com.local.superdictate",
-                bundlePath: "/Applications/SuperDictate.app",
+                bundleID: "com.abc.abxvoiceassist",
+                bundlePath: "/Applications/ABX Voice Assist.app",
                 installKind: "Applications app",
                 status: "Hold Right Option to dictate",
                 startup: "Runtime ready",
@@ -17406,7 +17406,7 @@ private enum ParakeySelfTest {
                 ],
                 updateLines: ["Pending update: none"],
                 microphoneLines: ["Selected: System default", "Available inputs: none reported"],
-                logPath: "~/Library/Logs/SuperDictate.log",
+                logPath: "~/Library/Logs/ABX Voice Assist.log",
                 recentLogLines: ["[10:00:00] release: 1.23 s captured, transcribing"]
             )
         )
@@ -17430,7 +17430,7 @@ private enum ParakeySelfTest {
         try fm.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? fm.removeItem(at: root) }
 
-        let logFile = root.appendingPathComponent("SuperDictate.log")
+        let logFile = root.appendingPathComponent("ABX Voice Assist.log")
         for line in 1...6 {
             try appendPrivateLogData(Data("[10:00:0\(line)] line \(line)\n".utf8), to: logFile)
         }
@@ -18001,7 +18001,7 @@ private enum ParakeySelfTest {
             "disabled final period postprocessing should preserve existing behavior"
         )
 
-        let settingsSuiteName = "com.local.superdictate.self-test.postprocessing.\(UUID().uuidString)"
+        let settingsSuiteName = "com.abc.abxvoiceassist.self-test.postprocessing.\(UUID().uuidString)"
         guard let settingsDefaults = UserDefaults(suiteName: settingsSuiteName) else {
             throw SelfTestFailure.failed("could not create isolated postprocessing defaults")
         }
@@ -18086,7 +18086,7 @@ private enum ParakeySelfTest {
         )
 
         let pasteboardProbe = MainActor.assumeIsolated {
-            let pasteboardName = NSPasteboard.Name("com.local.superdictate.self-test.\(UUID().uuidString)")
+            let pasteboardName = NSPasteboard.Name("com.abc.abxvoiceassist.self-test.\(UUID().uuidString)")
             let pasteboard = NSPasteboard(name: pasteboardName)
             let wrote = ClipboardPasteInserter.write("pasteboard probe", to: pasteboard)
             let snapshot = PasteboardSnapshot.capture(from: pasteboard)
@@ -18106,7 +18106,7 @@ private enum ParakeySelfTest {
         )
 
         let lazyPasteProbe = MainActor.assumeIsolated {
-            let pasteboardName = NSPasteboard.Name("com.local.superdictate.lazy-paste-test.\(UUID().uuidString)")
+            let pasteboardName = NSPasteboard.Name("com.abc.abxvoiceassist.lazy-paste-test.\(UUID().uuidString)")
             let pasteboard = NSPasteboard(name: pasteboardName)
             _ = ClipboardPasteInserter.write("older clipboard text", to: pasteboard)
             let snapshot = PasteboardSnapshot.capture(from: pasteboard)
@@ -18153,7 +18153,7 @@ private enum ParakeySelfTest {
         )
 
         let untouchedUserCopyProbe = MainActor.assumeIsolated {
-            let pasteboardName = NSPasteboard.Name("com.local.superdictate.changed-paste-test.\(UUID().uuidString)")
+            let pasteboardName = NSPasteboard.Name("com.abc.abxvoiceassist.changed-paste-test.\(UUID().uuidString)")
             let pasteboard = NSPasteboard(name: pasteboardName)
             _ = ClipboardPasteInserter.write("older clipboard text", to: pasteboard)
             let snapshot = PasteboardSnapshot.capture(from: pasteboard)
@@ -18859,19 +18859,19 @@ private enum ParakeySelfTest {
             "sync merge should report same-source edits that changed differently on both sides"
         )
 
-        let normalizedSyncPath = normalizedCorrectionSyncFilePath(" /tmp/superdictate/../SuperDictate Corrections.superdictate-corrections\n")
+        let normalizedSyncPath = normalizedCorrectionSyncFilePath(" /tmp/abxvoiceassist/../ABX Voice Assist Corrections.abxvoiceassist-corrections\n")
         try expect(
             normalizedSyncPath,
-            equals: "/tmp/SuperDictate Corrections.superdictate-corrections",
+            equals: "/tmp/ABX Voice Assist Corrections.abxvoiceassist-corrections",
             "correction sync path normalization should trim and standardize absolute paths"
         )
         try expect(
-            normalizedCorrectionSyncFilePath("relative/path.superdictate-corrections"),
+            normalizedCorrectionSyncFilePath("relative/path.abxvoiceassist-corrections"),
             equals: nil,
             "correction sync path normalization should reject relative paths"
         )
         try expect(
-            normalizedCorrectionSyncFilePath("/tmp/\u{0}superdictate.superdictate-corrections"),
+            normalizedCorrectionSyncFilePath("/tmp/\u{0}abxvoiceassist.abxvoiceassist-corrections"),
             equals: nil,
             "correction sync path normalization should reject NUL bytes"
         )
@@ -19079,14 +19079,14 @@ private enum ParakeySelfTest {
         // Import dialog copy: state the original count when entries
         // will be dropped, and warn before a cap-overflowing merge.
         try expect(
-            correctionImportCountText(sourceName: "file.superdictate-corrections",
+            correctionImportCountText(sourceName: "file.abxvoiceassist-corrections",
                                       originalCount: 3,
                                       keptCount: 3),
-            equals: "file.superdictate-corrections contains 3 corrections.",
+            equals: "file.abxvoiceassist-corrections contains 3 corrections.",
             "import count text should stay simple when nothing is dropped"
         )
         let truncatedImportText = correctionImportCountText(
-            sourceName: "big.superdictate-corrections",
+            sourceName: "big.abxvoiceassist-corrections",
             originalCount: MAX_TRANSCRIPT_CORRECTIONS + 88,
             keptCount: MAX_TRANSCRIPT_CORRECTIONS
         )
@@ -19357,7 +19357,7 @@ private enum ParakeySelfTest {
             "startup should pick up a microphone change without an extra audio restart"
         )
 
-        let suiteName = "com.local.superdictate.self-test.input.\(UUID().uuidString)"
+        let suiteName = "com.abc.abxvoiceassist.self-test.input.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             throw SelfTestFailure.failed("could not create isolated input-device defaults")
         }
@@ -19855,7 +19855,7 @@ private enum ParakeySelfTest {
                                        httpVersion: nil,
                                        headerFields: nil)!
         let releaseData = Data(
-            #"{"tag_name":"v9.8.7","body":"Notes","html_url":"https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7"}"#.utf8
+            #"{"tag_name":"v9.8.7","body":"Notes","html_url":"https://github.com/AbcCdx/ABX-Voice-Assist/releases/tag/v9.8.7"}"#.utf8
         )
 
         try expect(
@@ -19863,7 +19863,7 @@ private enum ParakeySelfTest {
             equals: .success(GitHubRelease(tagName: "v9.8.7",
                                            version: "9.8.7",
                                            body: "Notes",
-                                           htmlURL: "https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7")),
+                                           htmlURL: "https://github.com/AbcCdx/ABX-Voice-Assist/releases/tag/v9.8.7")),
             "update parsing should decode typed GitHub release payloads"
         )
         try expect(
@@ -19882,7 +19882,7 @@ private enum ParakeySelfTest {
         )
         let oversizedReleaseData = Data(
             """
-            {"tag_name":"v9.8.7","body":"\(String(repeating: "x", count: UpdateCheck.maxReleaseResponseBytes))","html_url":"https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7"}
+            {"tag_name":"v9.8.7","body":"\(String(repeating: "x", count: UpdateCheck.maxReleaseResponseBytes))","html_url":"https://github.com/AbcCdx/ABX-Voice-Assist/releases/tag/v9.8.7"}
             """.utf8
         )
         try expect(
@@ -19953,7 +19953,7 @@ private enum ParakeySelfTest {
         )
         try expect(
             UpdateCheck.parseLatest(
-                data: Data(#"{"tag_name":"v9.8.7","html_url":"https://github.com/shlgd/SuperDictate/releases/tag/v9.8.8"}"#.utf8),
+                data: Data(#"{"tag_name":"v9.8.7","html_url":"https://github.com/AbcCdx/ABX-Voice-Assist/releases/tag/v9.8.8"}"#.utf8),
                 response: ok
             ),
             equals: .success(GitHubRelease(tagName: "v9.8.7",
@@ -20005,19 +20005,19 @@ private enum ParakeySelfTest {
             "stored app version normalization should reject oversized numeric components"
         )
         try expect(
-            UpdateCheck.sanitizedReleaseURL("http://github.com/shlgd/SuperDictate/releases/tag/v9.8.7",
+            UpdateCheck.sanitizedReleaseURL("http://github.com/AbcCdx/ABX-Voice-Assist/releases/tag/v9.8.7",
                                             expectedTag: "v9.8.7"),
             equals: GITHUB_RELEASES_PAGE.absoluteString,
             "release URL sanitizing should require HTTPS"
         )
         try expect(
-            UpdateCheck.sanitizedReleaseURL("https://user@github.com/shlgd/SuperDictate/releases/tag/v9.8.7",
+            UpdateCheck.sanitizedReleaseURL("https://user@github.com/AbcCdx/ABX-Voice-Assist/releases/tag/v9.8.7",
                                             expectedTag: "v9.8.7"),
             equals: GITHUB_RELEASES_PAGE.absoluteString,
             "release URL sanitizing should reject userinfo"
         )
         try expect(
-            UpdateCheck.sanitizedReleaseURL("https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7?download=1",
+            UpdateCheck.sanitizedReleaseURL("https://github.com/AbcCdx/ABX-Voice-Assist/releases/tag/v9.8.7?download=1",
                                             expectedTag: "v9.8.7"),
             equals: GITHUB_RELEASES_PAGE.absoluteString,
             "release URL sanitizing should reject query strings"
@@ -20216,7 +20216,7 @@ private enum ParakeySelfTest {
                                         brewPath: "/opt/homebrew/bin/brew",
                                         targetVersion: "9.8.7",
                                         statePath: "/tmp/parakey-update.state",
-                                        appPath: "/Applications/SuperDictate.app",
+                                        appPath: "/Applications/ABX Voice Assist.app",
                                         releasesPageURL: "https://example.test/releases")
         for fragment in [
             "umask 077",
@@ -20228,9 +20228,9 @@ private enum ParakeySelfTest {
             "/bin/rm -f \"$SCRIPT_PATH\"",
             "printf '[%s] %s\\n' \"$(timestamp)\" \"$*\"",
             "printf '%s\\t%s\\n' \"$phase\" \"$message\" >\"$tmp\"",
-            "CASK_TAP='shlgd/superdictate'",
-            "CASK_TOKEN='shlgd/superdictate/superdictate'",
-            "CASK_INSTALLED_TOKEN='parakey'",
+            "CASK_TAP='AbcCdx/ABX-Voice-Assist'",
+            "CASK_TOKEN='AbcCdx/ABX-Voice-Assist/abx-voice-assist'",
+            "CASK_INSTALLED_TOKEN='abx-voice-assist'",
             "PlistBuddy -c \"Print :CFBundleShortVersionString\"",
             "version_at_least \"$installed\" \"$TARGET_VERSION\"",
             "state \"preparing\" \"Preparing Homebrew for Parakey v$TARGET_VERSION...\"",
@@ -20259,32 +20259,32 @@ private enum ParakeySelfTest {
         let directScript = superDictateDirectUpdateHelperScript(
             pid: 123,
             targetVersion: "9.8.7",
-            statePath: "/tmp/superdictate-update.state",
-            stagedAppPath: "/tmp/work/release/SuperDictate.app",
+            statePath: "/tmp/abxvoiceassist-update.state",
+            stagedAppPath: "/tmp/work/release/ABX Voice Assist.app",
             workDirectory: "/tmp/work",
-            backupAppPath: "/Applications/.SuperDictate-update-backup-test.app",
-            appPath: "/Applications/SuperDictate.app",
+            backupAppPath: "/Applications/.ABX Voice Assist-update-backup-test.app",
+            appPath: "/Applications/ABX Voice Assist.app",
             language: .english
         )
         for fragment in [
             "PANEL_PID=123",
             "TARGET_VERSION='9.8.7'",
-            "STAGED_APP='/tmp/work/release/SuperDictate.app'",
-            "BACKUP_APP='/Applications/.SuperDictate-update-backup-test.app'",
+            "STAGED_APP='/tmp/work/release/ABX Voice Assist.app'",
+            "BACKUP_APP='/Applications/.ABX Voice Assist-update-backup-test.app'",
             "wait_for_panel_exit || rollback",
             "launchctl bootout \"$SERVICE\"",
             "/bin/mv \"$APP_PATH\" \"$BACKUP_APP\" || rollback",
             "/usr/bin/ditto \"$STAGED_APP\" \"$APP_PATH\" || rollback",
             "/usr/bin/codesign --verify --deep --strict \"$APP_PATH\"",
             "if [ -d \"$BACKUP_APP\" ]; then",
-            "state \"complete\" 'SuperDictate v9.8.7 is installed.'",
+            "state \"complete\" 'ABX Voice Assist v9.8.7 is installed.'",
         ] {
             guard directScript.contains(fragment) else {
                 throw SelfTestFailure.failed("direct update helper missing fragment: \(fragment)")
             }
         }
         let directTmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("superdictate-direct-update-self-test-\(UUID().uuidString).sh")
+            .appendingPathComponent("abxvoiceassist-direct-update-self-test-\(UUID().uuidString).sh")
         try directScript.write(to: directTmp, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: directTmp) }
         let directProc = Process()
@@ -20380,7 +20380,7 @@ private enum ParakeySelfTest {
             "update helper script writer should leave symlink targets untouched"
         )
 
-        let preferredLog = helperRoot.appendingPathComponent("SuperDictate-update.log")
+        let preferredLog = helperRoot.appendingPathComponent("ABX Voice Assist-update.log")
         let helperLog = try openPrivateUpdateHelperLog(preferredPath: preferredLog.path,
                                                        fallbackDirectory: helperRoot.path)
         helperLog.handle.write(Data("log\n".utf8))
@@ -20444,15 +20444,15 @@ private enum ParakeySelfTest {
     private static func testDirectUpdateReplacement() throws {
         let fileManager = FileManager.default
         let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("superdictate-update-replacement-test-\(UUID().uuidString)",
+            .appendingPathComponent("abxvoiceassist-update-replacement-test-\(UUID().uuidString)",
                                     isDirectory: true)
         let applications = root.appendingPathComponent("Applications", isDirectory: true)
-        let currentApp = applications.appendingPathComponent("SuperDictate.app", isDirectory: true)
+        let currentApp = applications.appendingPathComponent("ABX Voice Assist.app", isDirectory: true)
         let workDirectory = root.appendingPathComponent("work", isDirectory: true)
         let stagedApp = workDirectory
             .appendingPathComponent("release", isDirectory: true)
-            .appendingPathComponent("SuperDictate.app", isDirectory: true)
-        let backupApp = applications.appendingPathComponent(".SuperDictate-update-backup.app",
+            .appendingPathComponent("ABX Voice Assist.app", isDirectory: true)
+        let backupApp = applications.appendingPathComponent(".ABX Voice Assist-update-backup.app",
                                                              isDirectory: true)
         let statePath = root.appendingPathComponent("state.txt")
         let helperPath = root.appendingPathComponent("helper.sh")
@@ -20471,7 +20471,7 @@ private enum ParakeySelfTest {
             backupAppPath: backupApp.path,
             appPath: currentApp.path,
             language: .english,
-            agentLabel: "com.local.superdictate.self-test.\(UUID().uuidString)",
+            agentLabel: "com.abc.abxvoiceassist.self-test.\(UUID().uuidString)",
             relaunch: false
         )
         try script.write(to: helperPath, atomically: true, encoding: .utf8)
@@ -20508,14 +20508,14 @@ private enum ParakeySelfTest {
         let fileManager = FileManager.default
         let executableDirectory = appURL.appendingPathComponent("Contents/MacOS", isDirectory: true)
         try fileManager.createDirectory(at: executableDirectory, withIntermediateDirectories: true)
-        let executableURL = executableDirectory.appendingPathComponent("SuperDictate")
+        let executableURL = executableDirectory.appendingPathComponent("ABXVoiceAssist")
         try fileManager.copyItem(at: sourceExecutable, to: executableURL)
         try fileManager.setAttributes([.posixPermissions: 0o755],
                                       ofItemAtPath: executableURL.path)
         let info: [String: Any] = [
-            "CFBundleExecutable": "SuperDictate",
-            "CFBundleIdentifier": "com.local.superdictate",
-            "CFBundleName": "SuperDictate",
+            "CFBundleExecutable": "ABXVoiceAssist",
+            "CFBundleIdentifier": "com.abc.abxvoiceassist",
+            "CFBundleName": "ABX Voice Assist",
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": version,
             "CFBundleVersion": "1",
@@ -20582,7 +20582,7 @@ private enum ParakeySelfTest {
             .appendingPathComponent("\(UPDATE_PROGRESS_APP_PREFIX)test.app")
         try expect(isSafeUpdateProgressCleanupPath(safeCleanupPath), equals: true,
                    "update progress cleanup should allow copied temp app bundles")
-        try expect(isSafeUpdateProgressCleanupPath("/Applications/SuperDictate.app"), equals: false,
+        try expect(isSafeUpdateProgressCleanupPath("/Applications/ABX Voice Assist.app"), equals: false,
                    "update progress cleanup should reject non-temp app bundles")
         let unsafeTempPath = (NSTemporaryDirectory() as NSString)
             .appendingPathComponent("Parakey.app")
@@ -20722,7 +20722,7 @@ private enum ParakeySelfTest {
         )
 
         let recoveryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("superdictate-recovery-test-\(UUID().uuidString)")
+            .appendingPathComponent("abxvoiceassist-recovery-test-\(UUID().uuidString)")
             .appendingPathExtension("sdaudio")
         defer { try? FileManager.default.removeItem(at: recoveryURL) }
         let expectedSamples: [Float] = [-0.75, -0.125, 0, 0.25, 0.875]
@@ -21986,7 +21986,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                               styleMask: [.titled, .closable, .miniaturizable],
                               backing: .buffered,
                               defer: false)
-        window.title = "SuperDictate"
+        window.title = "ABX Voice Assist"
         window.contentMinSize = NSSize(width: 520, height: 310)
         window.contentMaxSize = NSSize(width: 520, height: 310)
         window.isReleasedWhenClosed = false
@@ -22018,10 +22018,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         guard force || fingerprint != lastRenderFingerprint else { return }
         lastRenderFingerprint = fingerprint
         resizeCompactPanel(window)
-        window.title = t("SuperDictate — панель управления", "SuperDictate — Control Panel")
+        window.title = t("ABX Voice Assist — панель управления", "ABX Voice Assist — Control Panel")
         window.contentView = makeContentView()
         if let settingsWindow, settingsWindow.isVisible {
-            settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
+            settingsWindow.title = t("Настройки ABX Voice Assist", "ABX Voice Assist Settings")
         }
     }
 
@@ -22292,7 +22292,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 1
-        text.addArrangedSubview(panelLabel("SuperDictate", size: 20, weight: .semibold))
+        text.addArrangedSubview(panelLabel("ABX Voice Assist", size: 20, weight: .semibold))
         text.addArrangedSubview(panelLabel(
             t("Локальная диктовка · работает в фоне", "Local dictation · runs in the background"),
             size: 11.5,
@@ -22301,7 +22301,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         let version = panelLabel("v\(currentBundleVersion())", size: 11, color: .tertiaryLabelColor)
         version.setContentHuggingPriority(.required, for: .horizontal)
-        version.toolTip = t("Установленная версия SuperDictate", "Installed SuperDictate version")
+        version.toolTip = t("Установленная версия ABX Voice Assist", "Installed ABX Voice Assist version")
 
         let languageControl = NSSegmentedControl(labels: ["RU", "EN"],
                                                  trackingMode: .selectOne,
@@ -22504,8 +22504,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 size: 11,
                 color: .secondaryLabelColor
             )
-            ready.toolTip = t("SuperDictate получил все три необходимых разрешения macOS.",
-                              "SuperDictate has all three required macOS permissions.")
+            ready.toolTip = t("ABX Voice Assist получил все три необходимых разрешения macOS.",
+                              "ABX Voice Assist has all three required macOS permissions.")
             content.addArrangedSubview(ready)
         } else {
             for permission in missing {
@@ -22592,7 +22592,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     nil, nil, false, nil)
         case .upToDate:
             return ("checkmark.circle.fill", .systemGreen,
-                    t("SuperDictate актуален", "SuperDictate is up to date"),
+                    t("ABX Voice Assist актуален", "ABX Voice Assist is up to date"),
                     t("Установлена последняя версия v\(currentBundleVersion())",
                       "Latest version v\(currentBundleVersion()) is installed"),
                     t("Проверить", "Check"), #selector(updateButtonClicked(_:)), true,
@@ -22603,8 +22603,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     t("Скачается, проверится и установится автоматически",
                       "Downloads, verifies, and installs automatically"),
                     t("Обновить", "Update"), #selector(updateButtonClicked(_:)), serviceOperation == nil,
-                    t("Обновить SuperDictate до v\(release.version) одной кнопкой",
-                      "Update SuperDictate to v\(release.version) with one click"))
+                    t("Обновить ABX Voice Assist до v\(release.version) одной кнопкой",
+                      "Update ABX Voice Assist to v\(release.version) with one click"))
         case .preparing(let version, let phase):
             return ("arrow.down.circle", .systemBlue,
                     t("Обновляю до v\(version)", "Updating to v\(version)"),
@@ -22741,7 +22741,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .httpStatus(let code):
             return "GitHub вернул ошибку HTTP \(code). Повторите попытку позже."
         case .unexpectedResponse:
-            return "GitHub вернул ответ, который SuperDictate не смог проверить."
+            return "GitHub вернул ответ, который ABX Voice Assist не смог проверить."
         }
     }
 
@@ -22795,7 +22795,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let helperLog = try openPrivateUpdateHelperLog()
         let appURL = Bundle.main.bundleURL
         let backupURL = appURL.deletingLastPathComponent()
-            .appendingPathComponent(".SuperDictate-update-backup-\(UUID().uuidString).app",
+            .appendingPathComponent(".ABX Voice Assist-update-backup-\(UUID().uuidString).app",
                                     isDirectory: true)
         let script = superDictateDirectUpdateHelperScript(
             pid: getpid(),
@@ -23331,8 +23331,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             enabled: serviceOperation == nil && !dictationInProgress,
             toolTip: dictationInProgress
                 ? t("Сначала завершите текущую диктовку.", "Finish the current dictation first.")
-                : t("Отозвать разрешения SuperDictate после дополнительного подтверждения.",
-                    "Revoke SuperDictate permissions after an additional confirmation.")
+                : t("Отозвать разрешения ABX Voice Assist после дополнительного подтверждения.",
+                    "Revoke ABX Voice Assist permissions after an additional confirmation.")
         )
         reset.setContentHuggingPriority(.required, for: .horizontal)
 
@@ -23949,7 +23949,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             backing: .buffered,
             defer: false
         )
-        settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
+        settingsWindow.title = t("Настройки ABX Voice Assist", "ABX Voice Assist Settings")
         settingsWindow.contentMinSize = NSSize(width: 680, height: contentHeight)
         settingsWindow.contentMaxSize = NSSize(width: 680, height: contentHeight)
         settingsWindow.isReleasedWhenClosed = false
@@ -24352,8 +24352,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         let confirmation = NSAlert()
         confirmation.alertStyle = .critical
-        confirmation.messageText = t("Сбросить разрешения SuperDictate?",
-                                     "Reset SuperDictate Permissions?")
+        confirmation.messageText = t("Сбросить разрешения ABX Voice Assist?",
+                                     "Reset ABX Voice Assist Permissions?")
         confirmation.informativeText = t(
             "Микрофон, Универсальный доступ и Мониторинг ввода будут отозваны. Используйте это только для восстановления сломанных разрешений; затем их нужно выдать заново.",
             "Microphone, Accessibility, and Input Monitoring access will be revoked. Use this only to recover stuck permissions; all three must then be granted again."
@@ -24427,7 +24427,7 @@ private func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
           let duration = TimeInterval(arguments[2]),
           duration > 0,
           duration <= 15 else {
-        fputs("usage: SuperDictate --diagnose-audio-capture <device-uid|default> <seconds>\n",
+        fputs("usage: ABX Voice Assist --diagnose-audio-capture <device-uid|default> <seconds>\n",
               stderr)
         return EXIT_FAILURE
     }
@@ -24465,7 +24465,7 @@ if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) 
     exit(diagnosticResult)
 } else if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
     guard launchArguments.count == 2 else {
-        fputs("usage: SuperDictate --export-hud-animation <frames-directory>\n", stderr)
+        fputs("usage: ABX Voice Assist --export-hud-animation <frames-directory>\n", stderr)
         exit(EXIT_FAILURE)
     }
     do {

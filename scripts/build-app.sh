@@ -3,15 +3,15 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUTPUT_APP="${1:-$ROOT_DIR/dist/SuperDictate.app}"
+OUTPUT_APP="${1:-$ROOT_DIR/dist/ABX Voice Assist.app}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 say() {
-    printf 'SuperDictate: %s\n' "$*"
+    printf 'ABX Voice Assist: %s\n' "$*"
 }
 
 fail() {
-    printf 'SuperDictate: %s\n' "$*" >&2
+    printf 'ABX Voice Assist: %s\n' "$*" >&2
     exit 1
 }
 
@@ -53,17 +53,17 @@ BIN_DIR="$(swift build -c release --package-path "$ROOT_DIR/swift" --show-bin-pa
 BIN="$BIN_DIR/Parakey"
 [[ -x "$BIN" ]] || fail "The Swift build did not produce $BIN"
 
-STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/superdictate-build.XXXXXX")"
+STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/abxvoiceassist-build.XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
-STAGE_APP="$STAGE_DIR/SuperDictate.app"
+STAGE_APP="$STAGE_DIR/ABX Voice Assist.app"
 
 mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources"
-cp "$BIN" "$STAGE_APP/Contents/MacOS/SuperDictate"
+cp "$BIN" "$STAGE_APP/Contents/MacOS/ABXVoiceAssist"
 cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"
-chmod 755 "$STAGE_APP/Contents/MacOS/SuperDictate"
+chmod 755 "$STAGE_APP/Contents/MacOS/ABXVoiceAssist"
 
 SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime
            --entitlements "$ROOT_DIR/entitlements.plist")

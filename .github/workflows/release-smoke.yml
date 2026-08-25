@@ -14,15 +14,15 @@ jobs:
     steps:
       - name: Install from the public command
         run: |
-          curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | \
-            SUPERDICTATE_NO_OPEN=1 bash
+          curl -fsSL https://raw.githubusercontent.com/AbcCdx/ABX-Voice-Assist/main/install.sh | \
+            ABX_VOICE_ASSIST_NO_OPEN=1 bash
       - name: Verify installed release
         run: |
-          test -x /Applications/SuperDictate.app/Contents/MacOS/SuperDictate
-          test "$(plutil -extract CFBundleIdentifier raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "com.local.superdictate"
-          test "$(plutil -extract CFBundleShortVersionString raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "0.2.40"
-          file /Applications/SuperDictate.app/Contents/MacOS/SuperDictate | grep -q arm64
-          codesign --verify --deep --strict /Applications/SuperDictate.app
-          codesign -d --entitlements :- /Applications/SuperDictate.app > "$RUNNER_TEMP/entitlements.plist" 2>/dev/null
+          test -x /Applications/ABX Voice Assist.app/Contents/MacOS/ABXVoiceAssist
+          test "$(plutil -extract CFBundleIdentifier raw -o - /Applications/ABX Voice Assist.app/Contents/Info.plist)" = "com.abc.abxvoiceassist"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - /Applications/ABX Voice Assist.app/Contents/Info.plist)" = "0.2.40"
+          file /Applications/ABX Voice Assist.app/Contents/MacOS/ABXVoiceAssist | grep -q arm64
+          codesign --verify --deep --strict /Applications/ABX Voice Assist.app
+          codesign -d --entitlements :- /Applications/ABX Voice Assist.app > "$RUNNER_TEMP/entitlements.plist" 2>/dev/null
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$RUNNER_TEMP/entitlements.plist")" = "true"
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.microphone' "$RUNNER_TEMP/entitlements.plist")" = "true"

@@ -3,19 +3,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_PATH="/Applications/SuperDictate.app"
-AGENT_LABEL="com.local.superdictate.agent"
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/superdictate-local-install.XXXXXX")"
-STAGED_APP="$WORK_DIR/SuperDictate.app"
-INCOMING="/Applications/.SuperDictate.incoming.$$"
-BACKUP="/Applications/.SuperDictate.previous.$$"
+APP_PATH="/Applications/ABX Voice Assist.app"
+AGENT_LABEL="com.abc.abxvoiceassist.agent"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/abxvoiceassist-local-install.XXXXXX")"
+STAGED_APP="$WORK_DIR/ABX Voice Assist.app"
+INCOMING="/Applications/.ABX-Voice-Assist.incoming.$$"
+BACKUP="/Applications/.ABX-Voice-Assist.previous.$$"
 
 cleanup() {
     rm -rf "$WORK_DIR" "$INCOMING"
 }
 trap cleanup EXIT
 
-identity="${SUPERDICTATE_SIGN_IDENTITY:-}"
+identity="${ABX_VOICE_ASSIST_SIGN_IDENTITY:-}"
 if [[ -z "$identity" && -d "$APP_PATH" ]]; then
     identity="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1 \
         | sed -n 's/^Authority=\(Apple Development:.*\)$/\1/p' \
@@ -27,8 +27,8 @@ if [[ -z "$identity" ]]; then
         | head -n 1)"
 fi
 if [[ -z "$identity" ]]; then
-    printf 'SuperDictate: no Apple Development signing identity was found.\n' >&2
-    printf 'Set SUPERDICTATE_SIGN_IDENTITY explicitly; ad-hoc local installs are disabled because they reset macOS permissions.\n' >&2
+    printf 'ABX Voice Assist: no Apple Development signing identity was found.\n' >&2
+    printf 'Set ABX_VOICE_ASSIST_SIGN_IDENTITY explicitly; ad-hoc local installs are disabled because they reset macOS permissions.\n' >&2
     exit 1
 fi
 
@@ -37,22 +37,22 @@ SIGN_IDENTITY="$identity" "$ROOT_DIR/scripts/build-app.sh" "$STAGED_APP"
 codesign --verify --deep --strict "$STAGED_APP"
 identifier="$(codesign -d --verbose=4 "$STAGED_APP" 2>&1 \
     | sed -n 's/^Identifier=//p')"
-[[ "$identifier" == "com.local.superdictate" ]] || {
-    printf 'SuperDictate: unexpected bundle identifier: %s\n' "$identifier" >&2
+[[ "$identifier" == "com.abc.abxvoiceassist" ]] || {
+    printf 'ABX Voice Assist: unexpected bundle identifier: %s\n' "$identifier" >&2
     exit 1
 }
 if [[ -d "$APP_PATH" ]]; then
     installed_requirement="$(codesign -d -r- "$APP_PATH" 2>&1 | tail -n 1)"
     staged_requirement="$(codesign -d -r- "$STAGED_APP" 2>&1 | tail -n 1)"
     [[ "$installed_requirement" == "$staged_requirement" ]] || {
-        printf 'SuperDictate: refusing to change the installed signing identity because that would reset macOS permissions.\n' >&2
+        printf 'ABX Voice Assist: refusing to change the installed signing identity because that would reset macOS permissions.\n' >&2
         exit 1
     }
 fi
 
 uid="$(id -u)"
 launchctl bootout "gui/$uid/$AGENT_LABEL" >/dev/null 2>&1 || true
-pkill -f '/Applications/SuperDictate.app/Contents/MacOS/SuperDictate' >/dev/null 2>&1 || true
+pkill -f '/Applications/ABX Voice Assist.app/Contents/MacOS/ABXVoiceAssist' >/dev/null 2>&1 || true
 
 ditto "$STAGED_APP" "$INCOMING"
 codesign --verify --deep --strict "$INCOMING"
@@ -71,4 +71,4 @@ rm -rf "$BACKUP"
 launchctl bootstrap "gui/$uid" "$HOME/Library/LaunchAgents/$AGENT_LABEL.plist" >/dev/null 2>&1 || true
 launchctl kickstart -k "gui/$uid/$AGENT_LABEL"
 
-printf 'SuperDictate: installed one signed app at %s and restarted the background agent.\n' "$APP_PATH"
+printf 'ABX Voice Assist: installed one signed app at %s and restarted the background agent.\n' "$APP_PATH"
