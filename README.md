@@ -189,6 +189,12 @@ swift run -c debug --package-path swift Parakey --self-test all
 open ./dist/ABX Voice Assist.app
 ```
 
+Для установки повторных локальных сборок используйте только
+`scripts/install-local.sh`. Он выбирает действующую Apple Development identity,
+закрепляет designated requirement за Team ID и запрещает ad-hoc замену, которая
+сбрасывает разрешения macOS. Продление сертификата внутри того же Team ID не
+меняет identity приложения для системных разрешений.
+
 По умолчанию локальная сборка подписывается ad-hoc. Чтобы использовать свой
 сертификат, передайте его имя:
 

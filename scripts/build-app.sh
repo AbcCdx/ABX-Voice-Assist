@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_APP="${1:-$ROOT_DIR/dist/ABX Voice Assist.app}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+SIGN_REQUIREMENT="${SIGN_REQUIREMENT:-}"
 
 say() {
     printf 'ABX Voice Assist: %s\n' "$*"
@@ -68,6 +69,9 @@ chmod 755 "$STAGE_APP/Contents/MacOS/ABXVoiceAssist"
 
 SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime
            --entitlements "$ROOT_DIR/entitlements.plist")
+if [[ -n "$SIGN_REQUIREMENT" ]]; then
+    SIGN_ARGS+=(--requirements "$SIGN_REQUIREMENT")
+fi
 if [[ "$SIGN_IDENTITY" == "-" ]]; then
     SIGN_ARGS+=(--timestamp=none)
 else

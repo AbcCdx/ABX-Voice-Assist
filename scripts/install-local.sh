@@ -16,6 +16,11 @@ cleanup() {
 trap cleanup EXIT
 
 identity="${ABX_VOICE_ASSIST_SIGN_IDENTITY:-}"
+allow_signing_migration="${ABX_VOICE_ASSIST_ALLOW_SIGNING_MIGRATION:-0}"
+if [[ "$identity" == "-" ]]; then
+    printf 'ABX Voice Assist: ad-hoc local installation is disabled because it resets macOS permissions.\n' >&2
+    exit 1
+fi
 valid_identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
 if [[ -z "$identity" && -d "$APP_PATH" ]]; then
     installed_identity="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1 \
@@ -36,7 +41,18 @@ if [[ -z "$identity" ]]; then
     exit 1
 fi
 
-SIGN_IDENTITY="$identity" "$ROOT_DIR/scripts/build-app.sh" "$STAGED_APP"
+certificate_subject="$(security find-certificate -c "$identity" -p 2>/dev/null \
+    | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null || true)"
+team_identifier="$(printf '%s\n' "$certificate_subject" \
+    | sed -n 's/.*OU=\([A-Z0-9]*\).*/\1/p')"
+[[ "$team_identifier" =~ ^[A-Z0-9]{10}$ ]] || {
+    printf 'ABX Voice Assist: could not determine the Apple Development Team ID.\n' >&2
+    exit 1
+}
+sign_requirement="=designated => identifier \"com.abc.abxvoiceassist\" and anchor apple generic and certificate leaf[subject.OU] = \"$team_identifier\""
+
+SIGN_IDENTITY="$identity" SIGN_REQUIREMENT="$sign_requirement" \
+    "$ROOT_DIR/scripts/build-app.sh" "$STAGED_APP"
 
 codesign --verify --deep --strict "$STAGED_APP"
 identifier="$(codesign -d --verbose=4 "$STAGED_APP" 2>&1 \
@@ -45,15 +61,28 @@ identifier="$(codesign -d --verbose=4 "$STAGED_APP" 2>&1 \
     printf 'ABX Voice Assist: unexpected bundle identifier: %s\n' "$identifier" >&2
     exit 1
 }
+staged_team_identifier="$(codesign -d --verbose=4 "$STAGED_APP" 2>&1 \
+    | sed -n 's/^TeamIdentifier=//p')"
+[[ "$staged_team_identifier" == "$team_identifier" ]] || {
+    printf 'ABX Voice Assist: staged Team ID does not match the signing certificate.\n' >&2
+    exit 1
+}
 if [[ -d "$APP_PATH" ]]; then
     installed_requirement="$(codesign -d -r- "$APP_PATH" 2>&1 | tail -n 1)"
     staged_requirement="$(codesign -d -r- "$STAGED_APP" 2>&1 | tail -n 1)"
-    [[ "$installed_requirement" == "$staged_requirement" || "$identity" == "-" ]] || {
+    installed_signature="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1 \
+        | sed -n 's/^Signature=//p' \
+        | head -n 1)"
+    migration_is_allowed=false
+    if [[ "$allow_signing_migration" == "1" && "$installed_signature" == "adhoc" ]]; then
+        migration_is_allowed=true
+    fi
+    [[ "$installed_requirement" == "$staged_requirement" || "$migration_is_allowed" == true ]] || {
         printf 'ABX Voice Assist: refusing to change the installed signing identity because that would reset macOS permissions.\n' >&2
         exit 1
     }
-    if [[ "$identity" == "-" && "$installed_requirement" != "$staged_requirement" ]]; then
-        printf 'ABX Voice Assist: replacing the installed app with the explicitly requested ad-hoc signature.\n'
+    if [[ "$migration_is_allowed" == true && "$installed_requirement" != "$staged_requirement" ]]; then
+        printf 'ABX Voice Assist: performing the one-time migration from ad-hoc to Apple Development signing.\n'
     fi
 fi
 

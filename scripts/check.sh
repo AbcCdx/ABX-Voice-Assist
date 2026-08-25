@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-bash -n install.sh uninstall.sh scripts/build-app.sh scripts/check.sh
+bash -n install.sh uninstall.sh scripts/build-app.sh scripts/check.sh scripts/install-local.sh
 plutil -lint swift/Info.plist entitlements.plist
 
 app_version="$(plutil -extract CFBundleShortVersionString raw -o - swift/Info.plist)"
@@ -38,6 +38,10 @@ grep -q 'sysctl.proc_translated' install.sh
 grep -q 'is_apple_silicon' install.sh
 grep -q 'Restarting the build natively for Apple Silicon' scripts/build-app.sh
 grep -q 'validate_output_app_path "$OUTPUT_APP"' scripts/build-app.sh
+grep -q 'SIGN_REQUIREMENT' scripts/build-app.sh
+grep -q 'ad-hoc local installation is disabled' scripts/install-local.sh
+grep -q 'ABX_VOICE_ASSIST_ALLOW_SIGNING_MIGRATION' scripts/install-local.sh
+grep -q 'certificate leaf\[subject.OU\]' scripts/install-local.sh
 
 git diff --check
 printf 'ABX Voice Assist checks passed (v%s).\n' "$app_version"
