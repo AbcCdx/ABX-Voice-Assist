@@ -22750,37 +22750,12 @@ private final class UnifiedBackdropView: NSView {
         NSColor(calibratedRed: 0.035, green: 0.030, blue: 0.045, alpha: 1).setFill()
         bounds.fill()
 
-        if let backgroundImage,
-           backgroundImage.size.width > 0,
-           backgroundImage.size.height > 0 {
-            let scale = max(bounds.width / backgroundImage.size.width,
-                            bounds.height / backgroundImage.size.height)
-            let destinationSize = NSSize(width: backgroundImage.size.width * scale,
-                                         height: backgroundImage.size.height * scale)
-            let destination = NSRect(x: bounds.midX - destinationSize.width / 2,
-                                     y: bounds.midY - destinationSize.height / 2,
-                                     width: destinationSize.width,
-                                     height: destinationSize.height)
-            backgroundImage.draw(in: destination,
-                                 from: NSRect(origin: .zero, size: backgroundImage.size),
+        if let backgroundImage {
+            backgroundImage.draw(in: bounds,
+                                 from: .zero,
                                  operation: .sourceOver,
-                                 fraction: 1,
-                                 respectFlipped: true,
-                                 hints: [.interpolation: NSImageInterpolation.high])
+                                 fraction: 1)
         }
-    }
-}
-
-@MainActor
-private final class UnifiedSidebarView: NSView {
-    override var isOpaque: Bool { true }
-
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor(calibratedRed: 0.055,
-                green: 0.048,
-                blue: 0.065,
-                alpha: 1).setFill()
-        dirtyRect.fill()
     }
 }
 
@@ -23068,7 +23043,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func makeDesktopSidebar() -> NSView {
-        let sidebar = UnifiedSidebarView()
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .underWindowBackground
+        sidebar.blendingMode = .withinWindow
+        sidebar.state = .active
+        sidebar.wantsLayer = true
+        sidebar.layer?.backgroundColor = NSColor(calibratedWhite: 0.025, alpha: 0.42).cgColor
 
         let stack = NSStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
