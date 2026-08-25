@@ -23026,6 +23026,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         switch desktopNavigationPage {
         case 0: content = makeDesktopGeneralSettingsPage()
         case 1: content = makeDesktopHistoryPage()
+        case 5: content = makeDesktopAboutPage()
         default: content = makeDesktopPendingPage()
         }
         layout.addArrangedSubview(content)
@@ -23093,8 +23094,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                               symbol: item.1,
                                               tag: index,
                                               selected: desktopNavigationPage == index)
-            button.isEnabled = index <= 1
-            if index > 1 {
+            button.isEnabled = index <= 1 || index == 5
+            if index > 1 && index < 5 {
                 button.toolTip = t("Будет перенесено на следующем этапе.",
                                    "Will be migrated in the next stage.")
             }
@@ -23304,6 +23305,163 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             }
         }
         return desktopSettingsScroll(stack)
+    }
+
+    private func makeDesktopAboutPage() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 24
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 30, bottom: 30, right: 30)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        stack.addArrangedSubview(panelLabel(t("О ПРОГРАММЕ", "ABOUT"),
+                                             size: 13,
+                                             weight: .medium,
+                                             color: unifiedMutedTextColor))
+        stack.addArrangedSubview(settingsSection(t("ПРИЛОЖЕНИЕ", "APPLICATION"), rows: [
+            aboutLanguageRow(),
+            aboutValueRow(title: t("Тема приложения", "App theme"),
+                          value: t("Тёмная", "Dark"),
+                          toolTip: t("Интерфейс ABX сейчас использует постоянную тёмную тему.",
+                                     "ABX currently uses a fixed dark appearance.")),
+            aboutValueRow(title: t("Версия", "Version"),
+                          value: "v\(currentBundleVersion())",
+                          monospaced: true),
+            aboutUpdateChecksRow(),
+            aboutActionRow(title: t("Поддержка", "Support"),
+                           buttonTitle: t("Сообщить о проблеме", "Report an issue"),
+                           action: #selector(openProjectSupportClicked(_:))),
+            aboutActionRow(title: t("Исходный код", "Source code"),
+                           buttonTitle: t("Посмотреть на GitHub", "View on GitHub"),
+                           action: #selector(openProjectGitHubClicked(_:))),
+            aboutDirectoryRow(title: t("Каталог данных приложения", "Application data directory"),
+                              url: applicationSupportDirectoryURL,
+                              action: #selector(openApplicationSupportDirectoryClicked(_:))),
+            aboutDirectoryRow(title: t("Каталог журналов", "Logs directory"),
+                              url: logsDirectoryURL,
+                              action: #selector(openLogsDirectoryClicked(_:))),
+        ]))
+
+        let privacy = panelLabel(
+            t("Локальная диктовка без телеметрии. Основано на открытом проекте Parakey, лицензия MIT.",
+              "Local dictation without telemetry. Based on the open-source Parakey project, MIT licensed."),
+            size: 11.5,
+            color: unifiedMutedTextColor
+        )
+        privacy.preferredMaxLayoutWidth = 650
+        stack.addArrangedSubview(privacy)
+        return desktopSettingsScroll(stack)
+    }
+
+    private func aboutLanguageRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        row.addArrangedSubview(panelLabel(t("Язык приложения", "App language"),
+                                          size: 13,
+                                          weight: .semibold))
+        row.addArrangedSubview(NSView())
+        let control = NSSegmentedControl(labels: ["RU", "EN"],
+                                         trackingMode: .selectOne,
+                                         target: self,
+                                         action: #selector(selectInterfaceLanguage(_:)))
+        control.selectedSegment = language == .russian ? 0 : 1
+        control.toolTip = t("Язык всего интерфейса ABX Voice Assist.",
+                            "Language used throughout ABX Voice Assist.")
+        row.addArrangedSubview(control)
+        return row
+    }
+
+    private func aboutValueRow(title: String,
+                               value: String,
+                               monospaced: Bool = false,
+                               toolTip: String? = nil) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        row.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
+        row.addArrangedSubview(NSView())
+        let label = panelLabel(value, size: 13, color: .secondaryLabelColor)
+        if monospaced {
+            label.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        }
+        label.toolTip = toolTip
+        row.addArrangedSubview(label)
+        return row
+    }
+
+    private func aboutUpdateChecksRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        row.addArrangedSubview(panelLabel(t("Проверять обновления", "Check for updates"),
+                                          size: 13,
+                                          weight: .semibold))
+        row.addArrangedSubview(NSView())
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleDesktopUpdateChecks(_:))
+        toggle.state = settings.checkForUpdates ? .on : .off
+        toggle.toolTip = t("Периодически проверять новые версии на GitHub.",
+                           "Periodically check GitHub for new versions.")
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func aboutActionRow(title: String,
+                                buttonTitle: String,
+                                action: Selector) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        row.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
+        row.addArrangedSubview(NSView())
+        let button = panelButton(buttonTitle, action: action)
+        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 170).isActive = true
+        row.addArrangedSubview(button)
+        return row
+    }
+
+    private func aboutDirectoryRow(title: String,
+                                   url: URL,
+                                   action: Selector) -> NSView {
+        let row = NSStackView()
+        row.orientation = .vertical
+        row.alignment = .leading
+        row.spacing = 8
+        row.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
+
+        let location = NSStackView()
+        location.orientation = .horizontal
+        location.alignment = .centerY
+        location.spacing = 10
+        let path = NSTextField(labelWithString: (url.path as NSString).abbreviatingWithTildeInPath)
+        path.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
+        path.textColor = .secondaryLabelColor
+        path.lineBreakMode = .byTruncatingMiddle
+        path.maximumNumberOfLines = 1
+        path.toolTip = url.path
+        location.addArrangedSubview(path)
+        let open = panelButton(t("Открыть", "Open"), action: action)
+        open.widthAnchor.constraint(equalToConstant: 92).isActive = true
+        location.addArrangedSubview(open)
+        row.addArrangedSubview(location)
+        location.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
+        return row
+    }
+
+    private var applicationSupportDirectoryURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(APP_SUPPORT_DIR_NAME, isDirectory: true)
+    }
+
+    private var logsDirectoryURL: URL {
+        Logger.shared.fileURL.deletingLastPathComponent()
     }
 
     private func desktopSettingsScroll(_ stack: NSStackView) -> NSView {
@@ -23746,6 +23904,39 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         desktopNavigationPage = sender.tag
         lastRenderFingerprint = ""
         refresh(force: true)
+    }
+
+    @objc private func toggleDesktopUpdateChecks(_ sender: NSSwitch) {
+        settings.checkForUpdates = sender.state == .on
+        if settings.checkForUpdates {
+            checkForUpdates()
+        } else {
+            updateTask?.cancel()
+            updateTask = nil
+            updateState = .upToDate(currentBundleVersion())
+            lastRenderFingerprint = ""
+            refresh(force: true)
+        }
+    }
+
+    @objc private func openProjectSupportClicked(_ sender: NSButton) {
+        NSWorkspace.shared.open(GITHUB_REPOSITORY_PAGE.appendingPathComponent("issues"))
+    }
+
+    @objc private func openProjectGitHubClicked(_ sender: NSButton) {
+        NSWorkspace.shared.open(GITHUB_REPOSITORY_PAGE)
+    }
+
+    @objc private func openApplicationSupportDirectoryClicked(_ sender: NSButton) {
+        if let directory = try? superDictateApplicationSupportDirectory() {
+            NSWorkspace.shared.open(directory)
+        }
+    }
+
+    @objc private func openLogsDirectoryClicked(_ sender: NSButton) {
+        try? FileManager.default.createDirectory(at: logsDirectoryURL,
+                                                 withIntermediateDirectories: true)
+        NSWorkspace.shared.open(logsDirectoryURL)
     }
 
     @objc private func desktopHistoryItemClicked(_ sender: NSButton) {
