@@ -22636,6 +22636,158 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
+        root.spacing = 24
+        root.edgeInsets = NSEdgeInsets(top: 28, left: 30, bottom: 28, right: 30)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addArrangedSubview(settingsSection(t("ОБЩИЕ", "GENERAL"), rows: [
+            hotkeyRow(title: t("Горячая клавиша транскрипции", "Transcription hotkey"),
+                      shortcut: draft.dictationHotkey,
+                      kind: .dictation,
+                      toolTip: t("Удерживайте эту клавишу, чтобы записывать диктовку.",
+                                 "Hold this key to record dictation.")),
+            holdToTalkRow(),
+        ]))
+        root.addArrangedSubview(settingsSection(t("НАСТРОЙКИ PARAKEET TDT 0.6B V3", "PARAKEET TDT 0.6B V3"), rows: [
+            languageSettingsRow(),
+        ]))
+        root.addArrangedSubview(settingsSection(t("ЗВУК", "AUDIO"), rows: [
+            microphoneSettingsRow(draft),
+        ]))
+        root.addArrangedSubview(settingsSection(t("ОБРАБОТКА ТЕКСТА", "TEXT PROCESSING"), rows: [
+            removeFinalPeriodRow(draft),
+            primaryCompletionBehaviorRow(draft),
+            alternateCompletionRow(draft),
+            enterDelayRow(draft),
+        ]))
+        root.addArrangedSubview(settingsSection(t("ВНЕШНИЙ ВИД", "APPEARANCE"), rows: [
+            popupRow(title: t("Размер капсулы", "Capsule size"),
+                     detail: t("Размер плавающего индикатора записи.", "Size of the floating recording indicator."),
+                     selectedValue: draft.hudSize.rawValue,
+                     options: RecordingHUDSize.allCases.map { (localizedHUDSizeName($0), $0.rawValue) },
+                     action: #selector(selectRecordingHUDSize(_:))),
+            popupRow(title: t("Цвет записи", "Recording color"),
+                     detail: t("Цвет аудиоволн во время записи.", "Wave color while recording."),
+                     selectedValue: draft.recordingColor.rawValue,
+                     options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+                     action: #selector(selectRecordingHUDRecordingColor(_:))),
+            popupRow(title: t("Цвет транскрибации", "Transcribing color"),
+                     detail: t("Цвет анимации во время распознавания.", "Animation color while transcribing."),
+                     selectedValue: draft.transcribingColor.rawValue,
+                     options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+                     action: #selector(selectRecordingHUDTranscribingColor(_:))),
+            popupRow(title: t("Фон капсулы", "HUD background"),
+                     detail: t("Тема плавающего индикатора.", "Floating indicator theme."),
+                     selectedValue: draft.backgroundStyle.rawValue,
+                     options: RecordingHUDBackgroundStyle.allCases.map { (localizedBackgroundName($0), $0.rawValue) },
+                     action: #selector(selectRecordingHUDBackgroundStyle(_:))),
+        ]))
+        root.addArrangedSubview(settingsSection(t("РАСШИРЕННЫЕ", "ADVANCED"), rows: [
+            aiCleanupSection(draft), permissionsRecoveryRow(), settingsActionsRow(draft: draft), privacyInfoView(),
+        ]))
+        return settingsScrollBackground(root)
+    }
+
+    private func settingsScrollBackground(_ root: NSStackView) -> NSView {
+        let background = studioBackground()
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        settingsScrollView = scroll
+        let document = SettingsDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(root)
+        scroll.documentView = document
+        background.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: background.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            root.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            root.topAnchor.constraint(equalTo: document.topAnchor),
+            root.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+        ])
+        let inset = -(root.edgeInsets.left + root.edgeInsets.right)
+        for view in root.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: root.widthAnchor, constant: inset).isActive = true
+        }
+        return background
+    }
+
+    private func settingsSection(_ title: String, rows: [NSView]) -> NSView {
+        let section = NSStackView()
+        section.orientation = .vertical
+        section.alignment = .leading
+        section.spacing = 10
+        let heading = panelLabel(title, size: 11.5, weight: .medium, color: studioMutedTextColor)
+        heading.font = .monospacedSystemFont(ofSize: 11.5, weight: .medium)
+        section.addArrangedSubview(heading)
+        let card = compactCard()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for (index, row) in rows.enumerated() {
+            if index > 0 { stack.addArrangedSubview(separator()) }
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        pin(stack, inside: card, horizontal: 16, vertical: 15)
+        section.addArrangedSubview(card)
+        return section
+    }
+
+    private func holdToTalkRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        row.addArrangedSubview(panelLabel(t("Нажми и говори", "Hold to talk"), size: 13, weight: .semibold))
+        row.addArrangedSubview(NSView())
+        let toggle = NSSwitch()
+        toggle.state = .on
+        toggle.isEnabled = false
+        toggle.toolTip = t("ABX работает только при удержании клавиши. Отпускание завершает запись.",
+                           "ABX records only while the key is held; releasing it ends recording.")
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func languageSettingsRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        row.addArrangedSubview(panelLabel(t("Язык", "Language"), size: 13, weight: .semibold))
+        row.addArrangedSubview(NSView())
+        let popup = NSPopUpButton()
+        popup.target = self
+        popup.action = #selector(selectDictationLanguage(_:))
+        for value in DictationLanguage.allCases {
+            popup.addItem(withTitle: DICTATION_LANGUAGE_DISPLAY[value] ?? value.rawValue)
+            popup.lastItem?.representedObject = value.rawValue
+        }
+        popup.select(popup.itemArray.first { ($0.representedObject as? String) == settings.dictationLanguage.rawValue })
+        row.addArrangedSubview(popup)
+        return row
+    }
+
+    private func makeLegacySettingsContentView() -> NSView {
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
         root.spacing = 11
         root.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
         root.translatesAutoresizingMaskIntoConstraints = false
@@ -24570,6 +24722,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         lastRenderFingerprint = ""
         refresh(force: true)
         refreshSettingsWindow()
+    }
+
+    @objc private func selectDictationLanguage(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let value = DictationLanguage(rawValue: raw) else { return }
+        settings.dictationLanguage = value
+        _ = settings.refreshFromDisk()
+        DistributedNotificationCenter.default().postNotificationName(
+            SETTINGS_CHANGED_NOTIFICATION,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+        lastRenderFingerprint = ""
+        refresh(force: true)
     }
 
     @objc private func selectPrimaryCompletionBehavior(_ sender: NSSegmentedControl) {
