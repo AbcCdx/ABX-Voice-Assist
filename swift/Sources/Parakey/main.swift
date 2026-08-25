@@ -10800,7 +10800,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         configureStatusItemImage()
-        concealMenuBarIcon()
         setMenuBarState(.loading)
         startCorrectionSyncIfConfigured()
         rebuildMenu()
@@ -11695,12 +11694,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("statusItem: microphone symbol unavailable — text fallback")
         }
         button.toolTip = "ABX Voice Assist"
-    }
-
-    private func concealMenuBarIcon() {
-        statusItem.length = 0
-        statusItem.button?.isHidden = true
-        statusItem.button?.toolTip = nil
     }
 
     private func tintedCopy(of source: NSImage, with color: NSColor) -> NSImage {
