@@ -61,6 +61,10 @@ STAGE_APP="$STAGE_DIR/ABX Voice Assist.app"
 mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources"
 cp "$BIN" "$STAGE_APP/Contents/MacOS/ABXVoiceAssist"
 cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
+SOURCE_COMMIT="${ABX_VOICE_ASSIST_SOURCE_COMMIT:-$(git -C "$ROOT_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)}"
+if [[ -n "$SOURCE_COMMIT" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :ABXSourceCommit string $SOURCE_COMMIT" "$STAGE_APP/Contents/Info.plist"
+fi
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/abx-background-texture.png" "$STAGE_APP/Contents/Resources/"
