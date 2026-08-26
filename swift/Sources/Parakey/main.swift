@@ -5670,8 +5670,124 @@ private struct CompletedTranscriptionWorkerResult: Sendable {
     let completedAt: TimeInterval
 }
 
+private enum TranscriptLetterScript: Equatable {
+    case cyrillic
+    case latin
+    case unknown
+}
+
+private struct TranscriptScriptProfile: Equatable {
+    let cyrillicLetters: Int
+    let latinLetters: Int
+
+    var dominant: TranscriptLetterScript {
+        if cyrillicLetters >= 3, cyrillicLetters >= latinLetters * 2 {
+            return .cyrillic
+        }
+        if latinLetters >= 3, latinLetters >= cyrillicLetters * 2 {
+            return .latin
+        }
+        return .unknown
+    }
+
+    var isMixed: Bool {
+        cyrillicLetters >= 3 && latinLetters >= 3
+    }
+}
+
+private let AUTO_LANGUAGE_ALLOWED_LATIN_WORDS: Set<String> = [
+    "abx", "ablx", "voice", "assist", "ableton", "spotify",
+    "chatgpt", "codex", "swift", "macos",
+]
+
+private let COMMON_ASR_HALLUCINATIONS = [
+    "thank you", "thanks for watching", "please subscribe", "subtitles by",
+]
+
+private func transcriptScriptProfile(_ text: String) -> TranscriptScriptProfile {
+    var cyrillicLetters = 0
+    var latinLetters = 0
+    let words = text.split(whereSeparator: { !$0.isLetter })
+
+    for wordSlice in words {
+        let word = String(wordSlice)
+        var wordCyrillic = 0
+        var wordLatin = 0
+        for scalar in word.unicodeScalars {
+            switch scalar.value {
+            case 0x0400...0x052F:
+                wordCyrillic += 1
+            case 0x0041...0x005A, 0x0061...0x007A:
+                wordLatin += 1
+            default:
+                continue
+            }
+        }
+
+        let normalized = word.lowercased()
+        let isShortUppercaseName = word.count <= 8
+            && word == word.uppercased()
+            && word != word.lowercased()
+        if wordLatin > 0,
+           wordCyrillic == 0,
+           (AUTO_LANGUAGE_ALLOWED_LATIN_WORDS.contains(normalized) || isShortUppercaseName) {
+            continue
+        }
+        cyrillicLetters += wordCyrillic
+        latinLetters += wordLatin
+    }
+    return TranscriptScriptProfile(cyrillicLetters: cyrillicLetters,
+                                   latinLetters: latinLetters)
+}
+
+private func containsCommonASRHallucination(_ text: String) -> Bool {
+    let normalized = text.lowercased()
+    return COMMON_ASR_HALLUCINATIONS.contains { normalized.contains($0) }
+}
+
+private func shouldVerifyAutoTranscription(text: String, confidence: Float) -> Bool {
+    let profile = transcriptScriptProfile(text)
+    return confidence < 0.72
+        || profile.isMixed
+        || containsCommonASRHallucination(text)
+}
+
+private func autoTranscriptionCandidateScore(text: String,
+                                             confidence: Float,
+                                             preferredScript: TranscriptLetterScript) -> Float {
+    let profile = transcriptScriptProfile(text)
+    let total = profile.cyrillicLetters + profile.latinLetters
+    var score = confidence
+    if total > 0 {
+        let foreignLetters: Int
+        switch preferredScript {
+        case .cyrillic: foreignLetters = profile.latinLetters
+        case .latin: foreignLetters = profile.cyrillicLetters
+        case .unknown: foreignLetters = 0
+        }
+        score -= Float(foreignLetters) / Float(total) * 0.55
+    }
+    if containsCommonASRHallucination(text) {
+        score -= 0.35
+    }
+    return score
+}
+
+private func selectedAutoTranscriptionIndex(texts: [String],
+                                            confidences: [Float]) -> Int {
+    guard !texts.isEmpty, texts.count == confidences.count else { return 0 }
+    let preferredScript = transcriptScriptProfile(texts[0]).dominant
+    let scores = zip(texts, confidences).map {
+        autoTranscriptionCandidateScore(text: $0.0,
+                                        confidence: $0.1,
+                                        preferredScript: preferredScript)
+    }
+    guard let bestIndex = scores.indices.max(by: { scores[$0] < scores[$1] }) else { return 0 }
+    let primaryIsEmpty = texts[0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    return primaryIsEmpty || scores[bestIndex] >= scores[0] + 0.015 ? bestIndex : 0
+}
+
 actor TranscriptionWorker {
-    private static let autoVerificationConfidenceThreshold: Float = 0.72
     private static let autoVerificationLanguages: [Language] = [
         .russian, .english, .ukrainian,
     ]
@@ -5748,7 +5864,8 @@ actor TranscriptionWorker {
 
         let primary = try await transcribeOnce(samples: samples, language: language)
         guard language == nil,
-              primary.confidence < Self.autoVerificationConfidenceThreshold else {
+              shouldVerifyAutoTranscription(text: primary.text,
+                                            confidence: primary.confidence) else {
             return TranscriptionWorkerResult(
                 text: primary.text,
                 confidence: primary.confidence,
@@ -5763,14 +5880,15 @@ actor TranscriptionWorker {
         for languageHint in Self.autoVerificationLanguages {
             attempts.append(try await transcribeOnce(samples: samples, language: languageHint))
         }
-        let best = attempts.max { lhs, rhs in lhs.confidence < rhs.confidence } ?? primary
-        let selected = primary.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || best.confidence >= primary.confidence + 0.02
-            ? best
-            : primary
+        let selectedIndex = selectedAutoTranscriptionIndex(
+            texts: attempts.map(\.text),
+            confidences: attempts.map(\.confidence)
+        )
+        let selected = attempts[selectedIndex]
         let primaryConfidence = String(format: "%.3f", primary.confidence)
         let selectedConfidence = String(format: "%.3f", selected.confidence)
-        log("ASR: auto verification confidence \(primaryConfidence) → \(selectedConfidence)")
+        let labels = ["auto", "ru", "en", "uk"]
+        log("ASR: auto verification confidence \(primaryConfidence) → \(selectedConfidence), selected=\(labels[selectedIndex])")
         return TranscriptionWorkerResult(
             text: selected.text,
             confidence: selected.confidence,
@@ -18907,6 +19025,36 @@ private enum ParakeySelfTest {
         try expect(isolatedSettings.dictationLanguage,
                    equals: .ukrainian,
                    "Ukrainian should remain a supported optional language")
+
+        try expect(
+            shouldVerifyAutoTranscription(
+                text: "Что за фоновые агенты? Thank you",
+                confidence: 0.84
+            ),
+            equals: true,
+            "mixed-script Russian output should be verified even at high confidence"
+        )
+        try expect(
+            shouldVerifyAutoTranscription(
+                text: "Открой ABX Voice Assist",
+                confidence: 0.84
+            ),
+            equals: false,
+            "known product names should not make a Russian transcript look mixed"
+        )
+        try expect(
+            selectedAutoTranscriptionIndex(
+                texts: [
+                    "Что за фоновые агенты? Thank you",
+                    "Что за фоновый агент?",
+                    "What are background agents? Thank you",
+                    "Що за фоновий агент?",
+                ],
+                confidences: [0.84, 0.70, 0.86, 0.66]
+            ),
+            equals: 1,
+            "Russian-majority Auto output should reject a higher-confidence English hallucination"
+        )
     }
 
     private static func testHotkeyPreferenceUpdateResults() throws {
