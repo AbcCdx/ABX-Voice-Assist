@@ -24582,11 +24582,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                             symbol: String,
                                             tag: Int,
                                             selected: Bool) -> NSButton {
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
         let button = NSButton(title: title, image: image ?? NSImage(), target: self,
                               action: #selector(selectDesktopNavigationPage(_:)))
         button.tag = tag
         button.imagePosition = .imageLeading
+        button.imageHugsTitle = true
         button.imageScaling = .scaleProportionallyDown
         button.alignment = .center
         button.isBordered = false
