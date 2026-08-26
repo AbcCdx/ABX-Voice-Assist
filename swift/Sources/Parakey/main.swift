@@ -8248,6 +8248,39 @@ private struct FocusedTextFieldSnapshot {
     let selectedRange: CFRange?
 }
 
+private struct FocusedTextSelectionSnapshot {
+    let text: String
+    let anchorFrame: NSRect
+}
+
+private enum FocusedTranslationMode: Equatable {
+    case selectedText
+    case fullField
+}
+
+private enum FocusedTranslationTarget {
+    case selectedText(FocusedTextSelectionSnapshot)
+    case fullField(FocusedTextFieldSnapshot)
+
+    var text: String {
+        switch self {
+        case .selectedText(let snapshot): return snapshot.text
+        case .fullField(let snapshot): return snapshot.text
+        }
+    }
+}
+
+private func focusedTranslationMode(selectedText: String?,
+                                    fullFieldText: String?) -> FocusedTranslationMode? {
+    if selectedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+        return .selectedText
+    }
+    if fullFieldText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+        return .fullField
+    }
+    return nil
+}
+
 @available(macOS 15.0, *)
 @MainActor
 private final class LocalTranslationCoordinator: ObservableObject {
@@ -8313,6 +8346,123 @@ private struct LocalTranslationHostView: View {
 
 private final class LocalTranslationHostContainer: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+@MainActor
+private enum FocusedTextSelectionReader {
+    private static let selectedTextMarkerRangeAttributeName = "AXSelectedTextMarkerRange"
+    private static let boundsForTextMarkerRangeAttributeName = "AXBoundsForTextMarkerRange"
+
+    static func capture() -> FocusedTextSelectionSnapshot? {
+        guard AXIsProcessTrusted(),
+              let applicationPID = NSWorkspace.shared.frontmostApplication?.processIdentifier else {
+            return nil
+        }
+        let application = AXUIElementCreateApplication(applicationPID)
+        AXUIElementSetMessagingTimeout(application, 0.16)
+        guard var element = elementAttribute(application,
+                                             kAXFocusedUIElementAttribute as CFString) else {
+            return nil
+        }
+
+        for _ in 0..<8 {
+            AXUIElementSetMessagingTimeout(element, 0.16)
+            if let text = selectedText(in: element),
+               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let anchor = selectionFrame(in: element)
+                    ?? NSRect(origin: NSEvent.mouseLocation, size: NSSize(width: 1, height: 1))
+                return FocusedTextSelectionSnapshot(text: text, anchorFrame: anchor)
+            }
+            guard let parent = elementAttribute(element, kAXParentAttribute as CFString),
+                  !CFEqual(parent, element) else {
+                break
+            }
+            element = parent
+        }
+        return nil
+    }
+
+    private static func selectedText(in element: AXUIElement) -> String? {
+        if let direct = attribute(element, kAXSelectedTextAttribute as CFString) as? String {
+            return direct
+        }
+        guard let range = selectedRange(in: element), range.length > 0,
+              let value = attribute(element, kAXValueAttribute as CFString) as? String else {
+            return nil
+        }
+        let string = value as NSString
+        guard range.location >= 0,
+              range.location + range.length <= string.length else { return nil }
+        return string.substring(with: NSRange(location: range.location, length: range.length))
+    }
+
+    private static func selectionFrame(in element: AXUIElement) -> NSRect? {
+        if let markerRange = attribute(element,
+                                       selectedTextMarkerRangeAttributeName as CFString) {
+            var rawBounds: CFTypeRef?
+            if AXUIElementCopyParameterizedAttributeValue(
+                element,
+                boundsForTextMarkerRangeAttributeName as CFString,
+                markerRange,
+                &rawBounds
+            ) == .success,
+               let rect = cgRect(from: rawBounds) {
+                return appKitRect(fromAXRect: rect)
+            }
+        }
+
+        guard var range = selectedRange(in: element), range.length > 0,
+              let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+        var rawBounds: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXBoundsForRangeParameterizedAttribute as CFString,
+            rangeValue,
+            &rawBounds
+        ) == .success,
+              let rect = cgRect(from: rawBounds) else { return nil }
+        return appKitRect(fromAXRect: rect)
+    }
+
+    private static func selectedRange(in element: AXUIElement) -> CFRange? {
+        guard let raw = attribute(element, kAXSelectedTextRangeAttribute as CFString),
+              CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+        let value = unsafeDowncast(raw, to: AXValue.self)
+        guard AXValueGetType(value) == .cfRange else { return nil }
+        var range = CFRange()
+        return AXValueGetValue(value, .cfRange, &range) ? range : nil
+    }
+
+    private static func appKitRect(fromAXRect rect: CGRect) -> NSRect {
+        let referenceMaxY = NSScreen.screens.first?.frame.maxY
+            ?? NSScreen.main?.frame.maxY
+            ?? 0
+        return NSRect(x: rect.origin.x,
+                      y: referenceMaxY - rect.origin.y - rect.height,
+                      width: rect.width,
+                      height: rect.height)
+    }
+
+    private static func cgRect(from raw: CFTypeRef?) -> CGRect? {
+        guard let raw, CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+        let value = unsafeDowncast(raw, to: AXValue.self)
+        guard AXValueGetType(value) == .cgRect else { return nil }
+        var rect = CGRect.zero
+        return AXValueGetValue(value, .cgRect, &rect) ? rect : nil
+    }
+
+    private static func elementAttribute(_ element: AXUIElement,
+                                         _ name: CFString) -> AXUIElement? {
+        guard let raw = attribute(element, name),
+              CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
+        return unsafeDowncast(raw, to: AXUIElement.self)
+    }
+
+    private static func attribute(_ element: AXUIElement,
+                                  _ name: CFString) -> CFTypeRef? {
+        var raw: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, name, &raw) == .success ? raw : nil
+    }
 }
 
 @MainActor
@@ -10827,6 +10977,12 @@ private final class HistoryOverlayPanel: NSPanel {
 }
 
 @MainActor
+private final class TranslationOverlayPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+@MainActor
 private final class HistoryItemLabel: NSTextField {
     init(_ text: String) {
         super.init(frame: .zero)
@@ -11636,6 +11792,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statisticsOverlayPresented = false
     private var statisticsOverlayGlobalDismissMonitor: Any?
     private var statisticsOverlayLocalDismissMonitor: Any?
+    private var translationOverlayWindow: TranslationOverlayPanel?
+    private var translationOverlayDismissWorkItem: DispatchWorkItem?
     private var controlPanelLaunchInProgress = false
     private var controlPanelProcess: Process?
 
@@ -13514,32 +13672,53 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             signalDictationFailure()
             return
         }
-        guard let snapshot = FocusedTextFieldEditor.capture(),
-              !snapshot.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            log("field translation ignored: focused element has no editable text value")
+        let selectionSnapshot = FocusedTextSelectionReader.capture()
+        let fieldSnapshot = selectionSnapshot == nil ? FocusedTextFieldEditor.capture() : nil
+        guard let mode = focusedTranslationMode(
+            selectedText: selectionSnapshot?.text,
+            fullFieldText: fieldSnapshot?.text
+        ) else {
+            log("translation ignored: no selected text or editable field value")
             signalDictationFailure()
             return
+        }
+        let target: FocusedTranslationTarget
+        switch mode {
+        case .selectedText:
+            guard let selectionSnapshot else { return }
+            target = .selectedText(selectionSnapshot)
+        case .fullField:
+            guard let fieldSnapshot else { return }
+            target = .fullField(fieldSnapshot)
         }
 
         isBusy = true
         setMenuBarState(.busy)
         showTranscribingHUD()
         rebuildMenu()
-        log("field translation started: \(snapshot.text.count) characters")
+        let targetName = mode == .selectedText ? "selection" : "field"
+        log("local \(targetName) translation started: \(target.text.count) characters")
 
         Task { @MainActor in
             var succeeded = false
             do {
-                let translated = try await coordinator.translate(snapshot.text)
-                succeeded = FocusedTextFieldEditor.replace(snapshot, with: translated)
-                if succeeded {
-                    log("local field translation completed: \(translated.count) characters")
-                    if settings.playFeedbackSounds { Sounds.playDone() }
-                } else {
-                    log("field translation cancelled: focused field changed or is not writable")
+                let translated = try await coordinator.translate(target.text)
+                switch target {
+                case .selectedText(let snapshot):
+                    showTranslationOverlay(translated, anchoredTo: snapshot.anchorFrame)
+                    succeeded = true
+                    log("local selection translation completed: \(translated.count) characters")
+                case .fullField(let snapshot):
+                    succeeded = FocusedTextFieldEditor.replace(snapshot, with: translated)
+                    if succeeded {
+                        log("local field translation completed: \(translated.count) characters")
+                    } else {
+                        log("field translation cancelled: focused field changed or is not writable")
+                    }
                 }
+                if succeeded, settings.playFeedbackSounds { Sounds.playDone() }
             } catch {
-                log("local field translation failed: \(error.localizedDescription)")
+                log("local \(targetName) translation failed: \(error.localizedDescription)")
             }
             isBusy = false
             setMenuBarState(.idle)
@@ -13547,6 +13726,89 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             rebuildMenu()
             if !succeeded { signalDictationFailure() }
         }
+    }
+
+    private func showTranslationOverlay(_ text: String, anchoredTo anchor: NSRect) {
+        translationOverlayDismissWorkItem?.cancel()
+        translationOverlayWindow?.orderOut(nil)
+
+        let bodyFont = NSFont.systemFont(ofSize: 14, weight: .regular)
+        let maximumBodyWidth: CGFloat = 420
+        let measured = (text as NSString).boundingRect(
+            with: NSSize(width: maximumBodyWidth, height: 260),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: bodyFont]
+        )
+        let bodyWidth = min(maximumBodyWidth, max(224, ceil(measured.width)))
+        let bodyHeight = min(260, max(22, ceil(measured.height)))
+        let panelSize = NSSize(width: bodyWidth + 36, height: bodyHeight + 58)
+
+        let panel = TranslationOverlayPanel(
+            contentRect: NSRect(origin: .zero, size: panelSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.animationBehavior = .utilityWindow
+
+        let background = NSVisualEffectView(frame: NSRect(origin: .zero, size: panelSize))
+        background.material = .hudWindow
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.wantsLayer = true
+        background.layer?.cornerRadius = 14
+        background.layer?.cornerCurve = .continuous
+        background.layer?.borderWidth = 1
+        background.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+
+        let title = NSTextField(labelWithString: t("ПЕРЕВОД", "TRANSLATION"))
+        title.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        title.textColor = NSColor(calibratedRed: 0.69, green: 0.48, blue: 0.91, alpha: 1)
+        title.frame = NSRect(x: 18, y: panelSize.height - 31, width: bodyWidth, height: 16)
+
+        let body = NSTextField(wrappingLabelWithString: text)
+        body.font = bodyFont
+        body.textColor = .labelColor
+        body.maximumNumberOfLines = 0
+        body.lineBreakMode = .byWordWrapping
+        body.frame = NSRect(x: 18, y: 15, width: bodyWidth, height: bodyHeight)
+
+        background.addSubview(title)
+        background.addSubview(body)
+        panel.contentView = background
+        panel.setFrame(translationOverlayFrame(size: panelSize, anchor: anchor), display: true)
+        panel.orderFrontRegardless()
+        translationOverlayWindow = panel
+
+        let dismiss = DispatchWorkItem { [weak self, weak panel] in
+            panel?.orderOut(nil)
+            if self?.translationOverlayWindow === panel {
+                self?.translationOverlayWindow = nil
+            }
+        }
+        translationOverlayDismissWorkItem = dismiss
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: dismiss)
+    }
+
+    private func translationOverlayFrame(size: NSSize, anchor: NSRect) -> NSRect {
+        let point = NSPoint(x: anchor.midX, y: anchor.midY)
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(point) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: size.width, height: size.height)
+        let preferredBelow = anchor.minY - size.height - 10
+        let y = preferredBelow >= visible.minY + 10
+            ? preferredBelow
+            : anchor.maxY + 10
+        let x = min(max(anchor.midX - size.width / 2, visible.minX + 10),
+                    visible.maxX - size.width - 10)
+        let clampedY = min(max(y, visible.minY + 10), visible.maxY - size.height - 10)
+        return NSRect(x: x, y: clampedY, width: size.width, height: size.height)
     }
 
     private func handlePress() {
@@ -18896,6 +19158,18 @@ private enum ParakeySelfTest {
         try expect(LocalTranslationDirection.detect(in: "ABX: русский текст для перевода"),
                    equals: .russianToEnglish,
                    "project names should not override the surrounding Russian direction")
+        try expect(focusedTranslationMode(selectedText: "выделено",
+                                          fullFieldText: "всё поле"),
+                   equals: .selectedText,
+                   "selected text should open a translation popup instead of replacing the field")
+        try expect(focusedTranslationMode(selectedText: nil,
+                                          fullFieldText: "всё поле"),
+                   equals: .fullField,
+                   "an unselected editable field should keep whole-field translation")
+        try expect(focusedTranslationMode(selectedText: "  ",
+                                          fullFieldText: ""),
+                   equals: nil,
+                   "empty selection and field should not start translation")
     }
 
     private static func testHotkeyPreferenceNormalization() throws {
@@ -24323,8 +24597,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                           value: t("Русский ↔ English", "Russian ↔ English")),
         ]))
         let note = panelLabel(
-            t("Переводится весь текст активного поля, независимо от выделения. Перевод выполняется локально средствами macOS, без API-ключа, подписки и отправки текста в сеть. Обычные сочетания Control не перехватываются.",
-              "The entire focused field is translated regardless of selection. Translation runs locally through macOS, without an API key, subscription, or sending text over the network. Regular Control shortcuts are not intercepted."),
+            t("Если текст выделен, его перевод показывается рядом во всплывающем окне. Без выделения переводится весь текст активного поля. Перевод выполняется локально средствами macOS, без API-ключа и подписки. Обычные сочетания Control не перехватываются.",
+              "Selected text is translated in a nearby popup. Without a selection, the entire focused field is translated. Translation runs locally through macOS, without an API key or subscription. Regular Control shortcuts are not intercepted."),
             size: 11.5,
             color: unifiedMutedTextColor
         )
