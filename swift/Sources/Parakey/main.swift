@@ -5650,10 +5650,23 @@ private enum LoadedSpeechEngine {
 private struct TranscriptionWorkerResult: Sendable {
     let text: String
     let confidence: Float
+    let tokenTimings: [TokenTiming]?
     let workerQueueSeconds: Double
     let decoderPreparationSeconds: Double
     let fluidCallSeconds: Double
     let fluidProcessingSeconds: Double
+
+    func replacingText(_ text: String) -> TranscriptionWorkerResult {
+        TranscriptionWorkerResult(
+            text: text,
+            confidence: confidence,
+            tokenTimings: tokenTimings,
+            workerQueueSeconds: workerQueueSeconds,
+            decoderPreparationSeconds: decoderPreparationSeconds,
+            fluidCallSeconds: fluidCallSeconds,
+            fluidProcessingSeconds: fluidProcessingSeconds
+        )
+    }
 
     func timing(totalSeconds: Double) -> ASRTimingBreakdown {
         ASRTimingBreakdown(
@@ -5870,6 +5883,7 @@ actor TranscriptionWorker {
             return TranscriptionWorkerResult(
                 text: primary.text,
                 confidence: primary.confidence,
+                tokenTimings: primary.tokenTimings,
                 workerQueueSeconds: workerEnteredAt - requestedAt,
                 decoderPreparationSeconds: primary.decoderPreparationSeconds,
                 fluidCallSeconds: primary.fluidCallSeconds,
@@ -5893,6 +5907,7 @@ actor TranscriptionWorker {
         return TranscriptionWorkerResult(
             text: selected.text,
             confidence: selected.confidence,
+            tokenTimings: selected.tokenTimings,
             workerQueueSeconds: workerEnteredAt - requestedAt,
             decoderPreparationSeconds: attempts.reduce(0) { $0 + $1.decoderPreparationSeconds },
             fluidCallSeconds: attempts.reduce(0) { $0 + $1.fluidCallSeconds },
@@ -5913,6 +5928,7 @@ actor TranscriptionWorker {
             return TranscriptionWorkerResult(
                 text: result.text,
                 confidence: result.confidence,
+                tokenTimings: result.tokenTimings,
                 workerQueueSeconds: 0,
                 decoderPreparationSeconds: fluidCallStartedAt - decoderPreparationStartedAt,
                 fluidCallSeconds: fluidCallCompletedAt - fluidCallStartedAt,
@@ -5944,10 +5960,51 @@ actor TranscriptionWorker {
         return TranscriptionWorkerResult(
             text: results.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n"),
             confidence: results.map(\.confidence).min() ?? 0,
+            tokenTimings: nil,
             workerQueueSeconds: results.first?.workerQueueSeconds ?? 0,
             decoderPreparationSeconds: results.reduce(0) { $0 + $1.decoderPreparationSeconds },
             fluidCallSeconds: results.reduce(0) { $0 + $1.fluidCallSeconds },
             fluidProcessingSeconds: results.reduce(0) { $0 + $1.fluidProcessingSeconds }
+        )
+    }
+
+    /// Keep one decoder context for the full utterance. Long-pause paragraph
+    /// boundaries are applied afterwards from FluidAudio token timings. The
+    /// former segmented decoder remains a fallback when timings are missing or
+    /// cannot be mapped back to the emitted text.
+    fileprivate func transcribeDictation(samples: [Float],
+                                          pauseSplitOffsets: [Int],
+                                          language: Language? = nil,
+                                          requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
+        let whole = try await transcribe(samples: samples,
+                                         language: language,
+                                         requestedAt: requestedAt)
+        guard !pauseSplitOffsets.isEmpty else { return whole }
+
+        if let tokenTimings = whole.tokenTimings,
+           let text = dictationTextAddingParagraphBreaks(
+               whole.text,
+               tokenTimings: tokenTimings,
+               pauseSplitOffsets: pauseSplitOffsets
+           ) {
+            log("ASR: preserved whole-utterance context and added \(pauseSplitOffsets.count) paragraph break(s) from token timings")
+            return whole.replacingText(text)
+        }
+
+        log("ASR: token timing paragraph mapping unavailable; using segmented fallback")
+        let fallback = try await transcribe(
+            segments: dictationSegmentsSeparatedByLongPause(samples: samples),
+            language: language,
+            requestedAt: ProcessInfo.processInfo.systemUptime
+        )
+        return TranscriptionWorkerResult(
+            text: fallback.text,
+            confidence: fallback.confidence,
+            tokenTimings: nil,
+            workerQueueSeconds: whole.workerQueueSeconds + fallback.workerQueueSeconds,
+            decoderPreparationSeconds: whole.decoderPreparationSeconds + fallback.decoderPreparationSeconds,
+            fluidCallSeconds: whole.fluidCallSeconds + fallback.fluidCallSeconds,
+            fluidProcessingSeconds: whole.fluidProcessingSeconds + fallback.fluidProcessingSeconds
         )
     }
 
@@ -6862,13 +6919,13 @@ private let MIN_DICTATION_SEGMENT_SECONDS = 0.5
 private let MAX_DICTATION_SEGMENTS = 3
 
 /// Finds deliberate long silent pauses in a single held recording. The
-/// threshold and segment cap deliberately favour one coherent paragraph over
+/// threshold and boundary cap deliberately favour one coherent paragraph over
 /// splitting on natural hesitations.
-private func dictationSegmentsSeparatedByLongPause(samples: [Float],
-                                                    sampleRate: Double = SAMPLE_RATE) -> [[Float]] {
+private func longDictationPauseSplitOffsets(samples: [Float],
+                                             sampleRate: Double = SAMPLE_RATE) -> [Int] {
     guard sampleRate > 0,
           samples.count >= Int(sampleRate * (MIN_DICTATION_SEGMENT_SECONDS * 2 + LONG_DICTATION_PAUSE_SECONDS)) else {
-        return [samples]
+        return []
     }
 
     let blockSize = LONG_DICTATION_PAUSE_BLOCK_SAMPLES
@@ -6907,6 +6964,13 @@ private func dictationSegmentsSeparatedByLongPause(samples: [Float],
         if splitOffsets.count == MAX_DICTATION_SEGMENTS - 1 { break }
     }
 
+    return splitOffsets
+}
+
+private func dictationSegmentsSeparatedByLongPause(samples: [Float],
+                                                    sampleRate: Double = SAMPLE_RATE) -> [[Float]] {
+    let splitOffsets = longDictationPauseSplitOffsets(samples: samples,
+                                                       sampleRate: sampleRate)
     guard !splitOffsets.isEmpty else { return [samples] }
     var result: [[Float]] = []
     var start = 0
@@ -6915,6 +6979,69 @@ private func dictationSegmentsSeparatedByLongPause(samples: [Float],
         start = split
     }
     result.append(Array(samples[start..<samples.count]))
+    return result
+}
+
+/// Inserts exactly one newline before the first timed word after every
+/// deliberate audio pause while preserving the model's emitted text. Returns
+/// nil when timings cannot be mapped safely, allowing the caller to use the
+/// segmented decoder fallback instead of guessing a boundary.
+private func dictationTextAddingParagraphBreaks(
+    _ text: String,
+    tokenTimings: [TokenTiming],
+    pauseSplitOffsets: [Int],
+    sampleRate: Double = SAMPLE_RATE
+) -> String? {
+    guard sampleRate > 0, !pauseSplitOffsets.isEmpty else { return text }
+    let words = buildWordTimings(from: tokenTimings)
+    guard !words.isEmpty else { return nil }
+
+    var boundaryWordIndices: [Int] = []
+    for splitOffset in pauseSplitOffsets {
+        let pauseTime = Double(splitOffset) / sampleRate
+        guard let wordIndex = words.firstIndex(where: { $0.startTime >= pauseTime }),
+              wordIndex > 0 else {
+            return nil
+        }
+        if boundaryWordIndices.last != wordIndex {
+            boundaryWordIndices.append(wordIndex)
+        }
+    }
+
+    let boundaryIndices = Set(boundaryWordIndices)
+    var boundaryPositions: [String.Index] = []
+    var searchStart = text.startIndex
+    for (index, word) in words.enumerated() {
+        guard searchStart <= text.endIndex,
+              let range = text.range(of: word.word,
+                                     options: [.literal],
+                                     range: searchStart..<text.endIndex) else {
+            return nil
+        }
+        if boundaryIndices.contains(index) {
+            boundaryPositions.append(range.lowerBound)
+        }
+        searchStart = range.upperBound
+    }
+    guard boundaryPositions.count == boundaryIndices.count else { return nil }
+
+    var result = ""
+    result.reserveCapacity(text.count + boundaryPositions.count)
+    var cursor = text.startIndex
+    for boundary in boundaryPositions {
+        var whitespaceStart = boundary
+        while whitespaceStart > cursor {
+            let previous = text.index(before: whitespaceStart)
+            guard text[previous].isWhitespace else { break }
+            whitespaceStart = previous
+        }
+        result.append(contentsOf: text[cursor..<whitespaceStart])
+        if !result.hasSuffix("\n") {
+            result.append("\n")
+        }
+        cursor = boundary
+    }
+    result.append(contentsOf: text[cursor..<text.endIndex])
     return result
 }
 
@@ -13924,14 +14051,15 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // immediately, but its disk/menu updates now overlap inference.
         let asrRequestedAt = ProcessInfo.processInfo.systemUptime
         let transcriptionWorker = asr
-        let pauseSeparatedSegments = dictationSegmentsSeparatedByLongPause(samples: samples)
-        if pauseSeparatedSegments.count > 1 {
-            log("release: detected \(pauseSeparatedSegments.count - 1) long pause(s); transcribing as paragraphs")
+        let pauseSplitOffsets = longDictationPauseSplitOffsets(samples: samples)
+        if !pauseSplitOffsets.isEmpty {
+            log("release: detected \(pauseSplitOffsets.count) long pause(s); preserving context and adding paragraphs from token timings")
         }
         let language = settings.dictationLanguage.fluidLanguage
         let transcriptionTask = Task.detached(priority: .userInitiated) {
-            let transcription = try await transcriptionWorker.transcribe(
-                segments: pauseSeparatedSegments,
+            let transcription = try await transcriptionWorker.transcribeDictation(
+                samples: samples,
+                pauseSplitOffsets: pauseSplitOffsets,
                 language: language,
                 requestedAt: asrRequestedAt
             )
@@ -19820,17 +19948,43 @@ private enum ParakeySelfTest {
 
         let speech = [Float](repeating: 0.08, count: Int(SAMPLE_RATE))
         let longSilence = [Float](repeating: 0, count: Int(SAMPLE_RATE * 1.5))
-        let pauseSegments = dictationSegmentsSeparatedByLongPause(samples: speech + longSilence + speech)
+        let pauseSamples = speech + longSilence + speech
+        let pauseOffsets = longDictationPauseSplitOffsets(samples: pauseSamples)
         try expect(
-            pauseSegments.count,
-            equals: 2,
-            "a long silence between speech regions should create one paragraph break"
+            pauseOffsets.count,
+            equals: 1,
+            "a long silence between speech regions should create one paragraph boundary"
         )
         let shortSilence = [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.8))
         try expect(
-            dictationSegmentsSeparatedByLongPause(samples: speech + shortSilence + speech).count,
-            equals: 1,
+            longDictationPauseSplitOffsets(samples: speech + shortSilence + speech).count,
+            equals: 0,
             "a natural hesitation should remain in one paragraph"
+        )
+
+        let tokenTimings = [
+            TokenTiming(token: "▁Первая", tokenId: 1, startTime: 0.10, endTime: 0.45, confidence: 0.95),
+            TokenTiming(token: "▁мысль.", tokenId: 2, startTime: 0.50, endTime: 0.90, confidence: 0.94),
+            TokenTiming(token: "▁Вторая", tokenId: 3, startTime: 2.60, endTime: 2.95, confidence: 0.96),
+            TokenTiming(token: "▁мысль.", tokenId: 4, startTime: 3.00, endTime: 3.35, confidence: 0.93),
+        ]
+        try expect(
+            dictationTextAddingParagraphBreaks(
+                "Первая мысль. Вторая мысль.",
+                tokenTimings: tokenTimings,
+                pauseSplitOffsets: pauseOffsets
+            ),
+            equals: "Первая мысль.\nВторая мысль.",
+            "a detected audio pause should become one newline without splitting ASR context"
+        )
+        try expect(
+            dictationTextAddingParagraphBreaks(
+                "Текст не совпадает",
+                tokenTimings: tokenTimings,
+                pauseSplitOffsets: pauseOffsets
+            ),
+            equals: nil,
+            "token mapping failure should request the safe segmented fallback"
         )
 
         let disabledPostprocessing = processedDictationText(

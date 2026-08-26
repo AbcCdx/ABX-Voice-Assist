@@ -8,15 +8,19 @@ answering the speaker, inventing facts, or changing meaning.
 ## Current pipeline
 
 1. Parakeet TDT 0.6B v3 produces the local transcript.
-2. Deterministic repair removes known ASR artifacts.
-3. A conservative project dictionary replaces complete spoken aliases with
+2. Long pauses are detected in the audio, but the full utterance is decoded
+   once. FluidAudio token timings place one paragraph break after each pause;
+   separate segment decoding is used only as a safe fallback when timings are
+   unavailable.
+3. Deterministic repair removes known ASR artifacts.
+4. A conservative project dictionary replaces complete spoken aliases with
    canonical English names.
-4. User corrections override built-in aliases.
-5. Optional filler removal and punctuation rules run locally.
-6. Optional LLM cleanup fixes punctuation, capitalization, grammar, and clear
+5. User corrections override built-in aliases.
+6. Optional filler removal and punctuation rules run locally.
+7. Optional LLM cleanup fixes punctuation, capitalization, grammar, and clear
    recognition errors. It receives only the canonical project names and must
    not introduce a name that was not spoken.
-7. Invalid, incomplete, conversational, or implausibly changed LLM output is
+8. Invalid, incomplete, conversational, or implausibly changed LLM output is
    rejected and the local transcript is kept.
 
 ## Canonical project dictionary
@@ -50,15 +54,17 @@ repeated errors without false replacements in ordinary text.
 
 ## Planned stages
 
-1. Collect confirmed recognition failures from History. Do not learn directly
+1. Completed: preserve whole-utterance decoder context across long pauses and
+   place paragraphs from token timings instead of decoding each part alone.
+2. Collect confirmed recognition failures from History. Do not learn directly
    from every transcript because unconfirmed output may teach new mistakes.
-2. Suggest an alias only after the same acoustic form fails repeatedly. The
+3. Suggest an alias only after the same acoustic form fails repeatedly. The
    user remains the authority for its canonical spelling.
-3. Retrieve only dictionary entries relevant to the current transcript for LLM
+4. Retrieve only dictionary entries relevant to the current transcript for LLM
    cleanup. A small context is safer and faster than sending the full glossary.
-4. Add CTC vocabulary boosting for terms that still fail before deterministic
+5. Add CTC vocabulary boosting for terms that still fail before deterministic
    correction. Tune it against both name recall and false-positive rate.
-5. Keep deterministic validation and local fallback after every probabilistic
+6. Keep deterministic validation and local fallback after every probabilistic
    stage.
 
 ## Research references
