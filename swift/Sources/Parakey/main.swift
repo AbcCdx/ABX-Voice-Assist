@@ -5684,25 +5684,9 @@ private struct CompletedTranscriptionWorkerResult: Sendable {
     let completedAt: TimeInterval
 }
 
-private enum TranscriptLetterScript: Equatable {
-    case cyrillic
-    case latin
-    case unknown
-}
-
 private struct TranscriptScriptProfile: Equatable {
     let cyrillicLetters: Int
     let latinLetters: Int
-
-    var dominant: TranscriptLetterScript {
-        if cyrillicLetters >= 3, cyrillicLetters >= latinLetters * 2 {
-            return .cyrillic
-        }
-        if latinLetters >= 3, latinLetters >= cyrillicLetters * 2 {
-            return .latin
-        }
-        return .unknown
-    }
 
     var isMixed: Bool {
         cyrillicLetters >= 3 && latinLetters >= 3
@@ -5759,27 +5743,35 @@ private func containsCommonASRHallucination(_ text: String) -> Bool {
     return COMMON_ASR_HALLUCINATIONS.contains { normalized.contains($0) }
 }
 
-private func shouldVerifyAutoTranscription(text: String, confidence: Float) -> Bool {
+private func lowerTailTokenConfidence(_ tokenTimings: [TokenTiming]) -> Float? {
+    let confidences = tokenTimings
+        .map(\.confidence)
+        .filter(\.isFinite)
+        .sorted()
+    guard !confidences.isEmpty else { return nil }
+    let index = Int(floor(Double(confidences.count - 1) * 0.20))
+    return max(0, min(1, confidences[index]))
+}
+
+private func shouldVerifyAutoTranscription(text: String,
+                                           confidence: Float,
+                                           tokenTimings: [TokenTiming] = []) -> Bool {
     let profile = transcriptScriptProfile(text)
     return confidence < 0.72
+        || lowerTailTokenConfidence(tokenTimings).map { $0 < 0.45 } == true
         || profile.isMixed
         || containsCommonASRHallucination(text)
 }
 
 private func autoTranscriptionCandidateScore(text: String,
                                              confidence: Float,
-                                             preferredScript: TranscriptLetterScript) -> Float {
+                                             lowerTailConfidence: Float) -> Float {
     let profile = transcriptScriptProfile(text)
     let total = profile.cyrillicLetters + profile.latinLetters
-    var score = confidence
-    if total > 0 {
-        let foreignLetters: Int
-        switch preferredScript {
-        case .cyrillic: foreignLetters = profile.latinLetters
-        case .latin: foreignLetters = profile.cyrillicLetters
-        case .unknown: foreignLetters = 0
-        }
-        score -= Float(foreignLetters) / Float(total) * 0.55
+    var score = confidence * 0.72 + lowerTailConfidence * 0.28
+    if profile.isMixed, total > 0 {
+        let minorityLetters = min(profile.cyrillicLetters, profile.latinLetters)
+        score -= Float(minorityLetters) / Float(total) * 0.45
     }
     if containsCommonASRHallucination(text) {
         score -= 0.35
@@ -5788,13 +5780,21 @@ private func autoTranscriptionCandidateScore(text: String,
 }
 
 private func selectedAutoTranscriptionIndex(texts: [String],
-                                            confidences: [Float]) -> Int {
-    guard !texts.isEmpty, texts.count == confidences.count else { return 0 }
-    let preferredScript = transcriptScriptProfile(texts[0]).dominant
-    let scores = zip(texts, confidences).map {
-        autoTranscriptionCandidateScore(text: $0.0,
-                                        confidence: $0.1,
-                                        preferredScript: preferredScript)
+                                            confidences: [Float],
+                                            lowerTailConfidences: [Float] = []) -> Int {
+    guard !texts.isEmpty,
+          texts.count == confidences.count,
+          lowerTailConfidences.isEmpty || lowerTailConfidences.count == texts.count else {
+        return 0
+    }
+    let scores = texts.indices.map { index in
+        autoTranscriptionCandidateScore(
+            text: texts[index],
+            confidence: confidences[index],
+            lowerTailConfidence: lowerTailConfidences.isEmpty
+                ? confidences[index]
+                : lowerTailConfidences[index]
+        )
     }
     guard let bestIndex = scores.indices.max(by: { scores[$0] < scores[$1] }) else { return 0 }
     let primaryIsEmpty = texts[0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -5879,7 +5879,8 @@ actor TranscriptionWorker {
         let primary = try await transcribeOnce(samples: samples, language: language)
         guard language == nil,
               shouldVerifyAutoTranscription(text: primary.text,
-                                            confidence: primary.confidence) else {
+                                            confidence: primary.confidence,
+                                            tokenTimings: primary.tokenTimings ?? []) else {
             return TranscriptionWorkerResult(
                 text: primary.text,
                 confidence: primary.confidence,
@@ -5897,13 +5898,24 @@ actor TranscriptionWorker {
         }
         let selectedIndex = selectedAutoTranscriptionIndex(
             texts: attempts.map(\.text),
-            confidences: attempts.map(\.confidence)
+            confidences: attempts.map(\.confidence),
+            lowerTailConfidences: attempts.map {
+                lowerTailTokenConfidence($0.tokenTimings ?? []) ?? $0.confidence
+            }
         )
         let selected = attempts[selectedIndex]
         let primaryConfidence = String(format: "%.3f", primary.confidence)
         let selectedConfidence = String(format: "%.3f", selected.confidence)
+        let primaryTail = String(
+            format: "%.3f",
+            lowerTailTokenConfidence(primary.tokenTimings ?? []) ?? primary.confidence
+        )
+        let selectedTail = String(
+            format: "%.3f",
+            lowerTailTokenConfidence(selected.tokenTimings ?? []) ?? selected.confidence
+        )
         let labels = ["auto", "ru", "en", "uk"]
-        log("ASR: auto verification confidence \(primaryConfidence) → \(selectedConfidence), selected=\(labels[selectedIndex])")
+        log("ASR: auto verification mean/tail \(primaryConfidence)/\(primaryTail) → \(selectedConfidence)/\(selectedTail), selected=\(labels[selectedIndex])")
         return TranscriptionWorkerResult(
             text: selected.text,
             confidence: selected.confidence,
@@ -19445,6 +19457,25 @@ private enum ParakeySelfTest {
             equals: false,
             "known product names should not make a Russian transcript look mixed"
         )
+        let unevenTokenTimings = [
+            TokenTiming(token: " Охо", tokenId: 1, startTime: 0, endTime: 0.2, confidence: 0.18),
+            TokenTiming(token: " выглядят", tokenId: 2, startTime: 0.2, endTime: 0.5, confidence: 0.94),
+            TokenTiming(token: ".", tokenId: 3, startTime: 0.5, endTime: 0.6, confidence: 0.92),
+        ]
+        try expect(
+            lowerTailTokenConfidence(unevenTokenTimings),
+            equals: 0.18,
+            "lower-tail confidence should expose an isolated weak token"
+        )
+        try expect(
+            shouldVerifyAutoTranscription(
+                text: "Охо выглядят.",
+                confidence: 0.86,
+                tokenTimings: unevenTokenTimings
+            ),
+            equals: true,
+            "one weak word should trigger local language verification despite a high mean confidence"
+        )
         try expect(
             selectedAutoTranscriptionIndex(
                 texts: [
@@ -19457,6 +19488,15 @@ private enum ParakeySelfTest {
             ),
             equals: 1,
             "Russian-majority Auto output should reject a higher-confidence English hallucination"
+        )
+        try expect(
+            selectedAutoTranscriptionIndex(
+                texts: ["Охо выглядят.", "Вот как выглядит.", "This is how it looks.", "Ось як це виглядає."],
+                confidences: [0.86, 0.78, 0.74, 0.73],
+                lowerTailConfidences: [0.18, 0.72, 0.68, 0.67]
+            ),
+            equals: 1,
+            "a clean candidate should beat a higher mean confidence hiding one broken word"
         )
     }
 
