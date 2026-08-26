@@ -7086,9 +7086,9 @@ private func processedDictationText(rawTranscript: String,
 
 // MARK: - Text insertion
 //
-// Default path: post the transcript as direct Unicode keyboard events.
-// This deliberately leaves the shared macOS pasteboard untouched, so an
-// image, file URL, or other non-text item cannot race into the target app.
+// Default path: publish one text-only pasteboard item and post Cmd+V.
+// The lazy provider keeps the full transcript atomic for Electron fields,
+// then restores the user's previous clipboard after the target reads it.
 
 func pastedText(from correctedTranscript: String, suffix: PasteSuffix) -> String {
     switch suffix {
@@ -8138,7 +8138,7 @@ private enum KeyboardShortcutPoster {
 
 @MainActor
 enum TextInserter {
-    nonisolated static let defaultStrategy = TextInsertionStrategy.directUnicode
+    nonisolated static let defaultStrategy = TextInsertionStrategy.clipboardPaste
 
     nonisolated static var defaultStrategyDescription: String {
         textInsertionStrategyDescription(primary: defaultStrategy)
@@ -20082,8 +20082,8 @@ private enum ParakeySelfTest {
         )
         try expect(
             TextInserter.defaultStrategy,
-            equals: .directUnicode,
-            "dictation should bypass the shared clipboard by default"
+            equals: .clipboardPaste,
+            "dictation should paste the transcript atomically by default"
         )
         try expect(
             textInsertionStrategyChain(primary: .clipboardPaste),
@@ -20097,8 +20097,8 @@ private enum ParakeySelfTest {
         )
         try expect(
             TextInserter.defaultStrategyDescription,
-            equals: "Direct Unicode typing",
-            "diagnostics should describe clipboard-free insertion"
+            equals: "Clipboard paste with Direct Unicode typing fallback",
+            "diagnostics should describe the atomic insertion fallback chain"
         )
         let unicodeChunks = unicodeInsertionChunks(for: "ab👩‍💻cd", maxUTF16UnitsPerEvent: 4)
             .map { String(decoding: $0, as: UTF16.self) }
@@ -20157,9 +20157,10 @@ private enum ParakeySelfTest {
             let pasteboard = NSPasteboard(name: pasteboardName)
             _ = ClipboardPasteInserter.write("older clipboard text", to: pasteboard)
             let snapshot = PasteboardSnapshot.capture(from: pasteboard)
+            let dictationText = "Да, на самом деле я тоже думаю, что это хорошая штука, так что будем продолжать работать"
             var transactionFinished = false
             let transaction = ClipboardPasteTransaction(
-                text: "fresh dictation",
+                text: dictationText,
                 pasteboard: pasteboard,
                 previousSnapshot: snapshot,
                 restoreDelay: 0.01,
@@ -20168,12 +20169,14 @@ private enum ParakeySelfTest {
                 transactionFinished = true
             }
             let installed = transaction.install()
+            let advertisedTypes = pasteboard.pasteboardItems?.first?.types ?? []
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.40))
             let freshText = pasteboard.string(forType: .string)
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
             return (
                 installed: installed,
                 freshText: freshText,
+                advertisedTypes: advertisedTypes,
                 restoredText: pasteboard.string(forType: .string),
                 transactionFinished: transactionFinished
             )
@@ -20185,8 +20188,13 @@ private enum ParakeySelfTest {
         )
         try expect(
             lazyPasteProbe.freshText,
-            equals: "fresh dictation",
-            "the paste target should receive the current dictation"
+            equals: "Да, на самом деле я тоже думаю, что это хорошая штука, так что будем продолжать работать",
+            "the paste target should receive the complete current dictation"
+        )
+        try expect(
+            lazyPasteProbe.advertisedTypes,
+            equals: [.string],
+            "the temporary dictation pasteboard item should expose text only"
         )
         try expect(
             lazyPasteProbe.restoredText,
