@@ -24592,8 +24592,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                             selected: Bool) -> NSButton {
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
             .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
-        let button = NSButton(title: title, image: image ?? NSImage(), target: self,
+        let button = NSButton(title: "\u{2009}\(title)", image: image ?? NSImage(), target: self,
                               action: #selector(selectDesktopNavigationPage(_:)))
+        button.setAccessibilityLabel(title)
         button.tag = tag
         button.imagePosition = .imageLeading
         button.imageHugsTitle = true
