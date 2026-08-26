@@ -24084,7 +24084,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private weak var settingsScrollView: NSScrollView?
     private var pendingAIKey = ""
     private var compactPanelTab = 0
-    private var desktopNavigationPage = 0
+    private var desktopNavigationPage = 1
     private var historyCopyNoticeVisible = false
     private var historyCopyNoticeWorkItem: DispatchWorkItem?
 
