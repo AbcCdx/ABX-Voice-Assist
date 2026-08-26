@@ -92,6 +92,7 @@ let RECORDING_HUD_ANIMATE_IN_SECONDS: TimeInterval = 0.32
 let RECORDING_HUD_ANIMATE_OUT_SECONDS: TimeInterval = 0.23
 let RECORDING_HUD_TRANSCRIBING_RESOLVE_SECONDS: TimeInterval = 0.20
 let RECORDING_HUD_TRANSCRIBING_MIN_VISIBLE_SECONDS: TimeInterval = 0.24
+let LOCAL_TRANSLATION_HUD_MIN_VISIBLE_SECONDS: TimeInterval = 0.75
 let RECORDING_HUD_TARGET_REFRESH_INTERVAL: TimeInterval = 0.16
 let RECORDING_HUD_TARGET_FOLLOW_RESPONSE: CGFloat = 22
 let RECORDING_HUD_TARGET_CACHE_MAX_AGE: TimeInterval = 10 * 60
@@ -6773,11 +6774,6 @@ private func finalizedDictationText(_ text: String,
         .joined(separator: "\n")
 }
 
-private struct SuccessfulDictationInsertionContext: Equatable {
-    let text: String
-    let applicationPID: pid_t
-}
-
 private struct DictationInsertionSurroundings: Equatable {
     let textBeforeCursor: String
     let textAfterCursor: String
@@ -6802,52 +6798,59 @@ private func replacingFirstLetter(in text: String,
     return result
 }
 
-private func cursorFollowsPreviousDictation(
-    _ previous: SuccessfulDictationInsertionContext,
-    surroundings: DictationInsertionSurroundings
-) -> Bool {
-    let textBeforeCursor = surroundings.textBeforeCursor
-        .trimmingCharacters(in: .whitespaces)
-    let previousText = previous.text.trimmingCharacters(in: .whitespacesAndNewlines)
-    let comparableSuffix = String(previousText.suffix(512))
-    return !comparableSuffix.isEmpty && textBeforeCursor.hasSuffix(comparableSuffix)
+private func currentLineBeforeCursor(
+    _ surroundings: DictationInsertionSurroundings
+) -> String {
+    surroundings.textBeforeCursor
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .last
+        .map(String.init) ?? ""
+}
+
+private func currentLineAfterCursor(
+    _ surroundings: DictationInsertionSurroundings
+) -> String {
+    surroundings.textAfterCursor
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .first
+        .map(String.init) ?? ""
 }
 
 private func cursorIsInsideLogicalContinuation(
     _ surroundings: DictationInsertionSurroundings
 ) -> Bool {
-    guard !surroundings.textAfterCursor
-        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !currentLineAfterCursor(surroundings)
+        .trimmingCharacters(in: .whitespaces)
         .isEmpty else {
         return false
     }
-    let currentLine = surroundings.textBeforeCursor
-        .split(separator: "\n", omittingEmptySubsequences: false)
-        .last
-        .map(String.init) ?? ""
-    let trimmedLine = currentLine.trimmingCharacters(in: .whitespaces)
+    let trimmedLine = currentLineBeforeCursor(surroundings)
+        .trimmingCharacters(in: .whitespaces)
     guard !trimmedLine.isEmpty else { return false }
     return !hasTerminalSentencePunctuation(trimmedLine)
 }
 
+private func cursorNeedsParagraphBreak(
+    _ surroundings: DictationInsertionSurroundings
+) -> Bool {
+    let trimmedLine = currentLineBeforeCursor(surroundings)
+        .trimmingCharacters(in: .whitespaces)
+    return !trimmedLine.isEmpty
+        && !hasTerminalSentencePunctuation(trimmedLine)
+        && !cursorIsInsideLogicalContinuation(surroundings)
+}
+
 private func dictationTextForInsertion(_ text: String,
-                                       previous: SuccessfulDictationInsertionContext?,
-                                       applicationPID: pid_t?,
                                        surroundings: DictationInsertionSurroundings?) -> String {
     guard !text.isEmpty, !text.hasPrefix("\n") else { return text }
-
-    if let previous,
-       let applicationPID,
-       previous.applicationPID == applicationPID,
-       !hasTerminalSentencePunctuation(previous.text),
-       let surroundings,
-       cursorFollowsPreviousDictation(previous, surroundings: surroundings) {
-        return "\n" + replacingFirstLetter(in: text) { $0.uppercased() }
-    }
 
     if let surroundings,
        cursorIsInsideLogicalContinuation(surroundings) {
         return replacingFirstLetter(in: text) { $0.lowercased() }
+    }
+    if let surroundings,
+       cursorNeedsParagraphBreak(surroundings) {
+        return "\n" + replacingFirstLetter(in: text) { $0.uppercased() }
     }
     return text
 }
@@ -8789,12 +8792,18 @@ private final class ClipboardPasteTransaction: NSObject, NSPasteboardItemDataPro
 @MainActor
 private enum DirectUnicodeInserter {
     private static let maxUTF16UnitsPerEvent = 20
+    private static let interChunkDelayMicroseconds: useconds_t = 6_000
 
     static func insert(_ text: String) -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState)
         var didPostAll = true
+        let chunks = unicodeInsertionChunks(for: text,
+                                            maxUTF16UnitsPerEvent: maxUTF16UnitsPerEvent)
 
-        for chunk in unicodeInsertionChunks(for: text, maxUTF16UnitsPerEvent: maxUTF16UnitsPerEvent) {
+        for (index, chunk) in chunks.enumerated() {
+            if index > 0 {
+                usleep(interChunkDelayMicroseconds)
+            }
             didPostAll = post(chunk, source: source) && didPostAll
         }
         return didPostAll
@@ -11799,8 +11808,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// Local transcript archive, newest first. UI applies the user's visible limit.
     private var history: [TranscriptHistoryEntry] = []
-    private var lastSuccessfulDictationInsertion: SuccessfulDictationInsertionContext?
-
     private var visibleHistory: [TranscriptHistoryEntry] {
         limitedRecentTranscriptEntries(
             limitedTranscriptHistoryArchive(history),
@@ -13566,10 +13573,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return NSRect(x: x, y: y, width: frame.width, height: frame.height)
     }
 
-    private func finishBusyHUD() {
+    private func finishBusyHUD(
+        minimumVisibleSeconds: TimeInterval = RECORDING_HUD_TRANSCRIBING_MIN_VISIBLE_SECONDS
+    ) {
         if let startedAt = recordingHUDTranscribingStartedAt {
             let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
-            let remaining = RECORDING_HUD_TRANSCRIBING_MIN_VISIBLE_SECONDS - elapsed
+            let remaining = minimumVisibleSeconds - elapsed
             if remaining > 0 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
                     guard let self,
@@ -13722,7 +13731,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             isBusy = false
             setMenuBarState(.idle)
-            finishBusyHUD()
+            finishBusyHUD(minimumVisibleSeconds: LOCAL_TRANSLATION_HUD_MIN_VISIBLE_SECONDS)
             rebuildMenu()
             if !succeeded { signalDictationFailure() }
         }
@@ -13995,8 +14004,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                         let textToInsert = dictationTextForInsertion(
                             finalText,
-                            previous: lastSuccessfulDictationInsertion,
-                            applicationPID: insertionApplicationPID,
                             surroundings: insertionSurroundings
                         )
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
@@ -14032,12 +14039,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
                         var enterDelaySeconds: Double?
                         if inserted {
-                            if let insertionApplicationPID {
-                                lastSuccessfulDictationInsertion = SuccessfulDictationInsertionContext(
-                                    text: finalText,
-                                    applicationPID: insertionApplicationPID
-                                )
-                            }
                             if shouldPressEnterAfterInsertion {
                                 let enterDelayStartedAt = ProcessInfo.processInfo.systemUptime
                                 let enterDelayNanoseconds = UInt64(settings.enterDelayMilliseconds) * 1_000_000
@@ -19744,14 +19745,8 @@ private enum ParakeySelfTest {
             equals: "Первый\nВторой",
             "final period removal should apply to every pause-separated line"
         )
-        let previousInsertion = SuccessfulDictationInsertionContext(
-            text: "Первая мысль",
-            applicationPID: 42
-        )
         try expect(
             dictationTextForInsertion("Продолжение",
-                                      previous: previousInsertion,
-                                      applicationPID: 42,
                                       surroundings: DictationInsertionSurroundings(
                                         textBeforeCursor: "Первая мысль",
                                         textAfterCursor: ""
@@ -19761,11 +19756,6 @@ private enum ParakeySelfTest {
         )
         try expect(
             dictationTextForInsertion("Продолжение",
-                                      previous: SuccessfulDictationInsertionContext(
-                                        text: "Первая мысль.",
-                                        applicationPID: 42
-                                      ),
-                                      applicationPID: 42,
                                       surroundings: DictationInsertionSurroundings(
                                         textBeforeCursor: "Первая мысль.",
                                         textAfterCursor: ""
@@ -19774,31 +19764,16 @@ private enum ParakeySelfTest {
             "terminal punctuation should keep the next dictation inline"
         )
         try expect(
-            dictationTextForInsertion("Другое поле",
-                                      previous: previousInsertion,
-                                      applicationPID: 77,
-                                      surroundings: DictationInsertionSurroundings(
-                                        textBeforeCursor: "Первая мысль",
-                                        textAfterCursor: ""
-                                      )),
-            equals: "Другое поле",
-            "switching applications should not insert an unwanted paragraph"
-        )
-        try expect(
             dictationTextForInsertion("Новая позиция",
-                                      previous: previousInsertion,
-                                      applicationPID: 42,
                                       surroundings: DictationInsertionSurroundings(
                                         textBeforeCursor: "Несвязанный текст",
                                         textAfterCursor: ""
                                       )),
-            equals: "Новая позиция",
-            "moving the cursor should not reuse a previous dictation paragraph rule"
+            equals: "\nНовая позиция",
+            "unfinished text at any cursor destination should start one new paragraph"
         )
         try expect(
             dictationTextForInsertion("Продолжение",
-                                      previous: nil,
-                                      applicationPID: 42,
                                       surroundings: DictationInsertionSurroundings(
                                         textBeforeCursor: "Начало фразы ",
                                         textAfterCursor: "уже написано"
@@ -19808,8 +19783,6 @@ private enum ParakeySelfTest {
         )
         try expect(
             dictationTextForInsertion("Продолжение",
-                                      previous: nil,
-                                      applicationPID: 42,
                                       surroundings: DictationInsertionSurroundings(
                                         textBeforeCursor: "Готово. ",
                                         textAfterCursor: "Следующий текст"
@@ -19819,14 +19792,30 @@ private enum ParakeySelfTest {
         )
         try expect(
             dictationTextForInsertion("продолжение",
-                                      previous: previousInsertion,
-                                      applicationPID: 42,
                                       surroundings: DictationInsertionSurroundings(
                                         textBeforeCursor: "Первая мысль ",
                                         textAfterCursor: ""
                                       )),
             equals: "\nПродолжение",
             "a new paragraph should capitalize its first word"
+        )
+        try expect(
+            dictationTextForInsertion("Новая вставка",
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Первая мысль",
+                                        textAfterCursor: "\nСледующий абзац"
+                                      )),
+            equals: "\nНовая вставка",
+            "text on later lines should not turn an end-of-line insertion into an inline continuation"
+        )
+        try expect(
+            dictationTextForInsertion("Новая строка",
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Первая мысль\n",
+                                        textAfterCursor: ""
+                                      )),
+            equals: "Новая строка",
+            "an existing line break should not receive a duplicate paragraph prefix"
         )
 
         let speech = [Float](repeating: 0.08, count: Int(SAMPLE_RATE))
@@ -19923,6 +19912,15 @@ private enum ParakeySelfTest {
             unicodeChunks,
             equals: ["ab", "👩‍💻", "cd"],
             "direct Unicode insertion should keep extended grapheme clusters together while chunking"
+        )
+        let reportedDroppedPrefixChunks = unicodeInsertionChunks(
+            for: "Карточки все еще плохо выглядят",
+            maxUTF16UnitsPerEvent: 20
+        ).map { String(decoding: $0, as: UTF16.self) }
+        try expect(
+            reportedDroppedPrefixChunks,
+            equals: ["Карточки все еще пло", "хо выглядят"],
+            "the reported ChatGPT truncation should remain reproducible at the Unicode event boundary"
         )
         try expect(
             unicodeInsertionChunks(for: "abc", maxUTF16UnitsPerEvent: 0),
