@@ -6833,19 +6833,68 @@ private func removingFinalPeriod(from text: String) -> String {
 }
 
 private func finalizedDictationText(_ text: String,
-                                    removeFinalPeriod: Bool) -> String {
-    guard removeFinalPeriod else { return text }
-    // A long pause becomes exactly one line break. Remove the generated
-    // closing period from each part, not only from the final one.
-    return text
-        .components(separatedBy: "\n")
-        .map(removingFinalPeriod)
-        .joined(separator: "\n")
+                                    removeFinalPeriod: Bool,
+                                    addMissingParagraphPeriods: Bool = false) -> String {
+    let lines = text.components(separatedBy: "\n")
+    if removeFinalPeriod {
+        // A long pause becomes exactly one line break. Remove the generated
+        // closing period from each part, not only from the final one.
+        return lines.map(removingFinalPeriod).joined(separator: "\n")
+    }
+    guard addMissingParagraphPeriods else { return text }
+    return lines.map { line in
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !hasTerminalSentencePunctuation(trimmed) else { return line }
+        return line + "."
+    }.joined(separator: "\n")
 }
 
-private struct DictationInsertionSurroundings: Equatable {
+private struct DictationInsertionSurroundings: Equatable, Sendable {
     let textBeforeCursor: String
     let textAfterCursor: String
+}
+
+private struct CapturedDictationInsertionContext: Equatable, Sendable {
+    let applicationPID: pid_t
+    let bundleIdentifier: String
+    let surroundings: DictationInsertionSurroundings
+}
+
+private let CHAT_EDITOR_BUNDLE_IDENTIFIERS: Set<String> = [
+    "com.openai.codex",
+    "com.openai.chat",
+    "com.anthropic.claudefordesktop",
+    "com.google.GeminiMacOS",
+    "com.google.Chrome",
+]
+
+private func usesChatEditorDictationFormatting(bundleIdentifier: String?) -> Bool {
+    guard let bundleIdentifier else { return false }
+    return CHAT_EDITOR_BUNDLE_IDENTIFIERS.contains(bundleIdentifier)
+}
+
+private func effectiveRemoveFinalPeriod(configured: Bool,
+                                        bundleIdentifier: String?) -> Bool {
+    configured && !usesChatEditorDictationFormatting(bundleIdentifier: bundleIdentifier)
+}
+
+private func resolvedDictationInsertionSurroundings(
+    current: DictationInsertionSurroundings?,
+    capturedAtRecordingStart: CapturedDictationInsertionContext?,
+    applicationPID: pid_t?,
+    bundleIdentifier: String?
+) -> DictationInsertionSurroundings? {
+    if let current { return current }
+    guard let capturedAtRecordingStart,
+          let applicationPID,
+          let bundleIdentifier,
+          usesChatEditorDictationFormatting(bundleIdentifier: bundleIdentifier),
+          capturedAtRecordingStart.applicationPID == applicationPID,
+          capturedAtRecordingStart.bundleIdentifier == bundleIdentifier else {
+        return nil
+    }
+    return capturedAtRecordingStart.surroundings
 }
 
 private func hasTerminalSentencePunctuation(_ text: String) -> Bool {
@@ -6910,7 +6959,8 @@ private func cursorNeedsParagraphBreak(
 }
 
 private func dictationTextForInsertion(_ text: String,
-                                       surroundings: DictationInsertionSurroundings?) -> String {
+                                       surroundings: DictationInsertionSurroundings?,
+                                       addMissingPeriodBeforeParagraph: Bool = false) -> String {
     guard !text.isEmpty, !text.hasPrefix("\n") else { return text }
 
     if let surroundings,
@@ -6919,7 +6969,8 @@ private func dictationTextForInsertion(_ text: String,
     }
     if let surroundings,
        cursorNeedsParagraphBreak(surroundings) {
-        return "\n" + replacingFirstLetter(in: text) { $0.uppercased() }
+        let paragraphPrefix = addMissingPeriodBeforeParagraph ? ".\n" : "\n"
+        return paragraphPrefix + replacingFirstLetter(in: text) { $0.uppercased() }
     }
     return text
 }
@@ -7923,7 +7974,6 @@ private enum FocusedInsertionTargetLocator {
     }
 }
 
-@MainActor
 private enum FocusedTextInsertionContextReader {
     private static let maximumContextLength = 512
 
@@ -11925,6 +11975,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingHUDTargetSessionToken = 0
     private var recordingHUDWaitingForInitialTarget = false
     private var insertionTargetCache: [pid_t: CachedInsertionTarget] = [:]
+    private var recordingStartInsertionContextTask: Task<CapturedDictationInsertionContext?, Never>?
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
     private var errorFlashWorkItem: DispatchWorkItem?
@@ -13976,6 +14027,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let initialInsertionContext = insertionTargetQueryContext()
+        recordingStartInsertionContextTask?.cancel()
+        recordingStartInsertionContextTask = nil
         cancelAudioIdleStop()
         var recoveryJournal: PendingDictationJournal?
         do {
@@ -13995,6 +14048,26 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         isRecording = true
+        if let initialInsertionContext,
+           usesChatEditorDictationFormatting(
+            bundleIdentifier: initialInsertionContext.bundleIdentifier
+           ) {
+            let applicationPID = initialInsertionContext.applicationPID
+            let bundleIdentifier = initialInsertionContext.bundleIdentifier
+            recordingStartInsertionContextTask = Task.detached(priority: .userInitiated) {
+                guard !Task.isCancelled,
+                      let surroundings = FocusedTextInsertionContextReader.read(
+                        applicationPID: applicationPID
+                      ) else {
+                    return nil
+                }
+                return CapturedDictationInsertionContext(
+                    applicationPID: applicationPID,
+                    bundleIdentifier: bundleIdentifier,
+                    surroundings: surroundings
+                )
+            }
+        }
         if setupChecklistWindow?.isVisible == true {
             hotkeyTestSucceeded = true
             updateSetupChecklist()
@@ -14013,6 +14086,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func handleRelease(shortcut: DictationReleaseShortcut = .standard,
                                hotkeyDetectedAt: TimeInterval? = nil) {
         guard isRecording, !isTerminating else { return }
+        let recordingStartInsertionContextTask = self.recordingStartInsertionContextTask
+        self.recordingStartInsertionContextTask = nil
         let releaseReceivedAt = ProcessInfo.processInfo.systemUptime
         let hotkeyDispatchSeconds = hotkeyDetectedAt.map { max(0, releaseReceivedAt - $0) }
         let settingsRefreshStartedAt = ProcessInfo.processInfo.systemUptime
@@ -14026,6 +14101,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let missing = missingPermissions()
         let releasePermissionCheckCompletedAt = ProcessInfo.processInfo.systemUptime
         guard missing.isEmpty else {
+            recordingStartInsertionContextTask?.cancel()
             recoverActiveRecordingToHistory(reason: "permission lost on release") { [weak self] in
                 self?.enterPermissionBlockedState(missing: missing, reason: "hotkey release")
             }
@@ -14044,6 +14120,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let dur: Double
         switch recordingReleaseAction(capturedSampleCount: samples.count) {
         case .discardTooShort(let duration):
+            recordingStartInsertionContextTask?.cancel()
             dur = duration
             log("release: clip too short (\(String(format: "%.2f", dur)) s), discarding")
             PendingDictationRecovery.remove(captured.recoveryURL)
@@ -14099,11 +14176,21 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     totalSeconds: completed.completedAt - asrRequestedAt
                 )
                 if !isTerminating {
+                    let insertionApplication = NSWorkspace.shared.frontmostApplication
+                    let insertionApplicationPID = insertionApplication?.processIdentifier
+                    let insertionBundleIdentifier = insertionApplication?.bundleIdentifier
+                    let usesOfficialFormatting = usesChatEditorDictationFormatting(
+                        bundleIdentifier: insertionBundleIdentifier
+                    )
+                    let removeFinalPeriod = effectiveRemoveFinalPeriod(
+                        configured: settings.removeFinalPeriod,
+                        bundleIdentifier: insertionBundleIdentifier
+                    )
                     let postprocessingStartedAt = ProcessInfo.processInfo.systemUptime
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
-                                                           removeFinalPeriod: settings.removeFinalPeriod,
+                                                           removeFinalPeriod: removeFinalPeriod,
                                                            language: settings.dictationLanguage)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
                     if processed.appliedCorrectionCount > 0 {
@@ -14134,17 +14221,31 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     finalText = finalizedDictationText(
                         finalText,
-                        removeFinalPeriod: settings.removeFinalPeriod
+                        removeFinalPeriod: removeFinalPeriod,
+                        addMissingParagraphPeriods: usesOfficialFormatting
                     )
 
                     if !cleaned.isEmpty {
-                        let insertionApplicationPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-                        let insertionSurroundings = insertionApplicationPID.flatMap {
+                        let currentInsertionSurroundings = insertionApplicationPID.flatMap {
                             FocusedTextInsertionContextReader.read(applicationPID: $0)
+                        }
+                        let capturedInsertionContext = currentInsertionSurroundings == nil
+                            ? await recordingStartInsertionContextTask?.value
+                            : nil
+                        let insertionSurroundings = resolvedDictationInsertionSurroundings(
+                            current: currentInsertionSurroundings,
+                            capturedAtRecordingStart: capturedInsertionContext,
+                            applicationPID: insertionApplicationPID,
+                            bundleIdentifier: insertionBundleIdentifier
+                        )
+                        if currentInsertionSurroundings == nil,
+                           insertionSurroundings != nil {
+                            log("chat editor insertion context restored from recording start: \(insertionBundleIdentifier ?? "unknown")")
                         }
                         let textToInsert = dictationTextForInsertion(
                             finalText,
-                            surroundings: insertionSurroundings
+                            surroundings: insertionSurroundings,
+                            addMissingPeriodBeforeParagraph: usesOfficialFormatting
                         )
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
                         addToHistory(
@@ -14251,6 +14352,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func recoverActiveRecordingToHistory(reason: String,
                                                  runDeferredRefresh: Bool = true,
                                                  completion: (() -> Void)? = nil) {
+        recordingStartInsertionContextTask?.cancel()
+        recordingStartInsertionContextTask = nil
         guard isRecording || audio.isRunning else {
             hotkey.resetToggleState()
             completion?()
@@ -14349,6 +14452,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Termination cannot await transcription, so it only flushes the
     // recovery journal. The next launch transcribes it into history.
     private func cancelRecordingForTermination() {
+        recordingStartInsertionContextTask?.cancel()
+        recordingStartInsertionContextTask = nil
         cancelMaxDurationAutoRelease()
         hotkey.onPress = nil
         hotkey.onRelease = nil
@@ -19914,13 +20019,124 @@ private enum ParakeySelfTest {
             "final period removal should apply to every pause-separated line"
         )
         try expect(
+            finalizedDictationText(
+                "Тестирую первую мысль\nИ задаю вопрос?",
+                removeFinalPeriod: false,
+                addMissingParagraphPeriods: true
+            ),
+            equals: "Тестирую первую мысль.\nИ задаю вопрос?",
+            "official formatting should complete every paragraph without replacing existing punctuation"
+        )
+        for bundleIdentifier in [
+            "com.openai.codex",
+            "com.openai.chat",
+            "com.anthropic.claudefordesktop",
+            "com.google.GeminiMacOS",
+            "com.google.Chrome",
+        ] {
+            try expect(
+                usesChatEditorDictationFormatting(bundleIdentifier: bundleIdentifier),
+                equals: true,
+                "chat editor formatting should recognize \(bundleIdentifier)"
+            )
+        }
+        try expect(
+            usesChatEditorDictationFormatting(bundleIdentifier: "com.apple.TextEdit"),
+            equals: false,
+            "chat editor formatting should not affect unrelated applications"
+        )
+        try expect(
+            effectiveRemoveFinalPeriod(
+                configured: true,
+                bundleIdentifier: "com.openai.codex"
+            ),
+            equals: false,
+            "chat editors should preserve the final period"
+        )
+        try expect(
+            effectiveRemoveFinalPeriod(
+                configured: true,
+                bundleIdentifier: "com.apple.TextEdit"
+            ),
+            equals: true,
+            "other applications should keep the configured final-period removal"
+        )
+        try expect(
+            effectiveRemoveFinalPeriod(
+                configured: false,
+                bundleIdentifier: "com.apple.TextEdit"
+            ),
+            equals: false,
+            "disabled final-period removal should remain disabled everywhere"
+        )
+        try expect(
+            finalizedDictationText(
+                "Проверка.",
+                removeFinalPeriod: effectiveRemoveFinalPeriod(
+                    configured: true,
+                    bundleIdentifier: "com.google.Chrome"
+                )
+            ),
+            equals: "Проверка.",
+            "Chrome chat text should keep its generated final period"
+        )
+        let capturedChatSurroundings = DictationInsertionSurroundings(
+            textBeforeCursor: "Первая мысль",
+            textAfterCursor: ""
+        )
+        let capturedChatContext = CapturedDictationInsertionContext(
+            applicationPID: 42,
+            bundleIdentifier: "com.openai.codex",
+            surroundings: capturedChatSurroundings
+        )
+        try expect(
+            resolvedDictationInsertionSurroundings(
+                current: nil,
+                capturedAtRecordingStart: capturedChatContext,
+                applicationPID: 42,
+                bundleIdentifier: "com.openai.codex"
+            ),
+            equals: capturedChatSurroundings,
+            "chat editors should restore the cursor context captured at recording start"
+        )
+        try expect(
+            resolvedDictationInsertionSurroundings(
+                current: nil,
+                capturedAtRecordingStart: capturedChatContext,
+                applicationPID: 77,
+                bundleIdentifier: "com.openai.codex"
+            ),
+            equals: nil,
+            "chat editor fallback should not cross application processes"
+        )
+        try expect(
+            resolvedDictationInsertionSurroundings(
+                current: nil,
+                capturedAtRecordingStart: capturedChatContext,
+                applicationPID: 42,
+                bundleIdentifier: "com.apple.TextEdit"
+            ),
+            equals: nil,
+            "chat editor fallback should not leak into unrelated applications"
+        )
+        try expect(
+            dictationTextForInsertion("Продолжение",
+                                      surroundings: DictationInsertionSurroundings(
+                                        textBeforeCursor: "Первая мысль",
+                                        textAfterCursor: ""
+                                      ),
+                                      addMissingPeriodBeforeParagraph: true),
+            equals: ".\nПродолжение",
+            "official continuation should finish the prior sentence and add one newline"
+        )
+        try expect(
             dictationTextForInsertion("Продолжение",
                                       surroundings: DictationInsertionSurroundings(
                                         textBeforeCursor: "Первая мысль",
                                         textAfterCursor: ""
                                       )),
             equals: "\nПродолжение",
-            "continuation after a previous dictation without terminal punctuation should add one newline"
+            "simple continuation should add one newline without adding punctuation"
         )
         try expect(
             dictationTextForInsertion("Продолжение",
