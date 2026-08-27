@@ -113,6 +113,8 @@ let DICTATION_ERROR_FLASH_SECONDS: TimeInterval = 1.5  // how long the menu-bar 
 let AUDIO_START_RETRY_DELAYS_SECONDS: [UInt64] = [1, 3, 8]
 let AUDIO_IDLE_STOP_DELAY_SECONDS: TimeInterval = 5
 let AUDIO_CONFIGURATION_CHANGE_SUPPRESSION_SECONDS: TimeInterval = 1
+let AUDIO_CAPTURE_TAP_MAX_SILENCE_SECONDS: TimeInterval = 1.5
+let AUDIO_CAPTURE_STALL_LEVEL_TICKS = 18
 let MODEL_DOWNLOAD_HEADROOM_BYTES: Int64 = 500 * 1024 * 1024
 
 let SETTINGS_SUITE = "com.abc.abxvoiceassist"
@@ -4946,6 +4948,19 @@ private struct CapturedRecording {
     let flattenSeconds: TimeInterval
 }
 
+private func audioCaptureTapIsFresh(
+    engineStarted: Bool,
+    lastTapCallbackUptime: TimeInterval?,
+    now: TimeInterval,
+    maximumSilence: TimeInterval
+) -> Bool {
+    guard engineStarted,
+          let lastTapCallbackUptime,
+          maximumSilence > 0 else { return false }
+    return now >= lastTapCallbackUptime
+        && now - lastTapCallbackUptime <= maximumSilence
+}
+
 private enum PendingDictationRecovery {
     private static let directoryName = "PendingDictations"
     private static let fileExtension = "sdaudio"
@@ -5317,6 +5332,7 @@ final class AudioCapture: @unchecked Sendable {
     private var recordingGeneration: UInt64 = 0
     private var recoveryJournal: PendingDictationJournal?
     private var engineStarted = false
+    private var lastTapCallbackUptime: TimeInterval?
     private var configurationObserver: NSObjectProtocol?
 
     var onConfigurationChange: (@Sendable () -> Void)?
@@ -5329,6 +5345,19 @@ final class AudioCapture: @unchecked Sendable {
     var isEngineStarted: Bool {
         lock.lock(); defer { lock.unlock() }
         return engineStarted
+    }
+
+    func hasRecentInputActivity(
+        maximumSilence: TimeInterval = 1.5,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return audioCaptureTapIsFresh(
+            engineStarted: engineStarted,
+            lastTapCallbackUptime: lastTapCallbackUptime,
+            now: now,
+            maximumSilence: maximumSilence
+        )
     }
 
     fileprivate func startEngine(inputDevicePreference: String = "",
@@ -5439,6 +5468,7 @@ final class AudioCapture: @unchecked Sendable {
         let recoveryJournal = self.recoveryJournal
         self.recoveryJournal = nil
         engineStarted = false
+        lastTapCallbackUptime = nil
         // Clear the converter trio under the same lock the render
         // thread snapshots them with — removeTap below does not wait
         // for an in-flight tap callback. A callback that already took
@@ -5595,6 +5625,7 @@ final class AudioCapture: @unchecked Sendable {
         // not wait for us, and the local strong reference keeps the
         // converter alive for the rest of this call.
         lock.lock()
+        lastTapCallbackUptime = ProcessInfo.processInfo.systemUptime
         let running = _isRunning
         let generation = recordingGeneration
         let converter = self.converter
@@ -5629,6 +5660,7 @@ final class AudioCapture: @unchecked Sendable {
         }
         guard let ch = out.floatChannelData?[0] else { return }
         let frameCount = Int(out.frameLength)
+        guard frameCount > 0 else { return }
         var arr: [Float] = []
         arr.reserveCapacity(frameCount)
         var sumSquares: Double = 0
@@ -13856,6 +13888,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             lastRecordingLevelSequence = snapshot.sequence
             staleRecordingLevelTicks = 0
         }
+        if staleRecordingLevelTicks >= AUDIO_CAPTURE_STALL_LEVEL_TICKS {
+            recoverStalledAudioCapture()
+            return
+        }
         let unsuppressedLevel = staleRecordingLevelTicks > 8 ? 0 : snapshot.level
         let rawLevel = visibleRecordingLevel(rawLevel: unsuppressedLevel)
         let attack: Float = rawLevel > recordingVisualLevel ? 0.65 : 0.28
@@ -13872,6 +13908,21 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             hideRecordingHUD()
         }
+    }
+
+    private func recoverStalledAudioCapture() {
+        guard isRecording, !isTerminating else { return }
+        recordingStartInsertionContextTask?.cancel()
+        recordingStartInsertionContextTask = nil
+        cancelMaxDurationAutoRelease()
+        isRecording = false
+        stopRecordingLevelMeter(hideHUD: false)
+        unmuteIfWeMuted()
+        let captured = audio.endRecording()
+        PendingDictationRecovery.remove(captured.recoveryURL)
+        log("AudioCapture: recording tap stalled; rebuilding the input graph")
+        signalDictationFailure()
+        restartAudioInput(reason: "recording tap stalled")
     }
 
     private var recordingHUDExpandedSize: NSSize {
@@ -14670,6 +14721,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordingStartInsertionContextTask?.cancel()
         recordingStartInsertionContextTask = nil
         cancelAudioIdleStop()
+        if audio.isEngineStarted,
+           !audio.hasRecentInputActivity(
+                maximumSilence: AUDIO_CAPTURE_TAP_MAX_SILENCE_SECONDS
+           ) {
+            log("AudioCapture: stale input tap detected before recording; rebuilding")
+            stopAudioEngineImmediately()
+        }
         var recoveryJournal: PendingDictationJournal?
         do {
             recoveryJournal = try PendingDictationRecovery.createJournal()
@@ -14769,6 +14827,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let captured = audio.endRecording()
         let audioFinalizedAt = ProcessInfo.processInfo.systemUptime
         let samples = captured.samples
+        if samples.isEmpty {
+            recordingStartInsertionContextTask?.cancel()
+            log("release: no audio frames captured; rebuilding the input graph")
+            PendingDictationRecovery.remove(captured.recoveryURL)
+            signalDictationFailure()
+            restartAudioInput(reason: "empty recording")
+            return
+        }
         let dur: Double
         switch recordingReleaseAction(capturedSampleCount: samples.count) {
         case .discardTooShort(let duration):
@@ -16063,18 +16129,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func quitClicked(_ sender: NSMenuItem) {
-        guard confirmStopDictation() else { return }
+        _ = SuperDictateControlPanelRegistry.terminateExistingPanelIfPresent()
         NSApp.terminate(self)
-    }
-
-    private func confirmStopDictation() -> Bool {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Stop ABX Voice Assist?"
-        alert.informativeText = "The \(hotkey.hotkey.name) dictation shortcut will stop until you open ABX Voice Assist again. Use Close to hide windows while keeping dictation running."
-        alert.addButton(withTitle: "Keep Running")
-        alert.addButton(withTitle: "Stop Dictation")
-        return alert.runModal() == .alertSecondButtonReturn
     }
 
     @objc private func cancelRecordingClicked(_ sender: NSMenuItem) {
@@ -16366,7 +16422,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func quitFromPopover(_ sender: Any) {
         statusPopover?.performClose(nil)
-        guard confirmStopDictation() else { return }
+        _ = SuperDictateControlPanelRegistry.terminateExistingPanelIfPresent()
         NSApp.terminate(self)
     }
 
@@ -23895,6 +23951,30 @@ private enum ParakeySelfTest {
             equals: .discardTooShort(duration: 0),
             "release decision should handle invalid sample rates defensively"
         )
+        try expect(
+            audioCaptureTapIsFresh(engineStarted: true,
+                                   lastTapCallbackUptime: 98.8,
+                                   now: 100,
+                                   maximumSilence: 1.5),
+            equals: true,
+            "a recently active input tap should remain usable"
+        )
+        try expect(
+            audioCaptureTapIsFresh(engineStarted: true,
+                                   lastTapCallbackUptime: 98.4,
+                                   now: 100,
+                                   maximumSilence: 1.5),
+            equals: false,
+            "a stalled input tap should force an audio graph rebuild"
+        )
+        try expect(
+            audioCaptureTapIsFresh(engineStarted: false,
+                                   lastTapCallbackUptime: 100,
+                                   now: 100,
+                                   maximumSilence: 1.5),
+            equals: false,
+            "a stopped audio engine must never report a healthy tap"
+        )
 
         let recoveryURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("abxvoiceassist-recovery-test-\(UUID().uuidString)")
@@ -25493,6 +25573,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
         NSApp.setActivationPolicy(.regular)
+        installStandardMainMenu()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
         showWindow()
         startRefreshTimer()
@@ -25507,7 +25588,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return true
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if window?.isVisible != true {
+            showWindow()
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
         historyCopyNoticeWorkItem?.cancel()
@@ -25538,15 +25625,94 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         if closingWindow === window {
             settingsWindow?.orderOut(nil)
             settingsWindow = nil
-            NSApp.terminate(nil)
+            window = nil
+            NSApp.setActivationPolicy(.accessory)
         }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard sender === window else { return true }
+        settingsWindow?.orderOut(nil)
+        sender.orderOut(nil)
+        NSApp.hide(nil)
+        NSApp.setActivationPolicy(.accessory)
+        return false
     }
 
     private func t(_ russian: String, _ english: String) -> String {
         localizedText(russian, english, language: language)
     }
 
+    private func installStandardMainMenu() {
+        let mainMenu = NSMenu()
+
+        let applicationItem = NSMenuItem()
+        mainMenu.addItem(applicationItem)
+        let applicationMenu = NSMenu(title: "ABX Voice Assist")
+        applicationItem.submenu = applicationMenu
+
+        let hide = NSMenuItem(title: t("Скрыть ABX Voice Assist", "Hide ABX Voice Assist"),
+                              action: #selector(NSApplication.hide(_:)),
+                              keyEquivalent: "h")
+        hide.target = NSApp
+        applicationMenu.addItem(hide)
+
+        let hideOthers = NSMenuItem(title: t("Скрыть остальные", "Hide Others"),
+                                    action: #selector(NSApplication.hideOtherApplications(_:)),
+                                    keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        hideOthers.target = NSApp
+        applicationMenu.addItem(hideOthers)
+
+        let showAll = NSMenuItem(title: t("Показать все", "Show All"),
+                                 action: #selector(NSApplication.unhideAllApplications(_:)),
+                                 keyEquivalent: "")
+        showAll.target = NSApp
+        applicationMenu.addItem(showAll)
+        applicationMenu.addItem(.separator())
+
+        let quit = NSMenuItem(title: t("Выйти из ABX Voice Assist", "Quit ABX Voice Assist"),
+                              action: #selector(quitWholeApplication(_:)),
+                              keyEquivalent: "q")
+        quit.target = self
+        applicationMenu.addItem(quit)
+
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: t("Правка", "Edit"))
+        editItem.submenu = editMenu
+        editMenu.addItem(withTitle: t("Отменить", "Undo"), action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: t("Вырезать", "Cut"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: t("Копировать", "Copy"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: t("Вставить", "Paste"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: t("Выбрать все", "Select All"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        let windowItem = NSMenuItem()
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: t("Окно", "Window"))
+        windowItem.submenu = windowMenu
+        windowMenu.addItem(withTitle: t("Свернуть", "Minimize"),
+                           action: #selector(NSWindow.performMiniaturize(_:)),
+                           keyEquivalent: "m")
+        windowMenu.addItem(withTitle: t("Масштаб", "Zoom"),
+                           action: #selector(NSWindow.performZoom(_:)),
+                           keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: t("Закрыть окно", "Close Window"),
+                           action: #selector(NSWindow.performClose(_:)),
+                           keyEquivalent: "w")
+        NSApp.windowsMenu = windowMenu
+        NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func quitWholeApplication(_ sender: Any?) {
+        SuperDictateAgentService.stop()
+        NSApp.terminate(sender)
+    }
+
     private func showWindow() {
+        NSApp.setActivationPolicy(.regular)
         if let window {
             refresh(force: true)
             window.makeKeyAndOrderFront(nil)
