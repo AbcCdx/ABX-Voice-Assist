@@ -38,6 +38,7 @@ import ServiceManagement
 import SwiftUI
 @preconcurrency import Translation
 import UniformTypeIdentifiers
+import WhisperKit
 
 // MARK: - Constants
 
@@ -88,6 +89,8 @@ let DIAGNOSTICS_LOG_MAX_LINE_CHARACTERS = 4096
 let TRANSCRIPT_HISTORY_ARCHIVE_MAX_ENTRIES = 100
 let TRANSCRIPT_HISTORY_RETENTION_SECONDS: TimeInterval = 12 * 60 * 60
 let RECORDING_HUD_BASE_SIZE = NSSize(width: 64, height: 38)
+let WHISPER_MODEL_VARIANT = "openai_whisper-large-v3-v20240930_626MB"
+let WHISPER_MODEL_REPOSITORY = "argmaxinc/whisperkit-coreml"
 let RECORDING_HUD_ANIMATE_IN_SECONDS: TimeInterval = 0.32
 let RECORDING_HUD_ANIMATE_OUT_SECONDS: TimeInterval = 0.23
 let RECORDING_HUD_TRANSCRIBING_RESOLVE_SECONDS: TimeInterval = 0.20
@@ -496,7 +499,7 @@ enum SpeechModelProfile: String, CaseIterable {
     var displayName: String {
         switch self {
         case .multilingualV3:
-            return "Multilingual (Parakeet TDT v3)"
+            return "Whisper large-v3 (Parakeet fallback)"
         case .englishUnified:
             return "English optimized (Parakeet Unified, deprecated)"
         }
@@ -505,7 +508,7 @@ enum SpeechModelProfile: String, CaseIterable {
     var shortName: String {
         switch self {
         case .multilingualV3:
-            return "Parakeet TDT v3"
+            return "Whisper large-v3"
         case .englishUnified:
             return "Parakeet Unified"
         }
@@ -514,14 +517,14 @@ enum SpeechModelProfile: String, CaseIterable {
     var aboutModelText: String {
         switch self {
         case .multilingualV3:
-            return "FluidAudio · Parakeet TDT v3 multilingual (CoreML / ANE)"
+            return "WhisperKit · Whisper large-v3 (Core ML), with Parakeet TDT v3 fallback"
         case .englishUnified:
             return "FluidAudio · Parakeet Unified English (deprecated)"
         }
     }
 
     var setupReadyDetail: String {
-        "\(shortName) is loaded locally."
+        "\(shortName) is loaded locally. Parakeet is available as a fallback."
     }
 
     var cacheResetDetail: String {
@@ -1168,11 +1171,11 @@ struct DictationProjectTerm: Equatable, Sendable {
 let BUILT_IN_PROJECT_TERMS: [DictationProjectTerm] = [
     DictationProjectTerm(
         canonical: "ABLX",
-        aliases: ["аблэкс", "аблекс", "эй би эл экс"]
+        aliases: ["аблэкс", "аблекс", "абл икс", "эй би эл экс"]
     ),
     DictationProjectTerm(
         canonical: "ABX Voice Assist",
-        aliases: ["абикс войс ассист", "эй би экс войс ассист", "войс ассист"]
+        aliases: ["абикс войс ассист", "аб икс войс ассист", "эй би экс войс ассист", "войс ассист"]
     ),
 ]
 
@@ -5643,14 +5646,21 @@ private final class AudioConverterInputProvider: @unchecked Sendable {
 // ever break: it refuses (and, in DEBUG, asserts on) a re-entrant
 // call instead of corrupting ANE state.
 
-private enum LoadedSpeechEngine {
-    case parakeetV3(AsrManager)
+private enum SpeechEngineKind: String, Sendable {
+    case whisperLargeV3
+    case parakeetV3
+}
+
+private struct LoadedSpeechEngine {
+    var whisperKit: WhisperKit?
+    var parakeetV3: AsrManager?
 }
 
 private struct TranscriptionWorkerResult: Sendable {
     let text: String
     let confidence: Float
     let tokenTimings: [TokenTiming]?
+    var engine: SpeechEngineKind = .parakeetV3
     let workerQueueSeconds: Double
     let decoderPreparationSeconds: Double
     let fluidCallSeconds: Double
@@ -5661,6 +5671,7 @@ private struct TranscriptionWorkerResult: Sendable {
             text: text,
             confidence: confidence,
             tokenTimings: tokenTimings,
+            engine: engine,
             workerQueueSeconds: workerQueueSeconds,
             decoderPreparationSeconds: decoderPreparationSeconds,
             fluidCallSeconds: fluidCallSeconds,
@@ -5699,8 +5710,201 @@ private let AUTO_LANGUAGE_ALLOWED_LATIN_WORDS: Set<String> = [
 ]
 
 private let COMMON_ASR_HALLUCINATIONS = [
-    "thank you", "thanks for watching", "please subscribe", "subtitles by",
+    "thank you", "thanks for watching", "thanks for listening", "please subscribe",
+    "subtitles by", "спасибо за просмотр", "спасибо за внимание",
+    "продолжение следует", "субтитры сделал", "субтитры подготовил",
 ]
+
+private let MINIMUM_ASR_AUDIO_SAMPLES = Int(SAMPLE_RATE * 0.3)
+
+private func containsEnoughAudioForASR(_ samples: [Float]) -> Bool {
+    samples.count >= MINIMUM_ASR_AUDIO_SAMPLES
+}
+
+private struct AudioSpeechEvidence: Equatable {
+    let overallRMS: Float
+    let lowerRMS: Float
+    let upperRMS: Float
+    let voicedBlockFraction: Float
+
+    var containsLikelySpeech: Bool {
+        guard overallRMS >= 0.0005, upperRMS >= 0.003 else { return false }
+        if overallRMS >= 0.015 { return true }
+        return upperRMS >= max(0.004, lowerRMS * 1.8)
+            && voicedBlockFraction >= 0.025
+    }
+}
+
+private func audioSpeechEvidence(
+    samples: [Float],
+    blockSamples: Int = LONG_DICTATION_PAUSE_BLOCK_SAMPLES
+) -> AudioSpeechEvidence {
+    guard !samples.isEmpty, blockSamples > 0 else {
+        return AudioSpeechEvidence(overallRMS: 0,
+                                   lowerRMS: 0,
+                                   upperRMS: 0,
+                                   voicedBlockFraction: 0)
+    }
+
+    var totalSumSquares: Float = 0
+    var blockRMSValues: [Float] = []
+    blockRMSValues.reserveCapacity((samples.count + blockSamples - 1) / blockSamples)
+    for start in stride(from: 0, to: samples.count, by: blockSamples) {
+        let end = min(samples.count, start + blockSamples)
+        var blockSumSquares: Float = 0
+        for sample in samples[start..<end] {
+            let clamped = max(-1, min(1, sample.isFinite ? sample : 0))
+            blockSumSquares += clamped * clamped
+        }
+        totalSumSquares += blockSumSquares
+        blockRMSValues.append(sqrt(blockSumSquares / Float(max(1, end - start))))
+    }
+
+    let sorted = blockRMSValues.sorted()
+    func percentile(_ fraction: Double) -> Float {
+        guard !sorted.isEmpty else { return 0 }
+        let index = Int((Double(sorted.count - 1) * fraction).rounded(.down))
+        return sorted[max(0, min(sorted.count - 1, index))]
+    }
+    let lowerRMS = percentile(0.20)
+    let upperRMS = percentile(0.90)
+    let voicedThreshold = max(0.004, lowerRMS * 1.8)
+    let voicedBlocks = blockRMSValues.filter { $0 >= voicedThreshold }.count
+    return AudioSpeechEvidence(
+        overallRMS: sqrt(totalSumSquares / Float(samples.count)),
+        lowerRMS: lowerRMS,
+        upperRMS: upperRMS,
+        voicedBlockFraction: Float(voicedBlocks) / Float(max(1, blockRMSValues.count))
+    )
+}
+
+private struct WhisperWordTimingValue {
+    let word: String
+    let start: Float
+    let end: Float
+    let probability: Float
+}
+
+private struct WhisperTranscriptionCandidate {
+    let text: String
+    let language: String
+    let averageLogProbability: Float
+    let minimumWordProbability: Float
+    let averageWordProbability: Float
+    let words: [WhisperWordTimingValue]
+    let elapsedSeconds: Double
+}
+
+private func shouldRejectWhisperCandidate(_ candidate: WhisperTranscriptionCandidate) -> Bool {
+    let trimmed = candidate.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return true }
+    let likelyStockHallucination = containsCommonASRHallucination(trimmed)
+        && (candidate.averageLogProbability < -0.8
+            || candidate.minimumWordProbability < 0.08)
+    return likelyStockHallucination
+        || (candidate.averageLogProbability < -1.2
+            && candidate.minimumWordProbability < 0.02)
+}
+
+private func whisperTextAddingLogicalParagraphBreaks(
+    _ text: String,
+    words: [WhisperWordTimingValue]
+) -> String {
+    guard words.count > 1, !text.contains("\n") else { return text }
+
+    var boundaryWordIndices: [Int] = []
+    for index in 1..<words.count {
+        let gap = words[index].start - words[index - 1].end
+        let previousWord = words[index - 1].word
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let followsCompletedSentence = hasTerminalSentencePunctuation(previousWord)
+        if gap >= 1.8 || (gap >= 1.2 && followsCompletedSentence) {
+            boundaryWordIndices.append(index)
+            if boundaryWordIndices.count == MAX_DICTATION_SEGMENTS - 1 { break }
+        }
+    }
+    guard !boundaryWordIndices.isEmpty else { return text }
+
+    let boundaries = Set(boundaryWordIndices)
+    var boundaryPositions: [String.Index] = []
+    var searchStart = text.startIndex
+    for (index, wordTiming) in words.enumerated() {
+        let word = wordTiming.word.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !word.isEmpty,
+              let range = text.range(of: word,
+                                     options: [.literal],
+                                     range: searchStart..<text.endIndex) else {
+            return text
+        }
+        if boundaries.contains(index) {
+            boundaryPositions.append(range.lowerBound)
+        }
+        searchStart = range.upperBound
+    }
+
+    var result = text
+    for boundary in boundaryPositions.reversed() {
+        var whitespaceStart = boundary
+        while whitespaceStart > result.startIndex {
+            let previous = result.index(before: whitespaceStart)
+            guard result[previous].isWhitespace else { break }
+            whitespaceStart = previous
+        }
+        result.replaceSubrange(whitespaceStart..<boundary, with: "\n")
+    }
+    return result
+}
+
+private func cachedWhisperKitModelFolder(in downloadBase: URL) -> URL? {
+    let folder = downloadBase
+        .appendingPathComponent("models/argmaxinc/whisperkit-coreml", isDirectory: true)
+        .appendingPathComponent(WHISPER_MODEL_VARIANT, isDirectory: true)
+    let requiredComponents = [
+        "AudioEncoder.mlmodelc",
+        "MelSpectrogram.mlmodelc",
+        "TextDecoder.mlmodelc",
+    ]
+    guard requiredComponents.allSatisfy({ component in
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(
+            atPath: folder.appendingPathComponent(component).path,
+            isDirectory: &isDirectory
+        ) && isDirectory.boolValue
+    }) else {
+        return nil
+    }
+    return folder
+}
+
+private func cachedWhisperKitTokenizerFolder(in downloadBase: URL) -> URL? {
+    let folder = downloadBase
+        .appendingPathComponent("models/openai/whisper-large-v3", isDirectory: true)
+    guard FileManager.default.fileExists(
+        atPath: folder.appendingPathComponent("tokenizer.json").path
+    ) else {
+        return nil
+    }
+    return folder
+}
+
+private func loadProductionWhisperKit() async throws -> WhisperKit {
+    let downloadBase = try whisperKitDownloadBaseURL()
+    let cachedModelFolder = cachedWhisperKitModelFolder(in: downloadBase)
+    let cachedTokenizerFolder = cachedWhisperKitTokenizerFolder(in: downloadBase)
+    let config = WhisperKitConfig(
+        model: cachedModelFolder == nil ? WHISPER_MODEL_VARIANT : nil,
+        downloadBase: downloadBase,
+        modelRepo: WHISPER_MODEL_REPOSITORY,
+        modelFolder: cachedModelFolder?.path,
+        tokenizerFolder: cachedTokenizerFolder ?? downloadBase,
+        verbose: false,
+        prewarm: false,
+        load: true,
+        download: cachedModelFolder == nil,
+        useBackgroundDownloadSession: false
+    )
+    return try await WhisperKit(config)
+}
 
 private func transcriptScriptProfile(_ text: String) -> TranscriptScriptProfile {
     var cyrillicLetters = 0
@@ -5833,7 +6037,22 @@ actor TranscriptionWorker {
             log("ASR: downloading + verifying + loading \(profile.shortName) CoreML weights…")
         }
         let t0 = Date()
-        engine = .parakeetV3(try await loadParakeetV3(progressHandler: progressHandler))
+        let whisperKit: WhisperKit?
+        do {
+            let whisperStartedAt = Date()
+            whisperKit = try await loadProductionWhisperKit()
+            log("ASR: Whisper large-v3 ready in \(String(format: "%.2f", Date().timeIntervalSince(whisperStartedAt))) s")
+        } catch {
+            whisperKit = nil
+            log("ASR: Whisper large-v3 unavailable; loading Parakeet fallback: \(error.localizedDescription)")
+        }
+        let parakeet: AsrManager?
+        if whisperKit == nil {
+            parakeet = try await loadParakeetV3(progressHandler: progressHandler)
+        } else {
+            parakeet = nil
+        }
+        engine = LoadedSpeechEngine(whisperKit: whisperKit, parakeetV3: parakeet)
         loadedProfile = profile
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
@@ -5864,10 +6083,11 @@ actor TranscriptionWorker {
     }
 
     fileprivate func transcribe(samples: [Float],
-                               language: Language? = nil,
-                               requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
+                                pauseSplitOffsets: [Int] = [],
+                                language: DictationLanguage = .auto,
+                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
-        guard engine != nil else { throw NSError(domain: "Parakey", code: -2) }
+        guard var loadedEngine = engine else { throw NSError(domain: "Parakey", code: -2) }
         guard !inFlight else {
             log("ASR: transcribe re-entered while another transcription is in flight — refusing (ParakeyApp.isBusy should make this impossible)")
             assertionFailure("TranscriptionWorker.transcribe re-entered across a suspension point")
@@ -5876,8 +6096,125 @@ actor TranscriptionWorker {
         inFlight = true
         defer { inFlight = false }
 
-        let primary = try await transcribeOnce(samples: samples, language: language)
-        guard language == nil,
+        let speechEvidence = audioSpeechEvidence(samples: samples)
+        guard containsEnoughAudioForASR(samples), speechEvidence.containsLikelySpeech else {
+            log("ASR: discarded clip without sufficient duration or speech evidence")
+            return TranscriptionWorkerResult(
+                text: "",
+                confidence: 1,
+                tokenTimings: nil,
+                engine: loadedEngine.whisperKit == nil ? .parakeetV3 : .whisperLargeV3,
+                workerQueueSeconds: workerEnteredAt - requestedAt,
+                decoderPreparationSeconds: 0,
+                fluidCallSeconds: 0,
+                fluidProcessingSeconds: 0
+            )
+        }
+
+        if let whisperKit = loadedEngine.whisperKit {
+            do {
+                let candidate = try await transcribeWhisperOnce(
+                    whisperKit: whisperKit,
+                    samples: samples,
+                    language: language
+                )
+                if !shouldRejectWhisperCandidate(candidate) {
+                    log("ASR: Whisper large-v3 selected language=\(candidate.language) meanWord=\(String(format: "%.3f", candidate.averageWordProbability)) minWord=\(String(format: "%.3f", candidate.minimumWordProbability))")
+                    return TranscriptionWorkerResult(
+                        text: whisperTextAddingLogicalParagraphBreaks(
+                            candidate.text,
+                            words: candidate.words
+                        ),
+                        confidence: candidate.averageWordProbability,
+                        tokenTimings: nil,
+                        engine: .whisperLargeV3,
+                        workerQueueSeconds: workerEnteredAt - requestedAt,
+                        decoderPreparationSeconds: 0,
+                        fluidCallSeconds: candidate.elapsedSeconds,
+                        fluidProcessingSeconds: candidate.elapsedSeconds
+                    )
+                }
+                log("ASR: Whisper result rejected as empty or likely hallucinated; using Parakeet fallback")
+            } catch {
+                log("ASR: Whisper transcription failed; using Parakeet fallback: \(error.localizedDescription)")
+            }
+        }
+
+        let parakeet: AsrManager
+        if let existingParakeet = loadedEngine.parakeetV3 {
+            parakeet = existingParakeet
+        } else {
+            log("ASR: loading Parakeet fallback on demand")
+            parakeet = try await loadParakeetV3(progressHandler: nil)
+            loadedEngine.parakeetV3 = parakeet
+            engine = loadedEngine
+        }
+
+        return try await transcribeParakeet(
+            asr: parakeet,
+            samples: samples,
+            language: language,
+            workerQueueSeconds: workerEnteredAt - requestedAt
+        )
+    }
+
+    private func transcribeWhisperOnce(
+        whisperKit: WhisperKit,
+        samples: [Float],
+        language: DictationLanguage
+    ) async throws -> WhisperTranscriptionCandidate {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let languageCode = language == .auto ? nil : language.rawValue
+        let options = DecodingOptions(
+            language: languageCode,
+            usePrefillPrompt: languageCode != nil,
+            detectLanguage: languageCode == nil,
+            wordTimestamps: true,
+            noSpeechThreshold: 0.55,
+            chunkingStrategy: ChunkingStrategy.none
+        )
+        let results = try await whisperKit.transcribe(
+            audioArray: samples,
+            decodeOptions: options
+        )
+        let segments = results.flatMap(\.segments)
+        let words = segments.compactMap(\.words).flatMap { $0 }.map {
+            WhisperWordTimingValue(word: $0.word,
+                                   start: $0.start,
+                                   end: $0.end,
+                                   probability: $0.probability)
+        }
+        let averageLogProbability = segments.isEmpty
+            ? -Float.infinity
+            : segments.map(\.avgLogprob).reduce(0, +) / Float(segments.count)
+        let wordProbabilities = words.map(\.probability).filter(\.isFinite)
+        let averageWordProbability = wordProbabilities.isEmpty
+            ? 0
+            : wordProbabilities.reduce(0, +) / Float(wordProbabilities.count)
+        return WhisperTranscriptionCandidate(
+            text: results.map(\.text).joined()
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            language: results.first?.language ?? languageCode ?? "auto",
+            averageLogProbability: averageLogProbability,
+            minimumWordProbability: wordProbabilities.min() ?? 0,
+            averageWordProbability: averageWordProbability,
+            words: words,
+            elapsedSeconds: ProcessInfo.processInfo.systemUptime - startedAt
+        )
+    }
+
+    private func transcribeParakeet(
+        asr: AsrManager,
+        samples: [Float],
+        language: DictationLanguage,
+        workerQueueSeconds: Double
+    ) async throws -> TranscriptionWorkerResult {
+        let primary = try await transcribeParakeetOnce(
+            asr: asr,
+            samples: samples,
+            language: language.fluidLanguage
+        )
+        guard language == .auto,
               shouldVerifyAutoTranscription(text: primary.text,
                                             confidence: primary.confidence,
                                             tokenTimings: primary.tokenTimings ?? []) else {
@@ -5885,7 +6222,8 @@ actor TranscriptionWorker {
                 text: primary.text,
                 confidence: primary.confidence,
                 tokenTimings: primary.tokenTimings,
-                workerQueueSeconds: workerEnteredAt - requestedAt,
+                engine: .parakeetV3,
+                workerQueueSeconds: workerQueueSeconds,
                 decoderPreparationSeconds: primary.decoderPreparationSeconds,
                 fluidCallSeconds: primary.fluidCallSeconds,
                 fluidProcessingSeconds: primary.fluidProcessingSeconds
@@ -5894,7 +6232,11 @@ actor TranscriptionWorker {
 
         var attempts = [primary]
         for languageHint in Self.autoVerificationLanguages {
-            attempts.append(try await transcribeOnce(samples: samples, language: languageHint))
+            attempts.append(try await transcribeParakeetOnce(
+                asr: asr,
+                samples: samples,
+                language: languageHint
+            ))
         }
         let selectedIndex = selectedAutoTranscriptionIndex(
             texts: attempts.map(\.text),
@@ -5920,59 +6262,58 @@ actor TranscriptionWorker {
             text: selected.text,
             confidence: selected.confidence,
             tokenTimings: selected.tokenTimings,
-            workerQueueSeconds: workerEnteredAt - requestedAt,
+            engine: .parakeetV3,
+            workerQueueSeconds: workerQueueSeconds,
             decoderPreparationSeconds: attempts.reduce(0) { $0 + $1.decoderPreparationSeconds },
             fluidCallSeconds: attempts.reduce(0) { $0 + $1.fluidCallSeconds },
             fluidProcessingSeconds: attempts.reduce(0) { $0 + $1.fluidProcessingSeconds }
         )
     }
 
-    private func transcribeOnce(samples: [Float],
-                                language: Language?) async throws -> TranscriptionWorkerResult {
-        guard let engine else { throw NSError(domain: "Parakey", code: -2) }
-        switch engine {
-        case .parakeetV3(let asr):
-            let decoderPreparationStartedAt = ProcessInfo.processInfo.systemUptime
-            var state = try TdtDecoderState()
-            let fluidCallStartedAt = ProcessInfo.processInfo.systemUptime
-            let result = try await asr.transcribe(samples, decoderState: &state, language: language)
-            let fluidCallCompletedAt = ProcessInfo.processInfo.systemUptime
-            return TranscriptionWorkerResult(
-                text: result.text,
-                confidence: result.confidence,
-                tokenTimings: result.tokenTimings,
-                workerQueueSeconds: 0,
-                decoderPreparationSeconds: fluidCallStartedAt - decoderPreparationStartedAt,
-                fluidCallSeconds: fluidCallCompletedAt - fluidCallStartedAt,
-                fluidProcessingSeconds: result.processingTime
-            )
-        }
+    private func transcribeParakeetOnce(
+        asr: AsrManager,
+        samples: [Float],
+        language: Language?
+    ) async throws -> TranscriptionWorkerResult {
+        let decoderPreparationStartedAt = ProcessInfo.processInfo.systemUptime
+        var state = try TdtDecoderState()
+        let fluidCallStartedAt = ProcessInfo.processInfo.systemUptime
+        let result = try await asr.transcribe(samples,
+                                              decoderState: &state,
+                                              language: language)
+        let fluidCallCompletedAt = ProcessInfo.processInfo.systemUptime
+        return TranscriptionWorkerResult(
+            text: result.text,
+            confidence: result.confidence,
+            tokenTimings: result.tokenTimings,
+            engine: .parakeetV3,
+            workerQueueSeconds: 0,
+            decoderPreparationSeconds: fluidCallStartedAt - decoderPreparationStartedAt,
+            fluidCallSeconds: fluidCallCompletedAt - fluidCallStartedAt,
+            fluidProcessingSeconds: result.processingTime
+        )
     }
 
-    /// Transcribe pause-separated portions serially. The ANE model must never
-    /// receive concurrent requests, and one line break is added only for a
-    /// long silence detected in the original recording.
-    fileprivate func transcribe(segments: [[Float]],
-                                language: Language? = nil,
-                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
-        guard segments.count > 1 else {
-            return try await transcribe(samples: segments.first ?? [],
-                                        language: language,
-                                        requestedAt: requestedAt)
-        }
-
+    private func transcribeParakeetSegments(
+        asr: AsrManager,
+        segments: [[Float]],
+        language: DictationLanguage
+    ) async throws -> TranscriptionWorkerResult {
         var results: [TranscriptionWorkerResult] = []
         results.reserveCapacity(segments.count)
-        for (index, segment) in segments.enumerated() {
-            let result = try await transcribe(samples: segment,
-                                               language: language,
-                                               requestedAt: index == 0 ? requestedAt : ProcessInfo.processInfo.systemUptime)
+        for segment in segments {
+            let result = try await transcribeParakeetOnce(
+                asr: asr,
+                samples: segment,
+                language: language.fluidLanguage
+            )
             results.append(result)
         }
         return TranscriptionWorkerResult(
             text: results.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n"),
             confidence: results.map(\.confidence).min() ?? 0,
             tokenTimings: nil,
+            engine: .parakeetV3,
             workerQueueSeconds: results.first?.workerQueueSeconds ?? 0,
             decoderPreparationSeconds: results.reduce(0) { $0 + $1.decoderPreparationSeconds },
             fluidCallSeconds: results.reduce(0) { $0 + $1.fluidCallSeconds },
@@ -5986,11 +6327,13 @@ actor TranscriptionWorker {
     /// cannot be mapped back to the emitted text.
     fileprivate func transcribeDictation(samples: [Float],
                                           pauseSplitOffsets: [Int],
-                                          language: Language? = nil,
+                                          language: DictationLanguage = .auto,
                                           requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
         let whole = try await transcribe(samples: samples,
+                                         pauseSplitOffsets: pauseSplitOffsets,
                                          language: language,
                                          requestedAt: requestedAt)
+        guard whole.engine == .parakeetV3 else { return whole }
         guard !pauseSplitOffsets.isEmpty else { return whole }
 
         if let tokenTimings = whole.tokenTimings,
@@ -6004,15 +6347,17 @@ actor TranscriptionWorker {
         }
 
         log("ASR: token timing paragraph mapping unavailable; using segmented fallback")
-        let fallback = try await transcribe(
+        guard let parakeet = engine?.parakeetV3 else { return whole }
+        let fallback = try await transcribeParakeetSegments(
+            asr: parakeet,
             segments: dictationSegmentsSeparatedByLongPause(samples: samples),
-            language: language,
-            requestedAt: ProcessInfo.processInfo.systemUptime
+            language: language
         )
         return TranscriptionWorkerResult(
             text: fallback.text,
             confidence: fallback.confidence,
             tokenTimings: nil,
+            engine: .parakeetV3,
             workerQueueSeconds: whole.workerQueueSeconds + fallback.workerQueueSeconds,
             decoderPreparationSeconds: whole.decoderPreparationSeconds + fallback.decoderPreparationSeconds,
             fluidCallSeconds: whole.fluidCallSeconds + fallback.fluidCallSeconds,
@@ -6033,6 +6378,9 @@ actor TranscriptionWorker {
     }
 
     func unload() async {
+        if let whisperKit = engine?.whisperKit {
+            await whisperKit.unloadModels()
+        }
         engine = nil
         loadedProfile = nil
         ready = false
@@ -12591,7 +12939,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await asr.transcribe(
                     samples: samples,
-                    language: settings.dictationLanguage.fluidLanguage,
+                    language: settings.dictationLanguage,
                     requestedAt: requestedAt
                 )
                 let completedAt = ProcessInfo.processInfo.systemUptime
@@ -14144,7 +14492,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !pauseSplitOffsets.isEmpty {
             log("release: detected \(pauseSplitOffsets.count) long pause(s); preserving context and adding paragraphs from token timings")
         }
-        let language = settings.dictationLanguage.fluidLanguage
+        let language = settings.dictationLanguage
         let transcriptionTask = Task.detached(priority: .userInitiated) {
             let transcription = try await transcriptionWorker.transcribeDictation(
                 samples: samples,
@@ -14249,12 +14597,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         )
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
                         addToHistory(
-                            finalText,
+                            textToInsert,
                             transcriptionDurationSeconds: asrTiming.totalSeconds,
                             asrTiming: asrTiming,
                             rebuildMenuAfterPersisting: false
                         )
-                        recordDictationUsage(text: finalText,
+                        recordDictationUsage(text: textToInsert,
                                              audioSeconds: dur,
                                              asrSeconds: asrTiming.totalSeconds)
                         let historyCompletedAt = ProcessInfo.processInfo.systemUptime
@@ -14390,7 +14738,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await asr.transcribe(
                     samples: captured.samples,
-                    language: settings.dictationLanguage.fluidLanguage,
+                    language: settings.dictationLanguage,
                     requestedAt: requestedAt
                 )
                 let completedAt = ProcessInfo.processInfo.systemUptime
@@ -18688,6 +19036,8 @@ private enum ParakeySelfTest {
             return runSuite("audio-level", testAudioLevelMetering)
         case "audio-conversion":
             return runSuite("audio-conversion", testAudioConversion)
+        case "asr-safety":
+            return runSuite("asr-safety", testASRSafety)
         case "audio-input":
             return runSuite("audio-input", testAudioInputDeviceFiltering)
         case "audio-input-live":
@@ -18748,6 +19098,7 @@ private enum ParakeySelfTest {
         try testAICleanup()
         try testAudioLevelMetering()
         try testAudioConversion()
+        try testASRSafety()
         try testAudioInputDeviceFiltering()
         try testSpeechModelStartupStatus()
         try testAudioRouteChangeDecision()
@@ -19300,7 +19651,7 @@ private enum ParakeySelfTest {
                 memoryLines: ["Resident: 100 MB"],
                 permissionLines: ["Microphone: granted", "Accessibility: granted", "Input Monitoring: granted"],
                 settingLines: [
-                    "Speech model: Multilingual (Parakeet TDT v3)",
+                    "Speech model: Whisper large-v3 (Parakeet fallback)",
                     "Language: Auto-detect",
                     "Recent transcripts: Last 5 (1 in memory)",
                     "Text corrections: 1 configured",
@@ -19318,7 +19669,7 @@ private enum ParakeySelfTest {
                    "diagnostics report should not include text correction contents")
         try expect(report.contains("Text corrections: 1 configured"), equals: true,
                    "diagnostics report should include correction counts")
-        try expect(report.contains("Speech model: Multilingual (Parakeet TDT v3)"), equals: true,
+        try expect(report.contains("Speech model: Whisper large-v3 (Parakeet fallback)"), equals: true,
                    "diagnostics report should include the speech model")
         try expect(report.contains("Recent log lines:"), equals: true,
                    "diagnostics report should include the recent log section")
@@ -19860,7 +20211,7 @@ private enum ParakeySelfTest {
                                      isStartupInProgress: false,
                                      startupStatusTitle: "Loading speech model…",
                                      failure: nil),
-            equals: SetupChecklistRowState(detail: "Parakeet TDT v3 is loaded locally.",
+            equals: SetupChecklistRowState(detail: "Whisper large-v3 is loaded locally. Parakeet is available as a fallback.",
                                            status: "Ready",
                                            buttonTitle: nil),
             "setup checklist should show the speech model when ready"
@@ -20901,6 +21252,110 @@ private enum ParakeySelfTest {
               converted.frameLength > 0 else {
             throw SelfTestFailure.failed("audio conversion should produce 16 kHz mono samples")
         }
+    }
+
+    private static func testASRSafety() throws {
+        let silence = [Float](repeating: 0, count: Int(SAMPLE_RATE))
+        try expect(
+            audioSpeechEvidence(samples: silence).containsLikelySpeech,
+            equals: false,
+            "digital silence must not reach an ASR decoder"
+        )
+
+        let quietNoise = [Float](repeating: 0.001, count: Int(SAMPLE_RATE))
+        try expect(
+            audioSpeechEvidence(samples: quietNoise).containsLikelySpeech,
+            equals: false,
+            "steady low-level noise must not become dictated text"
+        )
+
+        try expect(
+            containsEnoughAudioForASR([Float](repeating: 0.08,
+                                               count: MINIMUM_ASR_AUDIO_SAMPLES - 1)),
+            equals: false,
+            "sub-300ms recovery fragments must be discarded instead of retried forever"
+        )
+        try expect(
+            containsEnoughAudioForASR([Float](repeating: 0.08,
+                                               count: MINIMUM_ASR_AUDIO_SAMPLES)),
+            equals: true,
+            "a 300ms clip may proceed when it also contains speech evidence"
+        )
+
+        var speechLike = [Float](repeating: 0, count: Int(SAMPLE_RATE))
+        for index in 3_000..<13_000 {
+            speechLike[index] = sin(Float(index) * 0.11) * 0.08
+        }
+        try expect(
+            audioSpeechEvidence(samples: speechLike).containsLikelySpeech,
+            equals: true,
+            "sustained speech-level audio must pass the local speech gate"
+        )
+
+        let stockHallucination = WhisperTranscriptionCandidate(
+            text: "Спасибо за просмотр.",
+            language: "ru",
+            averageLogProbability: -1.0,
+            minimumWordProbability: 0.04,
+            averageWordProbability: 0.31,
+            words: [],
+            elapsedSeconds: 0.1
+        )
+        try expect(
+            shouldRejectWhisperCandidate(stockHallucination),
+            equals: true,
+            "a low-confidence stock phrase must fall back instead of being inserted"
+        )
+        let spokenPhrase = WhisperTranscriptionCandidate(
+            text: "Спасибо за просмотр.",
+            language: "ru",
+            averageLogProbability: -0.18,
+            minimumWordProbability: 0.72,
+            averageWordProbability: 0.91,
+            words: [],
+            elapsedSeconds: 0.1
+        )
+        try expect(
+            shouldRejectWhisperCandidate(spokenPhrase),
+            equals: false,
+            "a confidently spoken phrase must not be removed by a blocklist"
+        )
+
+        let paragraphText = whisperTextAddingLogicalParagraphBreaks(
+            "Первое предложение. Второе продолжение.",
+            words: [
+                WhisperWordTimingValue(word: "Первое", start: 0, end: 0.4, probability: 0.9),
+                WhisperWordTimingValue(word: "предложение.", start: 0.5, end: 1.0, probability: 0.9),
+                WhisperWordTimingValue(word: "Второе", start: 2.3, end: 2.7, probability: 0.9),
+                WhisperWordTimingValue(word: "продолжение.", start: 2.8, end: 3.4, probability: 0.9),
+            ]
+        )
+        try expect(
+            paragraphText,
+            equals: "Первое предложение.\nВторое продолжение.",
+            "one logical pause must produce exactly one paragraph break"
+        )
+        try expect(
+            paragraphText.contains("\n\n"),
+            equals: false,
+            "logical paragraph formatting must never create an empty line"
+        )
+        try expect(
+            whisperTextAddingLogicalParagraphBreaks(
+                "ABX Voice Assist, Audio to Drum Rack.",
+                words: [
+                    WhisperWordTimingValue(word: "ABX", start: 0, end: 0.2, probability: 0.9),
+                    WhisperWordTimingValue(word: "Voice", start: 0.3, end: 0.5, probability: 0.9),
+                    WhisperWordTimingValue(word: "Assist,", start: 0.6, end: 0.9, probability: 0.9),
+                    WhisperWordTimingValue(word: "Audio", start: 2.15, end: 2.4, probability: 0.9),
+                    WhisperWordTimingValue(word: "to", start: 2.45, end: 2.55, probability: 0.9),
+                    WhisperWordTimingValue(word: "Drum", start: 2.6, end: 2.8, probability: 0.9),
+                    WhisperWordTimingValue(word: "Rack.", start: 2.85, end: 3.2, probability: 0.9),
+                ]
+            ),
+            equals: "ABX Voice Assist, Audio to Drum Rack.",
+            "a list hesitation must not be mistaken for a paragraph"
+        )
     }
 
     private static func testTranscriptCorrections() throws {
@@ -24890,7 +25345,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                  "Hold this key to record dictation.")),
             holdToTalkRow(),
         ]))
-        stack.addArrangedSubview(settingsSection(t("НАСТРОЙКИ PARAKEET TDT 0.6B V3", "PARAKEET TDT 0.6B V3"), rows: [
+        stack.addArrangedSubview(settingsSection(t("НАСТРОЙКИ WHISPER LARGE-V3", "WHISPER LARGE-V3"), rows: [
             languageSettingsRow(),
         ]))
         stack.addArrangedSubview(settingsSection(t("ЗВУК", "AUDIO"), rows: [
@@ -25485,7 +25940,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row(t("Горячая клавиша", "Hotkey"), control: hotkey)
         row(t("Нажми и говори", "Hold to talk"), control: compactSettingsValue(t("ВСЕГДА", "ALWAYS")))
 
-        section("PARAKEET TDT 0.6B V3")
+        section("WHISPER LARGE-V3")
         let languagePopup = compactSettingsPopup(
             options: SUPPORTED_DICTATION_LANGUAGES.map {
                 (localizedDictationLanguageName($0, interfaceLanguage: language), $0.rawValue)
@@ -25845,7 +26300,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                  "Hold this key to record dictation.")),
             holdToTalkRow(),
         ]))
-        root.addArrangedSubview(settingsSection(t("НАСТРОЙКИ PARAKEET TDT 0.6B V3", "PARAKEET TDT 0.6B V3"), rows: [
+        root.addArrangedSubview(settingsSection(t("НАСТРОЙКИ WHISPER LARGE-V3", "WHISPER LARGE-V3"), rows: [
             languageSettingsRow(),
         ]))
         root.addArrangedSubview(settingsSection(t("ЗВУК", "AUDIO"), rows: [
@@ -28359,10 +28814,347 @@ private func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
     }
 }
 
+private struct AudioFileTranscriptionDiagnosticRecord: Encodable {
+    let path: String
+    let durationSeconds: Double?
+    let rawText: String?
+    let repairedText: String?
+    let confidence: Float?
+    let lowerTailConfidence: Float?
+    let paragraphBreakCount: Int?
+    let engine: String?
+    let elapsedSeconds: Double
+    let error: String?
+}
+
+private func printAudioFileTranscriptionDiagnosticRecord(
+    _ record: AudioFileTranscriptionDiagnosticRecord,
+    to output: FileHandle
+) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    guard let data = try? encoder.encode(record),
+          let json = String(data: data, encoding: .utf8) else {
+        fputs("AUDIO_TRANSCRIPTION_JSON_ENCODING_FAILED\n", stderr)
+        return
+    }
+    guard let line = "\(json)\n".data(using: .utf8) else { return }
+    do {
+        try output.write(contentsOf: line)
+    } catch {
+        fputs("AUDIO_TRANSCRIPTION_JSON_WRITE_FAILED: \(error.localizedDescription)\n",
+              stderr)
+    }
+}
+
+private func runAudioFileTranscriptionDiagnostic(arguments: [String]) async -> Int32 {
+    guard arguments.first == "--transcribe-audio-files",
+          arguments.count > 2 else {
+        fputs("usage: ABX Voice Assist --transcribe-audio-files <jsonl-output> <audio-file> [...]\n",
+              stderr)
+        return EXIT_FAILURE
+    }
+
+    let outputURL = URL(fileURLWithPath: arguments[1])
+    do {
+        try Data().write(to: outputURL, options: .atomic)
+    } catch {
+        fputs("AUDIO TRANSCRIPTION OUTPUT FAILED: \(error.localizedDescription)\n", stderr)
+        return EXIT_FAILURE
+    }
+    guard let output = try? FileHandle(forWritingTo: outputURL) else {
+        fputs("AUDIO TRANSCRIPTION OUTPUT FAILED: cannot open output file\n", stderr)
+        return EXIT_FAILURE
+    }
+    defer { try? output.close() }
+
+    let worker = TranscriptionWorker()
+    do {
+        try await worker.load(profile: .productionDefault)
+    } catch {
+        fputs("AUDIO TRANSCRIPTION MODEL FAILED: \(error.localizedDescription)\n", stderr)
+        return EXIT_FAILURE
+    }
+    defer {
+        Task { await worker.unload() }
+    }
+
+    let converter = AudioConverter()
+    var failureCount = 0
+    for path in arguments.dropFirst(2) {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        do {
+            let samples = try converter.resampleAudioFile(path: path)
+            let paragraphOffsets = longDictationPauseSplitOffsets(samples: samples)
+            let requestedAt = ProcessInfo.processInfo.systemUptime
+            let transcription = try await worker.transcribeDictation(
+                samples: samples,
+                pauseSplitOffsets: paragraphOffsets,
+                language: .auto,
+                requestedAt: requestedAt
+            )
+            let repaired = processedDictationText(
+                rawTranscript: transcription.text,
+                corrections: [],
+                removeFillerWords: false,
+                removeFinalPeriod: false,
+                language: .auto
+            )
+            printAudioFileTranscriptionDiagnosticRecord(
+                AudioFileTranscriptionDiagnosticRecord(
+                    path: path,
+                    durationSeconds: Double(samples.count) / SAMPLE_RATE,
+                    rawText: transcription.text,
+                    repairedText: repaired.text,
+                    confidence: transcription.confidence,
+                    lowerTailConfidence: transcription.tokenTimings.flatMap(lowerTailTokenConfidence),
+                    paragraphBreakCount: transcription.text.filter { $0 == "\n" }.count,
+                    engine: transcription.engine.rawValue,
+                    elapsedSeconds: ProcessInfo.processInfo.systemUptime - startedAt,
+                    error: nil
+                ),
+                to: output
+            )
+        } catch {
+            failureCount += 1
+            printAudioFileTranscriptionDiagnosticRecord(
+                AudioFileTranscriptionDiagnosticRecord(
+                    path: path,
+                    durationSeconds: nil,
+                    rawText: nil,
+                    repairedText: nil,
+                    confidence: nil,
+                    lowerTailConfidence: nil,
+                    paragraphBreakCount: nil,
+                    engine: nil,
+                    elapsedSeconds: ProcessInfo.processInfo.systemUptime - startedAt,
+                    error: error.localizedDescription
+                ),
+                to: output
+            )
+        }
+    }
+    return failureCount == 0 ? EXIT_SUCCESS : EXIT_FAILURE
+}
+
+private struct WhisperAudioFileTranscriptionDiagnosticRecord: Encodable {
+    let path: String
+    let durationSeconds: Double?
+    let text: String?
+    let detectedLanguage: String?
+    let languageProbability: Float?
+    let averageLogProbability: Float?
+    let minimumWordProbability: Float?
+    let elapsedSeconds: Double
+    let model: String
+    let error: String?
+}
+
+private func printWhisperAudioFileTranscriptionDiagnosticRecord(
+    _ record: WhisperAudioFileTranscriptionDiagnosticRecord,
+    to output: FileHandle
+) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    guard let data = try? encoder.encode(record),
+          let json = String(data: data, encoding: .utf8),
+          let line = "\(json)\n".data(using: .utf8) else {
+        fputs("WHISPER_TRANSCRIPTION_JSON_ENCODING_FAILED\n", stderr)
+        return
+    }
+    do {
+        try output.write(contentsOf: line)
+    } catch {
+        fputs("WHISPER_TRANSCRIPTION_JSON_WRITE_FAILED: \(error.localizedDescription)\n",
+              stderr)
+    }
+}
+
+private func whisperKitDownloadBaseURL() throws -> URL {
+    let directory = try superDictateApplicationSupportDirectory()
+        .appendingPathComponent("Models/WhisperKit", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory,
+                                            withIntermediateDirectories: true,
+                                            attributes: [.posixPermissions: 0o700])
+    return directory
+}
+
+private func whisperLanguageCode(for rawValue: String) -> String? {
+    switch rawValue.lowercased() {
+    case "auto": return nil
+    case "ru", "en", "uk": return rawValue.lowercased()
+    default: return nil
+    }
+}
+
+private func selectedWhisperLanguage(
+    detectedLanguage: String,
+    from probabilities: [String: Float]
+) -> (language: String, probability: Float) {
+    let supported = [
+        (code: "ru", name: "russian"),
+        (code: "en", name: "english"),
+        (code: "uk", name: "ukrainian"),
+    ]
+    let normalizedDetectedLanguage: String?
+    if supported.contains(where: { $0.code == detectedLanguage }) {
+        normalizedDetectedLanguage = detectedLanguage
+    } else {
+        normalizedDetectedLanguage = supported
+            .first(where: { $0.name == detectedLanguage })?
+            .code
+    }
+    if let normalizedDetectedLanguage {
+        let name = supported.first(where: { $0.code == normalizedDetectedLanguage })?.name
+        return (
+            normalizedDetectedLanguage,
+            probabilities[normalizedDetectedLanguage]
+                ?? name.flatMap { probabilities[$0] }
+                ?? 0
+        )
+    }
+
+    return supported
+        .map { language in
+            (language.code,
+             probabilities[language.code] ?? probabilities[language.name] ?? 0)
+        }
+        .max(by: { $0.1 < $1.1 })
+        .map { (language: $0.0, probability: $0.1) }
+        ?? (language: "ru", probability: 0)
+}
+
+private func runWhisperAudioFileTranscriptionDiagnostic(arguments: [String]) async -> Int32 {
+    guard arguments.first == "--transcribe-audio-files-whisper",
+          arguments.count > 3 else {
+        fputs("usage: ABX Voice Assist --transcribe-audio-files-whisper <jsonl-output> <auto|ru|en|uk> <audio-file> [...]\n",
+              stderr)
+        return EXIT_FAILURE
+    }
+
+    let outputURL = URL(fileURLWithPath: arguments[1])
+    let languageArgument = arguments[2].lowercased()
+    guard ["auto", "ru", "en", "uk"].contains(languageArgument) else {
+        fputs("WHISPER TRANSCRIPTION LANGUAGE FAILED: expected auto, ru, en, or uk\n", stderr)
+        return EXIT_FAILURE
+    }
+    do {
+        try Data().write(to: outputURL, options: .atomic)
+    } catch {
+        fputs("WHISPER TRANSCRIPTION OUTPUT FAILED: \(error.localizedDescription)\n", stderr)
+        return EXIT_FAILURE
+    }
+    guard let output = try? FileHandle(forWritingTo: outputURL) else {
+        fputs("WHISPER TRANSCRIPTION OUTPUT FAILED: cannot open output file\n", stderr)
+        return EXIT_FAILURE
+    }
+    defer { try? output.close() }
+
+    let whisperKit: WhisperKit
+    do {
+        whisperKit = try await WhisperKit(
+            model: WHISPER_MODEL_VARIANT,
+            downloadBase: try whisperKitDownloadBaseURL(),
+            modelRepo: WHISPER_MODEL_REPOSITORY,
+            verbose: false,
+            prewarm: false,
+            load: true,
+            download: true
+        )
+    } catch {
+        fputs("WHISPER TRANSCRIPTION MODEL FAILED: \(error.localizedDescription)\n", stderr)
+        return EXIT_FAILURE
+    }
+
+    let requestedLanguageCode = whisperLanguageCode(for: languageArgument)
+
+    let converter = AudioConverter()
+    var failureCount = 0
+    for path in arguments.dropFirst(3) {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        do {
+            let samples = try converter.resampleAudioFile(path: path)
+            let languageSelection: (language: String, probability: Float)
+            if let requestedLanguageCode {
+                languageSelection = (requestedLanguageCode, 1)
+            } else {
+                let detection = try await whisperKit.detectLangauge(audioArray: samples)
+                languageSelection = selectedWhisperLanguage(
+                    detectedLanguage: detection.language,
+                    from: detection.langProbs
+                )
+            }
+            let options = DecodingOptions(
+                language: languageSelection.language,
+                usePrefillPrompt: true,
+                detectLanguage: false,
+                wordTimestamps: true,
+                noSpeechThreshold: 0.55,
+                chunkingStrategy: ChunkingStrategy.none
+            )
+            let results = try await whisperKit.transcribe(
+                audioArray: samples,
+                decodeOptions: options
+            )
+            let text = results.map(\.text).joined()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let segments = results.flatMap(\.segments)
+            let words = segments.compactMap(\.words).flatMap { $0 }
+            let averageLogProbability = segments.isEmpty
+                ? nil
+                : segments.map(\.avgLogprob).reduce(0, +) / Float(segments.count)
+            printWhisperAudioFileTranscriptionDiagnosticRecord(
+                WhisperAudioFileTranscriptionDiagnosticRecord(
+                    path: path,
+                    durationSeconds: Double(samples.count) / SAMPLE_RATE,
+                    text: text,
+                    detectedLanguage: languageSelection.language,
+                    languageProbability: languageSelection.probability,
+                    averageLogProbability: averageLogProbability,
+                    minimumWordProbability: words.map(\.probability).min(),
+                    elapsedSeconds: ProcessInfo.processInfo.systemUptime - startedAt,
+                    model: WHISPER_MODEL_VARIANT,
+                    error: nil
+                ),
+                to: output
+            )
+        } catch {
+            failureCount += 1
+            printWhisperAudioFileTranscriptionDiagnosticRecord(
+                WhisperAudioFileTranscriptionDiagnosticRecord(
+                    path: path,
+                    durationSeconds: nil,
+                    text: nil,
+                    detectedLanguage: nil,
+                    languageProbability: nil,
+                    averageLogProbability: nil,
+                    minimumWordProbability: nil,
+                    elapsedSeconds: ProcessInfo.processInfo.systemUptime - startedAt,
+                    model: WHISPER_MODEL_VARIANT,
+                    error: error.localizedDescription
+                ),
+                to: output
+            )
+        }
+    }
+    await whisperKit.unloadModels()
+    return failureCount == 0 ? EXIT_SUCCESS : EXIT_FAILURE
+}
+
 let app = NSApplication.shared
 let launchArguments = Array(CommandLine.arguments.dropFirst())
 if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) {
     exit(diagnosticResult)
+} else if launchArguments.first == "--transcribe-audio-files" {
+    Task.detached(priority: .userInitiated) {
+        exit(await runAudioFileTranscriptionDiagnostic(arguments: launchArguments))
+    }
+    dispatchMain()
+} else if launchArguments.first == "--transcribe-audio-files-whisper" {
+    Task.detached(priority: .userInitiated) {
+        exit(await runWhisperAudioFileTranscriptionDiagnostic(arguments: launchArguments))
+    }
+    dispatchMain()
 } else if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
     guard launchArguments.count == 2 else {
         fputs("usage: ABX Voice Assist --export-hud-animation <frames-directory>\n", stderr)

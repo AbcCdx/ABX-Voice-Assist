@@ -23,12 +23,15 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/FluidInference/FluidAudio.git",
                  exact: "0.15.5"),
+        .package(url: "https://github.com/argmaxinc/argmax-oss-swift.git",
+                 exact: "1.0.0"),
     ],
     targets: [
         .executableTarget(
             name: "Parakey",
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio"),
+                .product(name: "WhisperKit", package: "argmax-oss-swift"),
             ]
             // No `resources:` here on purpose. SwiftPM bundles them as
             // a `<Package>_<Target>.bundle` directory next to the
