@@ -8,12 +8,11 @@ answering the speaker, inventing facts, or changing meaning.
 ## Current pipeline
 
 1. A local audio gate rejects silence and steady low-level noise before ASR.
-2. Whisper large-v3 runs locally through WhisperKit and Core ML. Automatic
-   mode detects the language in the same decode; explicit RU, EN, and UK modes
-   constrain decoding to that language.
-3. Empty or suspicious low-confidence stock phrases are rejected. Parakeet
-   TDT 0.6B v3 is loaded only on demand as the local fallback.
-4. Word timestamps place exactly one line break at a deliberate logical pause.
+2. Parakeet TDT 0.6B v3 runs locally through FluidAudio and Core ML. Automatic
+   mode is limited to Russian, English, and Ukrainian verification when the
+   first decode has low confidence.
+3. Empty or suspicious low-confidence stock phrases are rejected.
+4. Token timestamps place exactly one line break at a deliberate logical pause.
    Ordinary hesitations and list pauses remain inside the same paragraph.
 5. Deterministic repair removes known ASR artifacts.
 6. A conservative project dictionary replaces complete spoken aliases with
@@ -38,10 +37,11 @@ real transcript. Broad or ambiguous aliases can corrupt ordinary speech.
 
 ## Next research-backed stage
 
-Use the confirmed private corpus to measure future local model changes against
-the current Whisper large-v3 baseline. Do not switch to a smaller model only
-for speed unless word accuracy, mixed-language names, silence rejection, and
-paragraph placement remain acceptable.
+Use the confirmed private corpus and live corrections to measure future local
+model changes against the current Parakeet TDT v3 baseline. Whisper large-v3
+remains an offline comparison engine. Do not switch the live path again unless
+word accuracy, latency, mixed-language names, silence rejection, and paragraph
+placement all remain acceptable.
 
 The evaluation set should record, for each phrase:
 
@@ -58,10 +58,12 @@ repeated errors without false replacements in ordinary text.
 
 1. Completed: compare Parakeet and Whisper large-v3 on the user's private
    RU/EN/UK Telegram corpus.
-2. Completed: integrate native WhisperKit with Parakeet loaded only as fallback.
+2. Completed: integrate native WhisperKit as an offline comparison engine;
+   live dictation uses Parakeet after measured Whisper latency and morphology
+   regressions on this Mac.
 3. Completed: reject clips without local speech evidence and suspicious
    low-confidence stock hallucinations.
-4. Completed: place one paragraph from Whisper word gaps without splitting
+4. Completed: place one paragraph from ASR word gaps without splitting
    normal list hesitations.
 5. Collect confirmed recognition failures from History. Do not learn directly
    from every transcript because unconfirmed output may teach new mistakes.

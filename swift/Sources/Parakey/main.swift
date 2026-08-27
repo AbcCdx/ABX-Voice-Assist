@@ -499,7 +499,7 @@ enum SpeechModelProfile: String, CaseIterable {
     var displayName: String {
         switch self {
         case .multilingualV3:
-            return "Whisper large-v3 (Parakeet fallback)"
+            return "Parakeet TDT 0.6B v3"
         case .englishUnified:
             return "English optimized (Parakeet Unified, deprecated)"
         }
@@ -508,7 +508,7 @@ enum SpeechModelProfile: String, CaseIterable {
     var shortName: String {
         switch self {
         case .multilingualV3:
-            return "Whisper large-v3"
+            return "Parakeet TDT v3"
         case .englishUnified:
             return "Parakeet Unified"
         }
@@ -517,14 +517,14 @@ enum SpeechModelProfile: String, CaseIterable {
     var aboutModelText: String {
         switch self {
         case .multilingualV3:
-            return "WhisperKit · Whisper large-v3 (Core ML), with Parakeet TDT v3 fallback"
+            return "FluidAudio · Parakeet TDT 0.6B v3 (Core ML)"
         case .englishUnified:
             return "FluidAudio · Parakeet Unified English (deprecated)"
         }
     }
 
     var setupReadyDetail: String {
-        "\(shortName) is loaded locally. Parakeet is available as a fallback."
+        "\(shortName) is loaded locally."
     }
 
     var cacheResetDetail: String {
@@ -6037,22 +6037,14 @@ actor TranscriptionWorker {
             log("ASR: downloading + verifying + loading \(profile.shortName) CoreML weights…")
         }
         let t0 = Date()
-        let whisperKit: WhisperKit?
-        do {
-            let whisperStartedAt = Date()
-            whisperKit = try await loadProductionWhisperKit()
-            log("ASR: Whisper large-v3 ready in \(String(format: "%.2f", Date().timeIntervalSince(whisperStartedAt))) s")
-        } catch {
-            whisperKit = nil
-            log("ASR: Whisper large-v3 unavailable; loading Parakeet fallback: \(error.localizedDescription)")
-        }
-        let parakeet: AsrManager?
-        if whisperKit == nil {
-            parakeet = try await loadParakeetV3(progressHandler: progressHandler)
-        } else {
-            parakeet = nil
-        }
-        engine = LoadedSpeechEngine(whisperKit: whisperKit, parakeetV3: parakeet)
+        // Keep live dictation on the low-latency engine. On this Mac Whisper
+        // large-v3 added about 1.1-1.8 seconds to every short utterance and
+        // sometimes changed imperative endings (for example, "записывай" to
+        // "записывать"). Whisper remains available to the offline diagnostic
+        // commands, where its mixed-language accuracy can be evaluated without
+        // delaying the recording HUD.
+        let parakeet = try await loadParakeetV3(progressHandler: progressHandler)
+        engine = LoadedSpeechEngine(whisperKit: nil, parakeetV3: parakeet)
         loadedProfile = profile
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
@@ -19669,7 +19661,7 @@ private enum ParakeySelfTest {
                 memoryLines: ["Resident: 100 MB"],
                 permissionLines: ["Microphone: granted", "Accessibility: granted", "Input Monitoring: granted"],
                 settingLines: [
-                    "Speech model: Whisper large-v3 (Parakeet fallback)",
+                    "Speech model: Parakeet TDT 0.6B v3",
                     "Language: Auto-detect",
                     "Recent transcripts: Last 5 (1 in memory)",
                     "Text corrections: 1 configured",
@@ -19687,7 +19679,7 @@ private enum ParakeySelfTest {
                    "diagnostics report should not include text correction contents")
         try expect(report.contains("Text corrections: 1 configured"), equals: true,
                    "diagnostics report should include correction counts")
-        try expect(report.contains("Speech model: Whisper large-v3 (Parakeet fallback)"), equals: true,
+        try expect(report.contains("Speech model: Parakeet TDT 0.6B v3"), equals: true,
                    "diagnostics report should include the speech model")
         try expect(report.contains("Recent log lines:"), equals: true,
                    "diagnostics report should include the recent log section")
@@ -20229,7 +20221,7 @@ private enum ParakeySelfTest {
                                      isStartupInProgress: false,
                                      startupStatusTitle: "Loading speech model…",
                                      failure: nil),
-            equals: SetupChecklistRowState(detail: "Whisper large-v3 is loaded locally. Parakeet is available as a fallback.",
+            equals: SetupChecklistRowState(detail: "Parakeet TDT v3 is loaded locally.",
                                            status: "Ready",
                                            buttonTitle: nil),
             "setup checklist should show the speech model when ready"
