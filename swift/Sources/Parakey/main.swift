@@ -88,6 +88,7 @@ let DIAGNOSTICS_LOG_MAX_LINES = 40
 let DIAGNOSTICS_LOG_MAX_LINE_CHARACTERS = 4096
 let TRANSCRIPT_HISTORY_ARCHIVE_MAX_ENTRIES = 100
 let TRANSCRIPT_HISTORY_RETENTION_SECONDS: TimeInterval = 12 * 60 * 60
+let DICTATION_DIAGNOSTIC_ARCHIVE_MAX_RECORDINGS = 100
 let RECORDING_HUD_BASE_SIZE = NSSize(width: 64, height: 38)
 let WHISPER_MODEL_VARIANT = "openai_whisper-large-v3-v20240930_626MB"
 let WHISPER_MODEL_REPOSITORY = "argmaxinc/whisperkit-coreml"
@@ -5075,6 +5076,129 @@ private final class PendingDictationJournal: @unchecked Sendable {
             }
             _ = Darwin.close(fileDescriptor)
             fileDescriptor = -1
+        }
+    }
+}
+
+private struct DictationDiagnosticMetadata: Codable, Equatable, Sendable {
+    let id: UUID
+    let createdAt: Date
+    let sampleRate: Double
+    let sampleCount: Int
+    let audioDurationSeconds: Double
+    let rawTranscript: String
+    let finalText: String
+    let engine: String
+    let confidence: Float
+    let asrTiming: ASRTimingBreakdown
+    let destinationBundleIdentifier: String?
+}
+
+private enum DictationDiagnosticArchive {
+    private static let directoryName = "DictationArchive"
+    private static let queue = DispatchQueue(label: "ABX Voice Assist.DictationDiagnosticArchive",
+                                             qos: .utility)
+
+    static func directoryURL() throws -> URL {
+        let url = try superDictateApplicationSupportDirectory()
+            .appendingPathComponent(directoryName, isDirectory: true)
+        try FileManager.default.createDirectory(at: url,
+                                                withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700],
+                                              ofItemAtPath: url.path)
+        return url
+    }
+
+    static func storeAsync(recoveryURL: URL?, metadata: DictationDiagnosticMetadata) {
+        guard let recoveryURL else { return }
+        queue.async {
+            do {
+                let audioURL = try store(recoveryURL: recoveryURL, metadata: metadata)
+                log("dictation audio archived locally: \(audioURL.lastPathComponent)")
+            } catch {
+                // Leave the recovery journal in place on failure so a recording
+                // is never lost merely because the diagnostic archive failed.
+                log("dictation audio archive failed; recovery journal retained: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    @discardableResult
+    static func store(recoveryURL: URL,
+                      metadata: DictationDiagnosticMetadata,
+                      directory: URL? = nil,
+                      maximumCount: Int = DICTATION_DIAGNOSTIC_ARCHIVE_MAX_RECORDINGS) throws -> URL {
+        let archiveDirectory = try directory ?? directoryURL()
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: archiveDirectory,
+                                        withIntermediateDirectories: true,
+                                        attributes: [.posixPermissions: 0o700])
+        try fileManager.setAttributes([.posixPermissions: 0o700],
+                                      ofItemAtPath: archiveDirectory.path)
+
+        let baseName = "recording-\(metadata.id.uuidString.lowercased())"
+        let audioURL = archiveDirectory
+            .appendingPathComponent(baseName)
+            .appendingPathExtension("sdaudio")
+        let metadataURL = archiveDirectory
+            .appendingPathComponent(baseName)
+            .appendingPathExtension("json")
+
+        do {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(metadata).write(to: metadataURL, options: [.atomic])
+            try fileManager.setAttributes([.posixPermissions: 0o600],
+                                          ofItemAtPath: metadataURL.path)
+            try fileManager.moveItem(at: recoveryURL, to: audioURL)
+        } catch {
+            try? fileManager.removeItem(at: metadataURL)
+            throw error
+        }
+        try? fileManager.setAttributes([.modificationDate: metadata.createdAt],
+                                       ofItemAtPath: audioURL.path)
+
+        do {
+            try prune(directory: archiveDirectory, maximumCount: maximumCount)
+        } catch {
+            log("dictation audio archive pruning deferred: \(error.localizedDescription)")
+        }
+        return audioURL
+    }
+
+    static func prune(directory: URL,
+                      maximumCount: Int = DICTATION_DIAGNOSTIC_ARCHIVE_MAX_RECORDINGS) throws {
+        let fileManager = FileManager.default
+        let urls = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+        let audioURLs = urls.filter { $0.pathExtension == "sdaudio" }
+        let newestFirst = audioURLs.sorted { lhs, rhs in
+            let left = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate) ?? .distantPast
+            let right = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate) ?? .distantPast
+            return left > right
+        }
+        let keepCount = max(0, maximumCount)
+        for audioURL in newestFirst.dropFirst(keepCount) {
+            try fileManager.removeItem(at: audioURL)
+            let metadataURL = audioURL.deletingPathExtension().appendingPathExtension("json")
+            try? fileManager.removeItem(at: metadataURL)
+        }
+
+        let retainedAudioBaseNames = Set(newestFirst.prefix(keepCount).map {
+            $0.deletingPathExtension().lastPathComponent
+        })
+        for metadataURL in urls where metadataURL.pathExtension == "json" {
+            let baseName = metadataURL.deletingPathExtension().lastPathComponent
+            if !retainedAudioBaseNames.contains(baseName) {
+                try? fileManager.removeItem(at: metadataURL)
+            }
         }
     }
 }
@@ -12969,7 +13093,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                          audioSeconds: duration,
                                          asrSeconds: timing.totalSeconds)
                 }
-                PendingDictationRecovery.remove(url)
+                DictationDiagnosticArchive.storeAsync(
+                    recoveryURL: url,
+                    metadata: DictationDiagnosticMetadata(
+                        id: UUID(),
+                        createdAt: Date(),
+                        sampleRate: SAMPLE_RATE,
+                        sampleCount: samples.count,
+                        audioDurationSeconds: duration,
+                        rawTranscript: transcription.text,
+                        finalText: processed.text,
+                        engine: transcription.engine.rawValue,
+                        confidence: transcription.confidence,
+                        asrTiming: timing,
+                        destinationBundleIdentifier: nil
+                    )
+                )
                 log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
             } catch {
                 log("pending dictation recovery deferred: \(error.localizedDescription)")
@@ -14618,7 +14757,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let historyCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         let journalCleanupStartedAt = ProcessInfo.processInfo.systemUptime
-                        PendingDictationRecovery.remove(captured.recoveryURL)
+                        DictationDiagnosticArchive.storeAsync(
+                            recoveryURL: captured.recoveryURL,
+                            metadata: DictationDiagnosticMetadata(
+                                id: UUID(),
+                                createdAt: Date(),
+                                sampleRate: SAMPLE_RATE,
+                                sampleCount: samples.count,
+                                audioDurationSeconds: dur,
+                                rawTranscript: transcription.text,
+                                finalText: textToInsert,
+                                engine: transcription.engine.rawValue,
+                                confidence: transcription.confidence,
+                                asrTiming: asrTiming,
+                                destinationBundleIdentifier: insertionBundleIdentifier
+                            )
+                        )
                         let journalCleanupCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         let permissionRecheckStartedAt = ProcessInfo.processInfo.systemUptime
@@ -14684,7 +14838,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             pasteSucceeded: inserted
                         ).logLine)
                     } else {
-                        PendingDictationRecovery.remove(captured.recoveryURL)
+                        DictationDiagnosticArchive.storeAsync(
+                            recoveryURL: captured.recoveryURL,
+                            metadata: DictationDiagnosticMetadata(
+                                id: UUID(),
+                                createdAt: Date(),
+                                sampleRate: SAMPLE_RATE,
+                                sampleCount: samples.count,
+                                audioDurationSeconds: dur,
+                                rawTranscript: transcription.text,
+                                finalText: "",
+                                engine: transcription.engine.rawValue,
+                                confidence: transcription.confidence,
+                                asrTiming: asrTiming,
+                                destinationBundleIdentifier: insertionBundleIdentifier
+                            )
+                        )
                     }
                 }
             } catch {
@@ -23536,6 +23705,93 @@ private enum ParakeySelfTest {
             equals: 0o600,
             "pending dictation journal should be private"
         )
+
+        let archiveRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("abxvoiceassist-dictation-archive-test-\(UUID().uuidString)",
+                                    isDirectory: true)
+        try FileManager.default.createDirectory(at: archiveRoot,
+                                                withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: archiveRoot) }
+        let archiveIDs = [UUID(), UUID(), UUID()]
+        let archiveStart = Date(timeIntervalSince1970: 1_700_000_000)
+        for (index, id) in archiveIDs.enumerated() {
+            let sourceURL = archiveRoot
+                .appendingPathComponent("pending-\(id.uuidString)")
+                .appendingPathExtension("sdaudio")
+            let sourceJournal = try PendingDictationJournal(url: sourceURL)
+            sourceJournal.append([Float(index), Float(index) + 0.5])
+            sourceJournal.finish()
+            let metadata = DictationDiagnosticMetadata(
+                id: id,
+                createdAt: archiveStart.addingTimeInterval(Double(index)),
+                sampleRate: SAMPLE_RATE,
+                sampleCount: 2,
+                audioDurationSeconds: 2 / SAMPLE_RATE,
+                rawTranscript: "raw \(index)",
+                finalText: "final \(index)",
+                engine: SpeechEngineKind.parakeetV3.rawValue,
+                confidence: 0.9,
+                asrTiming: ASRTimingBreakdown(
+                    totalSeconds: 0.2,
+                    workerQueueSeconds: 0,
+                    decoderPreparationSeconds: 0.01,
+                    fluidCallSeconds: 0.18,
+                    fluidProcessingSeconds: 0.18
+                ),
+                destinationBundleIdentifier: "com.openai.codex"
+            )
+            try DictationDiagnosticArchive.store(
+                recoveryURL: sourceURL,
+                metadata: metadata,
+                directory: archiveRoot,
+                maximumCount: 2
+            )
+        }
+        let archivedURLs = try FileManager.default.contentsOfDirectory(
+            at: archiveRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        let archivedAudioURLs = archivedURLs.filter { $0.pathExtension == "sdaudio" }
+        let archivedMetadataURLs = archivedURLs.filter { $0.pathExtension == "json" }
+        try expect(archivedAudioURLs.count, equals: 2,
+                   "dictation diagnostic archive should retain only the newest audio files")
+        try expect(archivedMetadataURLs.count, equals: 2,
+                   "dictation diagnostic archive should prune metadata with old audio")
+        try expect(
+            archivedAudioURLs.contains {
+                $0.lastPathComponent.contains(archiveIDs[0].uuidString.lowercased())
+            },
+            equals: false,
+            "dictation diagnostic archive should remove the oldest recording"
+        )
+        let newestMetadataURL = archiveRoot
+            .appendingPathComponent("recording-\(archiveIDs[2].uuidString.lowercased())")
+            .appendingPathExtension("json")
+        let newestAudioURL = newestMetadataURL
+            .deletingPathExtension()
+            .appendingPathExtension("sdaudio")
+        try expect(
+            try PendingDictationRecovery.loadSamples(from: newestAudioURL),
+            equals: [2, 2.5],
+            "dictation diagnostic archive should preserve playable source samples"
+        )
+        let metadataDecoder = JSONDecoder()
+        metadataDecoder.dateDecodingStrategy = .iso8601
+        let newestMetadata = try metadataDecoder.decode(
+            DictationDiagnosticMetadata.self,
+            from: Data(contentsOf: newestMetadataURL)
+        )
+        try expect(newestMetadata.finalText, equals: "final 2",
+                   "dictation diagnostic metadata should retain the final inserted text")
+        let metadataAttributes = try FileManager.default.attributesOfItem(
+            atPath: newestMetadataURL.path
+        )
+        guard let metadataMode = metadataAttributes[.posixPermissions] as? NSNumber else {
+            throw SelfTestFailure.failed("dictation diagnostic metadata should expose POSIX permissions")
+        }
+        try expect(metadataMode.intValue, equals: 0o600,
+                   "dictation diagnostic metadata should be private")
 
         let processed = processedDictationText(
             rawTranscript: "  Um, parakeet is fast.  ",

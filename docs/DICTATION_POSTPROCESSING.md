@@ -22,7 +22,10 @@ answering the speaker, inventing facts, or changing meaning.
 9. History receives the same final content prepared for insertion. Insertion
    publishes one text-only pasteboard item and restores the previous clipboard
    only after the target reads the full string.
-10. Cloud LLM cleanup is not part of the required local path. A future local
+10. The last 100 dictations retain private local audio plus raw ASR, final text,
+    engine, confidence, target application, and timing metadata. Rotation runs
+    outside the insertion-critical path.
+11. Cloud LLM cleanup is not part of the required local path. A future local
     model must pass meaning-preservation and hallucination tests before use.
 
 ## Canonical project dictionary
