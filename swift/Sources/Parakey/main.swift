@@ -9002,6 +9002,37 @@ private struct FocusedTextSelectionSnapshot {
     let anchorFrame: NSRect
 }
 
+private func selectionRangeAfterWholeFieldReplacement(
+    _ range: CFRange?,
+    originalUTF16Length: Int,
+    replacementUTF16Length: Int
+) -> CFRange? {
+    guard let range,
+          originalUTF16Length >= 0,
+          replacementUTF16Length >= 0,
+          range.location >= 0,
+          range.length >= 0,
+          range.location + range.length <= originalUTF16Length else {
+        return nil
+    }
+    guard originalUTF16Length > 0 else {
+        return CFRange(location: replacementUTF16Length, length: 0)
+    }
+    let startFraction = Double(range.location) / Double(originalUTF16Length)
+    let endFraction = Double(range.location + range.length) / Double(originalUTF16Length)
+    let start = min(replacementUTF16Length,
+                    max(0, Int((startFraction * Double(replacementUTF16Length)).rounded())))
+    let end = min(replacementUTF16Length,
+                  max(start, Int((endFraction * Double(replacementUTF16Length)).rounded())))
+    return CFRange(location: start, length: end - start)
+}
+
+private func likelyLargeFileDirectories(homeDirectory: URL) -> [URL] {
+    ["Downloads", "Movies", "Music"].map {
+        homeDirectory.appendingPathComponent($0, isDirectory: true)
+    }
+}
+
 private enum FocusedTranslationMode: Equatable {
     case selectedText
     case fullField
@@ -9289,11 +9320,21 @@ private enum FocusedTextFieldEditor {
               settable.boolValue else {
             return false
         }
-        return AXUIElementSetAttributeValue(
+        let restoredRange = selectionRangeAfterWholeFieldReplacement(
+            snapshot.selectedRange,
+            originalUTF16Length: (snapshot.text as NSString).length,
+            replacementUTF16Length: (text as NSString).length
+        )
+        guard AXUIElementSetAttributeValue(
             snapshot.element,
             kAXValueAttribute as CFString,
             text as CFTypeRef
-        ) == .success
+        ) == .success else { return false }
+        restoreSelection(restoredRange, in: snapshot.element)
+        restoreSelectionAfterWebEditorUpdate(restoredRange,
+                                             expectedText: text,
+                                             snapshot: snapshot)
+        return true
     }
 
     static func apply(_ correction: KeyboardLayoutCorrection,
@@ -9317,19 +9358,46 @@ private enum FocusedTextFieldEditor {
             replaced as CFTypeRef
         ) == .success else { return false }
 
+        var restoredRange: CFRange?
         if let selectedRange = snapshot.selectedRange {
             let delta = (correction.replacement as NSString).length - correction.range.length
-            var restoredRange = CFRange(location: selectedRange.location + delta,
-                                        length: selectedRange.length)
-            if let rangeValue = AXValueCreate(.cfRange, &restoredRange) {
-                _ = AXUIElementSetAttributeValue(
-                    snapshot.element,
-                    kAXSelectedTextRangeAttribute as CFString,
-                    rangeValue
-                )
-            }
+            restoredRange = CFRange(location: selectedRange.location + delta,
+                                    length: selectedRange.length)
         }
+        restoreSelection(restoredRange, in: snapshot.element)
+        restoreSelectionAfterWebEditorUpdate(restoredRange,
+                                             expectedText: replaced,
+                                             snapshot: snapshot)
         return true
+    }
+
+    private static func restoreSelection(_ range: CFRange?, in element: AXUIElement) {
+        guard var range, let rangeValue = AXValueCreate(.cfRange, &range) else { return }
+        _ = AXUIElementSetAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            rangeValue
+        )
+    }
+
+    private static func restoreSelectionAfterWebEditorUpdate(
+        _ range: CFRange?,
+        expectedText: String,
+        snapshot: FocusedTextFieldSnapshot
+    ) {
+        guard range != nil else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+            guard focusedElementStillMatches(snapshot) else { return }
+            var rawValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                snapshot.element,
+                kAXValueAttribute as CFString,
+                &rawValue
+            ) == .success,
+                  let currentText = rawValue as? String,
+                  currentText == expectedText else { return }
+            restoreSelection(range, in: snapshot.element)
+        }
     }
 
     private static func focusedElementStillMatches(_ snapshot: FocusedTextFieldSnapshot) -> Bool {
@@ -25091,6 +25159,40 @@ private enum ParakeySelfTest {
                 "valid, mixed, transliterated, and code-like text should remain untouched: \(safeText)"
             )
         }
+
+        guard let translatedEndCaret = selectionRangeAfterWholeFieldReplacement(
+            CFRange(location: 10, length: 0),
+            originalUTF16Length: 10,
+            replacementUTF16Length: 17
+        ) else {
+            throw SelfTestFailure.failed("whole-field translation should restore an end caret")
+        }
+        try expect(translatedEndCaret.location,
+                   equals: 17,
+                   "whole-field translation should keep an end caret at the end")
+        try expect(translatedEndCaret.length,
+                   equals: 0,
+                   "whole-field translation should preserve a collapsed caret")
+
+        guard let translatedSelection = selectionRangeAfterWholeFieldReplacement(
+            CFRange(location: 2, length: 4),
+            originalUTF16Length: 10,
+            replacementUTF16Length: 20
+        ) else {
+            throw SelfTestFailure.failed("whole-field translation should restore a selection")
+        }
+        try expect(translatedSelection.location,
+                   equals: 4,
+                   "whole-field translation should preserve a proportional selection start")
+        try expect(translatedSelection.length,
+                   equals: 8,
+                   "whole-field translation should preserve a proportional selection length")
+        try expect(
+            likelyLargeFileDirectories(homeDirectory: URL(fileURLWithPath: "/Users/test"))
+                .map(\.lastPathComponent),
+            equals: ["Downloads", "Movies", "Music"],
+            "the folder shortcut should target the common large-file locations"
+        )
     }
 
     private static func event(
@@ -26031,6 +26133,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                           value: currentBuildDisplayVersion(),
                           monospaced: true),
             aboutUpdateChecksRow(),
+            aboutLargeFilesRow(),
             aboutDirectoryRow(title: t("Каталог данных приложения", "Application data directory"),
                               url: applicationSupportDirectoryURL,
                               action: #selector(openApplicationSupportDirectoryClicked(_:))),
@@ -26105,6 +26208,40 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         toggle.toolTip = t("Периодически проверять новые версии на GitHub.",
                            "Periodically check GitHub for new versions.")
         row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func aboutLargeFilesRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let labels = NSStackView()
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 3
+        labels.addArrangedSubview(panelLabel(t("Крупные файлы", "Large files"),
+                                              size: 13,
+                                              weight: .semibold))
+        labels.addArrangedSubview(panelLabel(t("Загрузки, Фильмы и Музыка", "Downloads, Movies, and Music"),
+                                              size: 11.5,
+                                              color: .secondaryLabelColor))
+        row.addArrangedSubview(labels)
+        row.addArrangedSubview(NSView())
+
+        let button = NSButton(
+            image: NSImage(systemSymbolName: "folder.fill",
+                           accessibilityDescription: t("Показать папки", "Show folders")) ?? NSImage(),
+            target: self,
+            action: #selector(openLikelyLargeFileDirectoriesClicked(_:))
+        )
+        button.imagePosition = .imageOnly
+        button.bezelStyle = .rounded
+        button.toolTip = t("Показать в Finder папки, где часто находятся крупные файлы.",
+                           "Show folders in Finder where large files are commonly stored.")
+        button.widthAnchor.constraint(equalToConstant: 42).isActive = true
+        row.addArrangedSubview(button)
         return row
     }
 
@@ -26660,6 +26797,22 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     @objc private func openApplicationSupportDirectoryClicked(_ sender: NSButton) {
         if let directory = try? superDictateApplicationSupportDirectory() {
             NSWorkspace.shared.open(directory)
+        }
+    }
+
+    @objc private func openLikelyLargeFileDirectoriesClicked(_ sender: NSButton) {
+        let candidates = likelyLargeFileDirectories(
+            homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+        )
+        let existing = candidates.filter {
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: $0.path, isDirectory: &isDirectory)
+                && isDirectory.boolValue
+        }
+        if existing.isEmpty {
+            NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser)
+        } else {
+            NSWorkspace.shared.activateFileViewerSelecting(existing)
         }
     }
 
