@@ -2322,11 +2322,30 @@ enum AgentRuntimeStateStore {
     }
 
     static func write(_ state: AgentRuntimeState) {
+        let data: Data
         do {
-            let data = try JSONEncoder().encode(state)
+            data = try JSONEncoder().encode(state)
+        } catch {
+            log("agent state encoding failed: \(error.localizedDescription)")
+            return
+        }
+        do {
             try data.write(to: url, options: [.atomic])
         } catch {
-            log("agent state write failed: \(error.localizedDescription)")
+            guard isOutOfDiskSpaceError(error) else {
+                log("agent state write failed: \(error.localizedDescription)")
+                return
+            }
+            do {
+                // Atomic replacement needs a second directory entry and can
+                // fail on a completely full APFS volume. The existing status
+                // file already owns a data block, so an in-place fallback can
+                // still keep the control panel synchronized.
+                try data.write(to: url)
+                log("agent state updated in place because the disk is full")
+            } catch {
+                log("agent state write failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -2338,6 +2357,21 @@ enum AgentRuntimeStateStore {
             return nil
         }
     }
+}
+
+private func isOutOfDiskSpaceError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(ENOSPC) {
+        return true
+    }
+    if nsError.domain == NSCocoaErrorDomain,
+       nsError.code == CocoaError.fileWriteOutOfSpace.rawValue {
+        return true
+    }
+    if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? Error {
+        return isOutOfDiskSpaceError(underlying)
+    }
+    return false
 }
 
 enum SuperDictateControlPanelRegistry {
@@ -5782,6 +5816,7 @@ private struct LoadedSpeechEngine {
 
 private struct TranscriptionWorkerResult: Sendable {
     let text: String
+    var rawText: String? = nil
     let confidence: Float
     let tokenTimings: [TokenTiming]?
     var engine: SpeechEngineKind = .parakeetV3
@@ -5793,6 +5828,7 @@ private struct TranscriptionWorkerResult: Sendable {
     func replacingText(_ text: String) -> TranscriptionWorkerResult {
         TranscriptionWorkerResult(
             text: text,
+            rawText: rawText,
             confidence: confidence,
             tokenTimings: tokenTimings,
             engine: engine,
@@ -5812,6 +5848,8 @@ private struct TranscriptionWorkerResult: Sendable {
             fluidProcessingSeconds: fluidProcessingSeconds
         )
     }
+
+    var diagnosticRawText: String { rawText ?? text }
 }
 
 private struct CompletedTranscriptionWorkerResult: Sendable {
@@ -6079,6 +6117,35 @@ private func lowerTailTokenConfidence(_ tokenTimings: [TokenTiming]) -> Float? {
     guard !confidences.isEmpty else { return nil }
     let index = Int(floor(Double(confidences.count - 1) * 0.20))
     return max(0, min(1, confidences[index]))
+}
+
+private func removingObservedParakeetHallucination(
+    from result: TranscriptionWorkerResult,
+    audioDurationSeconds: Double
+) -> TranscriptionWorkerResult {
+    guard result.engine == .parakeetV3 else { return result }
+    let normalized = result.text.lowercased().trimmingCharacters(
+        in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
+    )
+    let lowerTailConfidence = lowerTailTokenConfidence(result.tokenTimings ?? [])
+        ?? result.confidence
+    guard normalized == "yeah",
+          audioDurationSeconds <= 2,
+          result.confidence < 0.72,
+          lowerTailConfidence < 0.35 else {
+        return result
+    }
+    return TranscriptionWorkerResult(
+        text: "",
+        rawText: result.rawText ?? result.text,
+        confidence: result.confidence,
+        tokenTimings: result.tokenTimings,
+        engine: result.engine,
+        workerQueueSeconds: result.workerQueueSeconds,
+        decoderPreparationSeconds: result.decoderPreparationSeconds,
+        fluidCallSeconds: result.fluidCallSeconds,
+        fluidProcessingSeconds: result.fluidProcessingSeconds
+    )
 }
 
 private func shouldVerifyAutoTranscription(text: String,
@@ -6352,7 +6419,7 @@ actor TranscriptionWorker {
               shouldVerifyAutoTranscription(text: primary.text,
                                             confidence: primary.confidence,
                                             tokenTimings: primary.tokenTimings ?? []) else {
-            return TranscriptionWorkerResult(
+            return removingObservedParakeetHallucination(from: TranscriptionWorkerResult(
                 text: primary.text,
                 confidence: primary.confidence,
                 tokenTimings: primary.tokenTimings,
@@ -6361,7 +6428,7 @@ actor TranscriptionWorker {
                 decoderPreparationSeconds: primary.decoderPreparationSeconds,
                 fluidCallSeconds: primary.fluidCallSeconds,
                 fluidProcessingSeconds: primary.fluidProcessingSeconds
-            )
+            ), audioDurationSeconds: Double(samples.count) / SAMPLE_RATE)
         }
 
         var attempts = [primary]
@@ -6392,7 +6459,7 @@ actor TranscriptionWorker {
         )
         let labels = ["auto", "ru", "en", "uk"]
         log("ASR: auto verification mean/tail \(primaryConfidence)/\(primaryTail) → \(selectedConfidence)/\(selectedTail), selected=\(labels[selectedIndex])")
-        return TranscriptionWorkerResult(
+        return removingObservedParakeetHallucination(from: TranscriptionWorkerResult(
             text: selected.text,
             confidence: selected.confidence,
             tokenTimings: selected.tokenTimings,
@@ -6401,7 +6468,7 @@ actor TranscriptionWorker {
             decoderPreparationSeconds: attempts.reduce(0) { $0 + $1.decoderPreparationSeconds },
             fluidCallSeconds: attempts.reduce(0) { $0 + $1.fluidCallSeconds },
             fluidProcessingSeconds: attempts.reduce(0) { $0 + $1.fluidProcessingSeconds }
-        )
+        ), audioDurationSeconds: Double(samples.count) / SAMPLE_RATE)
     }
 
     private func transcribeParakeetOnce(
@@ -6436,15 +6503,23 @@ actor TranscriptionWorker {
         var results: [TranscriptionWorkerResult] = []
         results.reserveCapacity(segments.count)
         for segment in segments {
-            let result = try await transcribeParakeetOnce(
+            let decoded = try await transcribeParakeetOnce(
                 asr: asr,
                 samples: segment,
                 language: language.fluidLanguage
             )
+            let result = removingObservedParakeetHallucination(
+                from: decoded,
+                audioDurationSeconds: Double(segment.count) / SAMPLE_RATE
+            )
+            if decoded.text != result.text {
+                log("ASR: discarded observed low-confidence Yeah hallucination from isolated audio segment")
+            }
             results.append(result)
         }
         return TranscriptionWorkerResult(
             text: results.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n"),
+            rawText: results.map(\.diagnosticRawText).filter { !$0.isEmpty }.joined(separator: "\n"),
             confidence: results.map(\.confidence).min() ?? 0,
             tokenTimings: nil,
             engine: .parakeetV3,
@@ -13101,7 +13176,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         sampleRate: SAMPLE_RATE,
                         sampleCount: samples.count,
                         audioDurationSeconds: duration,
-                        rawTranscript: transcription.text,
+                        rawTranscript: transcription.diagnosticRawText,
                         finalText: processed.text,
                         engine: transcription.engine.rawValue,
                         confidence: transcription.confidence,
@@ -14530,6 +14605,18 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var recoveryJournal: PendingDictationJournal?
         do {
             recoveryJournal = try PendingDictationRecovery.createJournal()
+        } catch where isOutOfDiskSpaceError(error) {
+            // Audio capture itself is memory-backed. Keep dictation working
+            // when the optional crash-recovery journal cannot be created.
+            // This one recording will not survive a process crash and cannot
+            // be retained in the local diagnostic archive.
+            log("recording journal unavailable because the disk is full; recording in memory")
+        } catch {
+            log("recording journal creation failed: \(error.localizedDescription)")
+            signalDictationFailure()
+            return
+        }
+        do {
             didTouchAudioEngine = true
             if !audio.isEngineStarted {
                 suppressAudioConfigurationChangesFromAppEngineUpdate()
@@ -14765,7 +14852,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 sampleRate: SAMPLE_RATE,
                                 sampleCount: samples.count,
                                 audioDurationSeconds: dur,
-                                rawTranscript: transcription.text,
+                                rawTranscript: transcription.diagnosticRawText,
                                 finalText: textToInsert,
                                 engine: transcription.engine.rawValue,
                                 confidence: transcription.confidence,
@@ -14846,7 +14933,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 sampleRate: SAMPLE_RATE,
                                 sampleCount: samples.count,
                                 audioDurationSeconds: dur,
-                                rawTranscript: transcription.text,
+                                rawTranscript: transcription.diagnosticRawText,
                                 finalText: "",
                                 engine: transcription.engine.rawValue,
                                 confidence: transcription.confidence,
@@ -21500,6 +21587,52 @@ private enum ParakeySelfTest {
             "a confidently spoken phrase must not be removed by a blocklist"
         )
 
+        let observedFalseYeah = TranscriptionWorkerResult(
+            text: "Yeah.",
+            confidence: 0.62,
+            tokenTimings: [
+                TokenTiming(token: " Yeah", tokenId: 1, startTime: 0, endTime: 0.3, confidence: 0.24),
+                TokenTiming(token: ".", tokenId: 2, startTime: 0.3, endTime: 0.4, confidence: 0.91),
+            ],
+            workerQueueSeconds: 0,
+            decoderPreparationSeconds: 0,
+            fluidCallSeconds: 0,
+            fluidProcessingSeconds: 0
+        )
+        let filteredFalseYeah = removingObservedParakeetHallucination(
+            from: observedFalseYeah,
+            audioDurationSeconds: 0.44
+        )
+        try expect(
+            filteredFalseYeah.text,
+            equals: "",
+            "the observed low-confidence Yeah result from a hotkey-only clip must not be inserted"
+        )
+        try expect(
+            filteredFalseYeah.diagnosticRawText,
+            equals: "Yeah.",
+            "hallucination filtering must retain the decoder output for local diagnostics"
+        )
+        let confidentSpokenYeah = TranscriptionWorkerResult(
+            text: "Yeah.",
+            confidence: 0.91,
+            tokenTimings: [
+                TokenTiming(token: " Yeah", tokenId: 1, startTime: 0, endTime: 0.4, confidence: 0.89),
+            ],
+            workerQueueSeconds: 0,
+            decoderPreparationSeconds: 0,
+            fluidCallSeconds: 0,
+            fluidProcessingSeconds: 0
+        )
+        try expect(
+            removingObservedParakeetHallucination(
+                from: confidentSpokenYeah,
+                audioDurationSeconds: 0.55
+            ).text,
+            equals: "Yeah.",
+            "a confidently spoken short English acknowledgement must remain available"
+        )
+
         let paragraphText = whisperTextAddingLogicalParagraphBreaks(
             "Первое предложение. Второе продолжение.",
             words: [
@@ -23651,6 +23784,28 @@ private enum ParakeySelfTest {
     }
 
     private static func testRecordingLifecycle() throws {
+        try expect(
+            isOutOfDiskSpaceError(
+                NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+            ),
+            equals: true,
+            "POSIX disk-full errors should allow memory-only recording"
+        )
+        try expect(
+            isOutOfDiskSpaceError(
+                NSError(domain: NSCocoaErrorDomain,
+                        code: CocoaError.fileWriteOutOfSpace.rawValue)
+            ),
+            equals: true,
+            "Cocoa disk-full errors should allow memory-only recording"
+        )
+        try expect(
+            isOutOfDiskSpaceError(
+                NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))
+            ),
+            equals: false,
+            "permission failures must not be mistaken for a full disk"
+        )
         try expect(
             recordingReleaseAction(capturedSampleCount: 3_999,
                                    sampleRate: 16_000,
@@ -29170,7 +29325,7 @@ private func runAudioFileTranscriptionDiagnostic(arguments: [String]) async -> I
                 AudioFileTranscriptionDiagnosticRecord(
                     path: path,
                     durationSeconds: Double(samples.count) / SAMPLE_RATE,
-                    rawText: transcription.text,
+                    rawText: transcription.diagnosticRawText,
                     repairedText: repaired.text,
                     confidence: transcription.confidence,
                     lowerTailConfidence: transcription.tokenTimings.flatMap(lowerTailTokenConfidence),
