@@ -6134,7 +6134,25 @@ actor TranscriptionWorker {
                         fluidProcessingSeconds: candidate.elapsedSeconds
                     )
                 }
-                log("ASR: Whisper result rejected as empty or likely hallucinated; using Parakeet fallback")
+                if loadedEngine.parakeetV3 == nil {
+                    // A cold Parakeet/Core ML load can take tens of seconds on
+                    // its first use. Do not leave the recording HUD spinning
+                    // for a result Whisper already classified as unreliable.
+                    // A loaded fallback remains useful for short phrases, and
+                    // a real Whisper failure below may still load it on demand.
+                    log("ASR: Whisper result rejected as empty or likely hallucinated; cold Parakeet fallback skipped")
+                    return TranscriptionWorkerResult(
+                        text: "",
+                        confidence: candidate.averageWordProbability,
+                        tokenTimings: nil,
+                        engine: .whisperLargeV3,
+                        workerQueueSeconds: workerEnteredAt - requestedAt,
+                        decoderPreparationSeconds: 0,
+                        fluidCallSeconds: candidate.elapsedSeconds,
+                        fluidProcessingSeconds: candidate.elapsedSeconds
+                    )
+                }
+                log("ASR: Whisper result rejected as empty or likely hallucinated; using ready Parakeet fallback")
             } catch {
                 log("ASR: Whisper transcription failed; using Parakeet fallback: \(error.localizedDescription)")
             }
@@ -21304,7 +21322,7 @@ private enum ParakeySelfTest {
         try expect(
             shouldRejectWhisperCandidate(stockHallucination),
             equals: true,
-            "a low-confidence stock phrase must fall back instead of being inserted"
+            "a low-confidence stock phrase must be discarded instead of being inserted"
         )
         let spokenPhrase = WhisperTranscriptionCandidate(
             text: "Спасибо за просмотр.",
