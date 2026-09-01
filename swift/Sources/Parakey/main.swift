@@ -48,10 +48,11 @@ let PENDING_DICTATION_FILE_VERSION: UInt32 = 1
 let PENDING_DICTATION_HEADER_SIZE = 16
 let PENDING_DICTATION_MAX_SECONDS: TimeInterval = 30 * 60
 let PENDING_DICTATION_MAX_BYTES = Int(PENDING_DICTATION_MAX_SECONDS * SAMPLE_RATE * 4) + PENDING_DICTATION_HEADER_SIZE
-let DEFAULT_HOTKEY_KEYCODE: CGKeyCode = 54  // Right Command
+let DEFAULT_HOTKEY_KEYCODE: CGKeyCode = 61  // Right Option
 let RIGHT_COMMAND_KEYCODE: CGKeyCode = 54
 let LEFT_COMMAND_KEYCODE: CGKeyCode = 55
 let LEFT_CONTROL_KEYCODE: CGKeyCode = 59
+let LEFT_OPTION_KEYCODE: CGKeyCode = 58
 let RIGHT_OPTION_KEYCODE: CGKeyCode = 61
 let RIGHT_SHIFT_KEYCODE: CGKeyCode = 60
 let FN_KEYCODE: CGKeyCode = 63
@@ -2852,8 +2853,7 @@ final class Settings: @unchecked Sendable {
     var alternateCompletionEnabled: Bool {
         get {
             guard defaults.object(forKey: Self.keyAlternateCompletionEnabled) != nil else {
-                // The alternate finish shortcut was always enabled before v0.2.35.
-                return true
+                return false
             }
             return defaults.bool(forKey: Self.keyAlternateCompletionEnabled)
         }
@@ -17371,7 +17371,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             && !isRecording
             && !isBusy
             && !isTerminating
-        reset.toolTip = "Use Right Command for dictation."
+        reset.toolTip = "Use Right Option for dictation."
         hkSub.addItem(reset)
 
         hkParent.submenu = hkSub
@@ -20112,6 +20112,7 @@ private enum ParakeySelfTest {
 
     private static func testHotkey() throws {
         try testHotkeyPreferenceNormalization()
+        try testDefaultHotkeyUsesRightOptionOnly()
         try testSupportedDictationLanguages()
         try testHotkeyPreferenceUpdateResults()
         try testHotkeyRecorderCaptureFlow()
@@ -20133,6 +20134,60 @@ private enum ParakeySelfTest {
         try testTranslationHotkeyDoesNotBreakControlChords()
         try testLocalTranslationDirection()
         try testKeyboardLayoutMistypeDetector()
+    }
+
+    private static func testDefaultHotkeyUsesRightOptionOnly() throws {
+        try expect(DEFAULT_HOTKEY_KEYCODE,
+                   equals: RIGHT_OPTION_KEYCODE,
+                   "the default dictation hotkey should be Right Option")
+
+        let suiteName = "com.abc.abxvoiceassist.self-test.right-option.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            throw SelfTestFailure.failed("could not create isolated hotkey defaults")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let isolatedSettings = Settings(defaults: defaults)
+        try expect(isolatedSettings.configuredHotkey.keycode,
+                   equals: RIGHT_OPTION_KEYCODE,
+                   "fresh settings should default dictation to Right Option")
+        try expect(isolatedSettings.alternateCompletionEnabled,
+                   equals: false,
+                   "the conflicting alternate shortcut should be disabled by default")
+
+        var state = HotkeyTransitionState()
+        let shortcut = hotkeyChoice(forKeycode: DEFAULT_HOTKEY_KEYCODE)
+        let alternate = CGEventFlags.maskAlternate.rawValue
+
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: LEFT_OPTION_KEYCODE,
+                                        flags: alternate),
+                             hotkey: shortcut,
+                             triggerMode: .hold,
+                             isRecording: false),
+            equals: .pass,
+            "Left Option must not start a Right Option shortcut"
+        )
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: RIGHT_OPTION_KEYCODE,
+                                        flags: alternate),
+                             hotkey: shortcut,
+                             triggerMode: .hold,
+                             isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
+            "Right Option should start the default dictation shortcut"
+        )
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: RIGHT_OPTION_KEYCODE),
+                             hotkey: shortcut,
+                             triggerMode: .hold,
+                             isRecording: true),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.release]),
+            "releasing Right Option should finish the default dictation shortcut"
+        )
     }
 
     private static func testLocalTranslationDirection() throws {
